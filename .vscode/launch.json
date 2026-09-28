@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "BeamLab",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/beamlab",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "MIMode": "lldb",
+            "externalConsole": false,
+            "stopAtEntry": false,
+            "preLaunchTask": "BeamLab: build (Release)"
+        }
+    ]
+}

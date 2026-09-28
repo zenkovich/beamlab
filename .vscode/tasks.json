@@ -1,0 +1,24 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "BeamLab: fetch vehicles",
+            "detail": "Downloads the Rigs of Rods vehicle mods into assets/vehicles (skips folders that already exist)",
+            "type": "shell",
+            "command": "python3 tools/fetch_vehicles.py",
+            "options": { "cwd": "${workspaceFolder}" },
+            "presentation": { "reveal": "silent", "panel": "shared" },
+            "problemMatcher": []
+        },
+        {
+            "label": "BeamLab: build (Release)",
+            "type": "shell",
+            "command": "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build --target beamlab",
+            "options": { "cwd": "${workspaceFolder}" },
+            "dependsOn": "BeamLab: fetch vehicles",
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": { "reveal": "silent", "panel": "shared", "clear": true },
+            "problemMatcher": { "base": "$gcc", "fileLocation": ["autoDetect", "${workspaceFolder}/build"] }
+        }
+    ]
+}

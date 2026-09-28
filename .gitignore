@@ -1,0 +1,17 @@
+build/
+build_*/
+.DS_Store
+dist/
+# converted RBR stages: not to be redistributed (tools/fetch_rbr_stage.py builds them locally)
+assets/stages/
+# RoR vehicle mods: their authors' licences, downloaded by tools/fetch_vehicles.py; the project's own models are kept
+assets/vehicles/*
+!assets/vehicles/frame_car/
+!assets/vehicles/sheet_car/
+!assets/vehicles/editor/
+!assets/vehicles/yaris_biw/
+__pycache__/
+# the editor's re-saves of RoR mods (their authors' licences)
+assets/vehicles/editor/1988_audi_quattro.truck
+assets/vehicles/editor/1998_mercedes_benz_clk_200_elegance.truck
+assets/vehicles/editor/seat_ibiza_2_0l_gti.truck

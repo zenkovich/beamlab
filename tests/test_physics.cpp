@@ -1,0 +1,1890 @@
+// Physics regression tests (no GL): triangle-element sheets and the world stepping.
+//
+//   ./build/test_physics            all tests
+//   ./build/test_physics bench      + timing of the sheet force kernel
+//
+// The force kernel is compared with a frozen copy of the pre-optimisation kernel (reference_shell.cpp): same forces,
+// plastic state, strains and overload events. The rest checks invariants that any implementation has to keep.
+#include "core/jobs.h"
+#include "core/profiler.h"
+#include "core/util.h"
+#include "phys/cache_sim.h"
+#include "phys/sheet_builder.h"
+#include "phys/world.h"
+#include "reference_shell.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <set>
+#include <string>
+
+using namespace bl;
+using namespace bl::phys;
+
+static int g_pass = 0, g_fail = 0;
+#define CHECK(cond, ...)                                                   \
+    do {                                                                   \
+        if (cond) {                                                        \
+            g_pass++;                                                      \
+        } else {                                                           \
+            g_fail++;                                                      \
+            printf("    FAIL line %d: %s: ", __LINE__, #cond);            \
+            printf(__VA_ARGS__);                                           \
+            printf("\n");                                                 \
+        }                                                                  \
+    } while (0)
+
+struct TRng {
+    uint32_t s;
+    explicit TRng(uint32_t seed) : s(seed * 2654435761u + 1) {}
+    uint32_t next() {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        return s;
+    }
+    float uni() { return (next() & 0xffffff) / float(0x1000000); }
+    float range(float a, float b) { return a + (b - a) * uni(); }
+};
+
+// ------------------------------------------------------------------------------------------ materials (as in the lab)
+static ShellMaterial mat_lead() {
+    ShellMaterial m;
+    m.max_level = 4, m.min_edge = 0.02f, m.bend_damp = 2.0f, m.min_piece = 12;
+    m.k = 4e5f, m.damp = 150, m.yield = 0.006f, m.brk = 0.45f, m.refine = 0.3f, m.refine_yield = 0.05f;
+    m.bend = 300, m.bend_yield = 0.03f, m.refine_angle = 0.35f;
+    return m;
+}
+static ShellMaterial mat_glass() {
+    ShellMaterial m;
+    m.max_level = 4, m.min_edge = 0.02f, m.bend_damp = 2.0f, m.min_piece = 6;
+    m.k = 8e6f, m.damp = 80, m.brk = 0.01f, m.refine = 0.7f, m.flaw = 0.3f;
+    m.bend = 1e9f, m.bend_break = 0.15f, m.refine_angle = 0.12f;
+    return m;
+}
+static ShellMaterial mat_steel() {
+    ShellMaterial m;
+    m.max_level = 4, m.min_edge = 0.02f, m.bend_damp = 2.0f, m.min_piece = 12;
+    m.k = 1e7f, m.damp = 200, m.yield = 0.004f, m.brk = 0.35f, m.refine = 0.3f, m.refine_yield = 0.02f;
+    m.bend = 1e9f, m.bend_yield = 0.1f, m.refine_angle = 0.35f;
+    return m;
+}
+static ShellMaterial mat_plywood() {
+    ShellMaterial m;
+    m.max_level = 4, m.min_edge = 0.02f, m.bend_damp = 2.0f, m.min_piece = 6;
+    m.k = 3e6f, m.damp = 80, m.yield = 0.012f, m.brk = 0.025f, m.refine = 0.4f, m.flaw = 0.3f;
+    m.bend = 1e9f, m.bend_yield = 0.15f, m.bend_break = 0.25f, m.refine_angle = 0.12f;
+    return m;
+}
+// the materials with their fracture patterns (as sheet_material() in the scenes)
+static ShellMaterial patterned(ShellMaterial m, ShellPattern p, float size, float speed, float grain = 0.0f) {
+    m.pattern = p;
+    m.pattern_size = size;
+    m.pattern_speed = speed;
+    m.grain_angle = grain;
+    return m;
+}
+static ShellMaterial mat_fabric() {
+    ShellMaterial m;
+    m.max_level = 4, m.min_edge = 0.02f, m.bend_damp = 2.0f, m.min_piece = 12;
+    m.k = 4e4f, m.damp = 30, m.brk = 0.25f, m.refine = 0.5f, m.tension_only = true;
+    m.bend = 0, m.refine_angle = 1e9f;
+    return m;
+}
+
+// Sheet as build_sheet() makes it (4-8 grid, clamp 0 free, 1 all edges, 2 top + sides, 3 top).
+static std::unique_ptr<SoftBody> make_sheet(vec3 c, vec3 u, vec3 v, float w, float h, int nu, int nv, float mass, int clamp, const ShellMaterial& m,
+                                           uint32_t seed = 1) {
+    auto b = std::make_unique<SoftBody>();
+    b->name = "test sheet";
+    auto id = [&](int i, int j) { return (uint32_t)(j * nu + i); };
+    for (int j = 0; j < nv; j++)
+        for (int i = 0; i < nu; i++) {
+            const bool side = i == 0 || i == nu - 1, top = j == nv - 1, bottom = j == 0;
+            const bool fixed = clamp == 1 ? (side || top || bottom) : clamp == 2 ? (side || top) : clamp == 3 ? top : false;
+            vec3 p = c + u * (((float)i / (nu - 1) - 0.5f) * w) + v * (((float)j / (nv - 1) - 0.5f) * h);
+            b->add_node(p, 1.0f, NF_GROUND | NF_CONTACTER | (fixed ? NF_FIXED : 0));
+        }
+    auto uv = [&](int i, int j) { return vec2((float)i / (nu - 1), (float)j / (nv - 1)); };
+    for (int j = 0; j + 1 < nv; j++)
+        for (int i = 0; i + 1 < nu; i++) {
+            const uint32_t a = id(i, j), bb = id(i + 1, j), cc = id(i + 1, j + 1), e = id(i, j + 1);
+            if (((i + j) & 1) == 0) {
+                b->add_shell(a, bb, cc, uv(i, j), uv(i + 1, j), uv(i + 1, j + 1));
+                b->add_shell(a, cc, e, uv(i, j), uv(i + 1, j + 1), uv(i, j + 1));
+            } else {
+                b->add_shell(a, bb, e, uv(i, j), uv(i + 1, j), uv(i, j + 1));
+                b->add_shell(bb, cc, e, uv(i + 1, j), uv(i + 1, j + 1), uv(i, j + 1));
+            }
+        }
+    b->shell_mat = m;
+    b->collision_radius = 0.04f;
+    b->finalize();
+    b->finalize_shells(mass / (w * h), kDefaultDt, seed);
+    return b;
+}
+
+// A soft ball (icosahedron + centre) of radius r.
+static std::unique_ptr<SoftBody> make_ball(vec3 c, float r, float mass, vec3 vel) {
+    auto b = std::make_unique<SoftBody>();
+    b->name = "test ball";
+    const float t = (1.0f + std::sqrt(5.0f)) * 0.5f;
+    const vec3 ico[12] = {{-1, t, 0}, {1, t, 0}, {-1, -t, 0}, {1, -t, 0}, {0, -1, t}, {0, 1, t}, {0, -1, -t}, {0, 1, -t}, {t, 0, -1}, {t, 0, 1}, {-t, 0, -1}, {-t, 0, 1}};
+    const int faces[20][3] = {{0, 11, 5}, {0, 5, 1}, {0, 1, 7}, {0, 7, 10}, {0, 10, 11}, {1, 5, 9}, {5, 11, 4}, {11, 10, 2}, {10, 7, 6}, {7, 1, 8},
+                              {3, 9, 4}, {3, 4, 2}, {3, 2, 6}, {3, 6, 8}, {3, 8, 9}, {4, 9, 5}, {2, 4, 11}, {6, 2, 10}, {8, 6, 7}, {9, 8, 1}};
+    for (auto& p : ico) b->add_node(c + normalize(p) * r, mass / 13.0f);
+    const uint32_t centre = b->add_node(c, mass / 13.0f);
+    std::set<std::pair<int, int>> edges;
+    for (auto& f : faces) {
+        for (int k = 0; k < 3; k++) {
+            int a = f[k], bb = f[(k + 1) % 3];
+            edges.insert({std::min(a, bb), std::max(a, bb)});
+        }
+        b->add_triangle(f[0], f[2], f[1]);
+    }
+    for (auto& e : edges) b->add_beam(e.first, e.second, 2e6f, 400, 1e12f, 1e12f);
+    for (uint32_t i = 0; i < 12; i++) b->add_beam(i, centre, 2e6f, 400, 1e12f, 1e12f);
+    b->finalize();
+    b->stabilize(kDefaultDt);
+    b->set_velocity(vel);
+    b->collision_radius = 0.05f;
+    return b;
+}
+
+static void jitter(SoftBody& b, TRng& r, float dp, float dv) {
+    for (size_t i = 0; i < b.nodes.size(); i++) {
+        if (b.nodes[i].inv_mass <= 0) continue;
+        b.nodes[i].p += vec3(r.range(-dp, dp), r.range(-dp, dp), r.range(-dp, dp));
+        b.nodes[i].v += vec3(r.range(-dv, dv), r.range(-dv, dv), r.range(-dv, dv));
+    }
+}
+
+// Random refinements and cracks through the event queue (as the simulation does it).
+static void random_topology(SoftBody& b, TRng& r, int rounds, int refine_per_round, int cracks_per_round) {
+    for (int k = 0; k < rounds; k++) {
+        for (int i = 0; i < refine_per_round; i++) b.shell_events.push_back({(uint32_t)(r.next() % b.shells.size()), 0, 0});
+        b.process_shell_events();
+        for (int i = 0; i < cracks_per_round; i++) {
+            uint32_t s = r.next() % b.shells.size();
+            b.shell_strain(s) = 5.0f; // (crack priority)
+            b.shell_events.push_back({s, 1, (uint8_t)(r.next() % 3)});
+        }
+        b.process_shell_events();
+    }
+}
+
+static double shell_area(const SoftBody& b) {
+    double a = 0;
+    for (const auto& s : b.shells) a += s.area0;
+    return a;
+}
+
+// ------------------------------------------------------------------------------------------ invariants
+static void check_topology(const SoftBody& b, const char* what) {
+    int bad_link = 0, bad_fan = 0, bad_tri = 0, bad_mass = 0, nonfinite = 0, bad_code = 0, bad_uv = 0;
+    for (uint32_t si = 0; si < b.shells.size(); si++) {
+        const Shell& s = b.shells[si];
+        for (int e = 0; e < 3; e++) {
+            const int j = s.nb[e];
+            if (j < 0) continue;
+            const Shell& t = b.shells[j];
+            const uint32_t a = s.n[e], c = s.n[e == 2 ? 0 : e + 1];
+            int f = -1;
+            for (int q = 0; q < 3; q++) {
+                uint32_t p = t.n[q], w = t.n[q == 2 ? 0 : q + 1];
+                if ((p == a && w == c) || (p == c && w == a)) f = q;
+            }
+            if (f < 0 || t.nb[f] != (int)si) bad_link++;
+            else if (t.es[f] != s.es[e] || t.hs[f] != s.hs[e] || ((t.line >> f) & 1) != ((s.line >> e) & 1)) bad_code++;
+        }
+        const Triangle& tr = b.tris[s.tri];
+        if (tr.a != s.n[0] || tr.b != s.n[1] || tr.c != s.n[2]) bad_tri++;
+    }
+    std::vector<std::set<uint32_t>> fan(b.nodes.size());
+    for (uint32_t si = 0; si < b.shells.size(); si++)
+        for (int c = 0; c < 3; c++) fan[b.shells[si].n[c]].insert(si);
+    for (size_t v = 0; v < b.nodes.size() && v < b.node_shells.size(); v++) {
+        std::set<uint32_t> listed(b.node_shells[v].begin(), b.node_shells[v].end());
+        if (listed != fan[v] || listed.size() != b.node_shells[v].size()) bad_fan++;
+        double m = 0;
+        for (uint32_t si : fan[v]) m += b.shells[si].mass / 3.0;
+        if (!fan[v].empty() && std::fabs(m - b.nodes[v].mass) > 1e-4 * std::max(1e-3, m)) bad_mass++;
+        const Node& n = b.nodes[v];
+        if (!std::isfinite(n.p.x + n.p.y + n.p.z + n.v.x + n.v.y + n.v.z)) nonfinite++;
+        vec2 uv0(0);
+        bool first = true, same = true;
+        for (uint32_t si : fan[v]) {
+            const Shell& s = b.shells[si];
+            for (int c = 0; c < 3; c++)
+                if (s.n[c] == v) {
+                    if (first) uv0 = s.uv[c];
+                    else same &= std::fabs(s.uv[c].x - uv0.x) < 1e-5f && std::fabs(s.uv[c].y - uv0.y) < 1e-5f;
+                    first = false;
+                }
+        }
+        if (!same) bad_uv++;
+    }
+    CHECK(bad_link == 0, "%s: %d asymmetric neighbour links", what, bad_link);
+    CHECK(bad_fan == 0, "%s: %d node fans differ from the shells", what, bad_fan);
+    CHECK(bad_tri == 0, "%s: %d collision triangles differ from the shells", what, bad_tri);
+    CHECK(bad_mass == 0, "%s: %d node masses differ from the shells' shares", what, bad_mass);
+    CHECK(nonfinite == 0, "%s: %d non-finite nodes", what, nonfinite);
+    CHECK(bad_code == 0, "%s: %d edges with different pattern codes on their two sides", what, bad_code);
+    CHECK(bad_uv == 0, "%s: %d nodes with different uv in their triangles", what, bad_uv);
+}
+
+// ------------------------------------------------------------------------------------------ force kernel vs reference
+static void compare_kernels(const SoftBody& body, const char* what, float h = kDefaultDt) {
+    ref::RefBody A(body);
+    SoftBody B(body);
+    A.clear_forces(vec3(0));
+    B.clear_forces(vec3(0));
+    A.shell_acc_stale = B.shell_acc_stale = true;
+    A.ref_forces(h, 0, 1);
+    B.compute_shell_forces(h, 0, 1);
+    double fmax = 0, dmax = 0;
+    for (size_t i = 0; i < A.force.size(); i++) {
+        fmax = std::max(fmax, (double)length(A.force[i]));
+        dmax = std::max(dmax, (double)length(A.force[i] - B.force[i]));
+    }
+    // (the kernel's atan table is 1.3e-6 rad off: on the stiff hinges of a folded metal sheet that is a few 1e-4 of the force)
+    CHECK(dmax <= 5e-4 * std::max(1.0, fmax), "%s: forces differ by %.3g (max force %.3g)", what, dmax, fmax);
+    double dl = 0, dth = 0, dst = 0;
+    for (size_t s = 0; s < A.shells.size(); s++)
+        for (int e = 0; e < 3; e++) {
+            dl = std::max(dl, (double)std::fabs(A.shells[s].L[e] - B.shells[s].L[e]) / std::max(1e-6f, A.shells[s].L0[e]));
+            dth = std::max(dth, (double)std::fabs(A.shells[s].th0[e] - B.shells[s].th0[e]));
+            dst = std::max(dst, (double)std::fabs(A.shells[s].strain - B.shell_strain((uint32_t)s)) / std::max(1.0f, A.shells[s].strain));
+        }
+    CHECK(dl < 1e-4, "%s: plastic rest lengths differ by %.3g (relative)", what, dl);
+    CHECK(dth < 1e-3, "%s: plastic rest angles differ by %.3g rad", what, dth);
+    CHECK(dst < 1e-3, "%s: strains differ by %.3g", what, dst);
+    auto events = [](const SoftBody& b) {
+        std::set<std::tuple<uint32_t, int, int>> s;
+        for (auto& e : b.shell_events) s.insert({e.shell, e.kind, e.kind == 0 ? 0 : e.edge});
+        return s;
+    };
+    const auto ea = events(A), eb = events(B);
+    size_t common = 0;
+    for (auto& e : ea) common += eb.count(e);
+    // (borderline overloads may flip with rounding; nearly all events have to match)
+    CHECK(ea.size() == eb.size() || common + 2 >= std::max(ea.size(), eb.size()), "%s: overload events differ (%zu vs %zu, %zu in common)", what,
+          ea.size(), eb.size(), common);
+}
+
+static void test_kernel_equivalence() {
+    printf("kernel vs reference\n");
+    for (int variant = 0; variant < 4; variant++) {
+        const ShellMaterial m = variant == 0 ? mat_lead() : variant == 1 ? mat_glass() : variant == 2 ? mat_fabric() : mat_lead();
+        auto s = make_sheet(vec3(0, 1.4f, 0), vec3(1, 0, 0), vec3(0, 1, 0), 3.6f, 2.4f, 15, 11, 500.0f, variant == 3 ? 0 : 2, m, 7 + variant);
+        TRng r(100 + variant);
+        char name[64];
+        jitter(*s, r, 0.01f, 0.3f);
+        snprintf(name, sizeof name, "material %d, authored", variant);
+        compare_kernels(*s, name);
+        random_topology(*s, r, 12, 30, 6);
+        jitter(*s, r, 0.02f, 0.8f);
+        snprintf(name, sizeof name, "material %d, refined + cracked (%zu tris)", variant, s->shells.size());
+        compare_kernels(*s, name);
+        jitter(*s, r, 0.08f, 3.0f); // large: plastic flow, overloads, folds
+        snprintf(name, sizeof name, "material %d, heavily deformed", variant);
+        compare_kernels(*s, name);
+    }
+}
+
+static void test_momentum() {
+    printf("momentum and angular momentum of the internal forces\n");
+    ShellMaterial m = mat_lead();
+    m.aero = 0;
+    m.flex_damp = 0;
+    auto s = make_sheet(vec3(0.3f, 1.0f, -0.2f), normalize(vec3(1, 0.2f, 0)), normalize(vec3(0, 0.3f, 1)), 2.0f, 2.0f, 12, 12, 300, 0, m, 3);
+    TRng r(5);
+    random_topology(*s, r, 8, 20, 3);
+    jitter(*s, r, 0.05f, 1.0f);
+    s->clear_forces(vec3(0));
+    s->shell_acc_stale = true;
+    s->allow_break = false;
+    s->compute_shell_forces(kDefaultDt, 0, 1);
+    vec3 sum(0), torque(0);
+    double mag = 0;
+    for (size_t i = 0; i < s->nodes.size(); i++) {
+        sum += s->force[i];
+        torque += cross(s->nodes[i].p, s->force[i]);
+        mag += length(s->force[i]);
+    }
+    CHECK(length(sum) < 1e-4 * mag, "net force %.3g of %.3g", length(sum), mag);
+    CHECK(length(torque) < 1e-3 * mag, "net torque %.3g (force scale %.3g)", length(torque), mag);
+}
+
+static void test_reorder() {
+    printf("Morton renumbering keeps the sheet and its forces\n");
+    auto s = make_sheet(vec3(0, 1.4f, 0), vec3(1, 0, 0), vec3(0, 1, 0), 3.6f, 2.4f, 15, 11, 500.0f, 2, mat_lead(), 3);
+    s->shell_cap = 1u << 30;
+    TRng r(9);
+    for (int k = 0; k < 6; k++) {
+        for (int i = 0; i < 60; i++) s->shell_events.push_back({(uint32_t)(r.next() % s->shells.size()), 0, 0});
+        s->process_shell_events();
+    }
+    jitter(*s, r, 0.01f, 0.3f);
+    s->allow_break = false;
+    SoftBody a(*s), b(*s);
+    CHECK(b.reorder_shells(), "not reordered");
+    check_topology(b, "reordered");
+    a.clear_forces(vec3(0, -9.81f, 0));
+    b.clear_forces(vec3(0, -9.81f, 0));
+    a.compute_shell_forces(kDefaultDt, 0, 1);
+    b.compute_shell_forces(kDefaultDt, 0, 1);
+    // (refined only: every node has a position of its own)
+    auto sorted = [](const SoftBody& x) {
+        std::vector<std::pair<std::tuple<float, float, float>, vec3>> v;
+        for (size_t i = 0; i < x.nodes.size(); i++) v.push_back({{x.nodes[i].p.x, x.nodes[i].p.y, x.nodes[i].p.z}, x.force[i]});
+        std::sort(v.begin(), v.end(), [](auto& p, auto& q) { return p.first < q.first; });
+        return v;
+    };
+    const auto fa = sorted(a), fb = sorted(b);
+    double d = 0, m = 0;
+    for (size_t i = 0; i < fa.size(); i++) {
+        d = std::max(d, (double)length(fa[i].second - fb[i].second));
+        m = std::max(m, (double)length(fa[i].second));
+    }
+    CHECK(fa.size() == fb.size() && d <= 2e-4 * std::max(1.0, m), "forces differ by %.3g (max %.3g)", d, m);
+    CHECK(std::fabs(shell_area(a) - shell_area(b)) < 1e-6 * shell_area(a), "area changed");
+}
+
+static void test_topology() {
+    printf("topology invariants after random refinement and cracks\n");
+    for (int variant = 0; variant < 3; variant++) {
+        const ShellMaterial m = variant == 0 ? mat_lead() : variant == 1 ? mat_glass() : mat_fabric();
+        auto s = make_sheet(vec3(0), vec3(1, 0, 0), vec3(0, 0, -1), 1.7f, 1.7f, 14, 14, 100.0f, 1, m, 11 + variant);
+        const double area0 = shell_area(*s);
+        double mass0 = 0;
+        for (auto& sh : s->shells) mass0 += sh.mass;
+        TRng r(40 + variant);
+        random_topology(*s, r, 25, 40, 12);
+        char name[64];
+        snprintf(name, sizeof name, "material %d (%zu tris, %d cracks)", variant, s->shells.size(), s->shell_stats.cracks);
+        check_topology(*s, name);
+        CHECK(std::fabs(shell_area(*s) - area0) < 1e-4 * area0, "%s: area %.6f vs %.6f", name, shell_area(*s), area0);
+        double mass = 0;
+        for (auto& sh : s->shells) mass += sh.mass;
+        CHECK(std::fabs(mass - mass0) < 1e-4 * mass0, "%s: mass %.6f vs %.6f", name, mass, mass0);
+        CHECK(s->shell_stats.cracks > 0 && s->shell_stats.refined > 0, "%s: nothing happened", name);
+        // loose pieces become bodies of their own: nothing is lost
+        std::vector<std::unique_ptr<SoftBody>> pieces;
+        s->pieces_check = true;
+        s->detach_pieces(pieces);
+        double a = shell_area(*s);
+        for (auto& p : pieces) {
+            a += shell_area(*p);
+            check_topology(*p, "piece");
+        }
+        check_topology(*s, "after detaching");
+        CHECK(std::fabs(a - area0) < 1e-4 * area0, "%s: area after detaching %.6f vs %.6f (%zu pieces)", name, a, area0, pieces.size());
+    }
+}
+
+// ------------------------------------------------------------------------------------------ world level
+struct RunResult {
+    double hash = 0;
+    int cracks = 0;
+    size_t bodies = 0;
+    double area = 0;
+    float ball_min_y = 1e9f;
+    bool finite = true;
+    double ms = 0;
+};
+
+static RunResult run_impact(bool multithreaded, int frames, const ShellMaterial& m, float speed = 10.0f, double team_cost = -1) {
+    World w;
+    w.settings.multithreaded = multithreaded;
+    if (team_cost >= 0) w.settings.team_cost = team_cost;
+    auto sheet = make_sheet(vec3(0, 1.3f, 0), vec3(1, 0, 0), vec3(0, 0, -1), 1.7f, 1.7f, 14, 14, 68.0f * 2.89f, 1, m, 21);
+    const double area0 = shell_area(*sheet);
+    w.add_body(std::move(sheet));
+    w.add_body(make_ball(vec3(0.05f, 1.9f, 0.03f), 0.22f, 60.0f, vec3(0, -speed, 0)));
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int f = 0; f < frames; f++) w.step_substeps(33);
+    RunResult r;
+    r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    r.bodies = w.bodies().size();
+    for (auto& b : w.bodies()) {
+        for (size_t i = 0; i < b->nodes.size(); i++) {
+            const Node& n = b->nodes[i];
+            r.hash += (n.p.x * 1.3 + n.p.y * 2.7 + n.p.z * 3.1) * (double)((i % 97) + 1);
+            r.finite &= std::isfinite(n.p.x + n.p.y + n.p.z);
+            if (b->name == "test ball") r.ball_min_y = std::min(r.ball_min_y, n.p.y);
+        }
+        r.cracks += b->shell_stats.cracks;
+        r.area += shell_area(*b);
+    }
+    r.area /= area0;
+    return r;
+}
+
+static void test_world() {
+    printf("world: a ball through a sheet\n");
+    const RunResult a = run_impact(false, 45, mat_lead(), 14.0f);
+    CHECK(a.finite, "non-finite state");
+    CHECK(a.cracks > 0, "the sheet did not crack");
+    CHECK(a.ball_min_y < 1.3f - 0.3f, "the ball did not pass (lowest node y %.2f)", a.ball_min_y);
+    CHECK(std::fabs(a.area - 1.0) < 1e-4, "area of the sheet and its pieces %.6f of the authored one", a.area);
+    const RunResult b = run_impact(false, 45, mat_lead(), 14.0f);
+    CHECK(a.hash == b.hash, "single-threaded runs differ (%.9g vs %.9g)", a.hash, b.hash);
+    const RunResult c = run_impact(true, 45, mat_lead(), 14.0f);
+    CHECK(a.hash == c.hash, "multithreaded run differs from the single-threaded one (%.9g vs %.9g)", a.hash, c.hash);
+    const RunResult c2 = run_impact(true, 45, mat_lead(), 14.0f, 1e30);
+    CHECK(a.hash == c2.hash, "multithreaded run without teams differs from the single-threaded one (%.9g vs %.9g)", a.hash, c2.hash);
+    const RunResult c3 = run_impact(true, 45, mat_lead(), 14.0f);
+    CHECK(c3.hash == c.hash, "two multithreaded runs differ (%.9g vs %.9g)", c.hash, c3.hash);
+    printf("    %d cracks, %zu bodies, %.1f ms single / %.1f ms multithreaded for %d frames\n", a.cracks, a.bodies, a.ms, c.ms, 45);
+    const RunResult g = run_impact(false, 45, mat_glass(), 14.0f);
+    CHECK(g.finite && g.cracks > 0, "glass: finite %d, cracks %d", (int)g.finite, g.cracks);
+}
+
+// Two balls into one sheet, one after the other at different spots: the second impact has to refine the sheet around
+// it as the first one did (the refinement budget used to be spent by the first impact).
+struct ImpactStats {
+    int fine1 = 0, fine2 = 0;   // triangles of level >= 3 within 0.35 m of each impact point, after each impact
+    size_t shells = 0, cap = 0;
+    int cracks = 0;
+};
+static ImpactStats run_two_impacts(const ShellMaterial& m, float w, float h, int nu, int nv, float kg_m2, float speed, int frames_between) {
+    World w0;
+    World& W = w0;
+    W.settings.coarsen_per_frame = 0; // (the refinement budget is under test: the detail must stay)
+    auto sheet = make_sheet(vec3(0, 1.5f, 0), vec3(1, 0, 0), vec3(0, 0, -1), w, h, nu, nv, kg_m2 * w * h, 1, m, 31);
+    SoftBody* sb = W.add_body(std::move(sheet));
+    const vec3 p1(-w * 0.25f, 1.5f, 0.1f * h), p2(w * 0.25f, 1.5f, -0.1f * h);
+    W.add_body(make_ball(p1 + vec3(0, 0.5f, 0), 0.22f, 60.0f, vec3(0, -speed, 0)));
+    auto fine_near = [&](vec3 c) {
+        int n = 0;
+        for (const SoftBody* b : [&] {
+                 std::vector<const SoftBody*> v;
+                 for (auto& x : W.bodies())
+                     if (!x->shells.empty()) v.push_back(x.get());
+                 return v;
+             }())
+            for (const Shell& s : b->shells) {
+                const vec3 q = (b->nodes[s.n[0]].p + b->nodes[s.n[1]].p + b->nodes[s.n[2]].p) / 3.0f;
+                if (s.level >= 3 && length(vec3(q.x - c.x, 0, q.z - c.z)) < 0.35f) n++;
+            }
+        return n;
+    };
+    for (int f = 0; f < frames_between; f++) W.step_substeps(33);
+    ImpactStats r;
+    r.fine1 = fine_near(p1);
+    W.add_body(make_ball(p2 + vec3(0, 0.5f, 0), 0.22f, 60.0f, vec3(0, -speed, 0)));
+    for (int f = 0; f < 40; f++) W.step_substeps(33);
+    r.fine2 = fine_near(p2);
+    r.shells = sb->shells.size();
+    r.cap = sb->shell_cap;
+    for (auto& b : W.bodies()) r.cracks += b->shell_stats.cracks;
+    return r;
+}
+
+static void test_repeat_impacts() {
+    printf("repeated impacts: the second ball refines the sheet like the first\n");
+    struct Case {
+        const char* name;
+        ShellMaterial m;
+        float w, h;
+        int nu, nv;
+        float kg_m2, speed;
+    };
+    const Case cases[] = {{"lead 1.7 m", mat_lead(), 1.7f, 1.7f, 14, 14, 68.0f, 12.0f},
+                          {"lead 3.6 m", mat_lead(), 3.6f, 2.4f, 15, 11, 68.0f, 12.0f},
+                          {"glass 1.7 m", mat_glass(), 1.7f, 1.7f, 14, 14, 25.0f, 8.0f}};
+    for (const Case& c : cases) {
+        const ImpactStats r = run_two_impacts(c.m, c.w, c.h, c.nu, c.nv, c.kg_m2, c.speed, 40);
+        printf("    %-12s first impact: %d fine triangles, second: %d; %zu triangles (cap %zu), %d cracks\n", c.name, r.fine1, r.fine2, r.shells, r.cap,
+               r.cracks);
+        CHECK(r.fine1 > 0, "%s: the first impact did not refine", c.name);
+        CHECK(r.fine2 * 2 >= r.fine1, "%s: the second impact refined %d triangles, the first %d", c.name, r.fine2, r.fine1);
+    }
+}
+
+// ------------------------------------------------------------------------------------------ shapes and sizes
+struct ShapeCase {
+    const char* name;
+    SheetMeshDesc d;
+    float kg_m2;
+    double area; // expected (analytic)
+};
+static std::vector<ShapeCase> shape_cases(vec3 c, int clamp) {
+    const float pi = 3.14159265f;
+    std::vector<ShapeCase> v;
+    auto base = [&](SheetShape sh, float w, float h, int nu, int nv) {
+        SheetMeshDesc d;
+        d.center = c;
+        d.u = vec3(1, 0, 0);
+        d.v = vec3(0, 0, -1); // (lying: normal up)
+        d.width = w;
+        d.height = h;
+        d.nu = nu;
+        d.nv = nv;
+        d.shape = sh;
+        d.clamp = clamp;
+        return d;
+    };
+    v.push_back({"big 6x4 m", base(SheetShape::Rect, 6.0f, 4.0f, 31, 21), 40.0f, 24.0});
+    v.push_back({"disc 2.4 m", base(SheetShape::Disc, 2.4f, 2.4f, 21, 21), 40.0f, pi * 1.2 * 1.2});
+    {
+        ShapeCase r{"ring 2.4 m", base(SheetShape::Ring, 2.4f, 2.4f, 25, 25), 40.0f, pi * 1.44 * (1 - 0.45 * 0.45)};
+        v.push_back(r);
+    }
+    v.push_back({"triangle 2.6 m", base(SheetShape::Triangle, 2.6f, 2.2f, 21, 17), 40.0f, 0.5 * 2.6 * 2.2});
+    v.push_back({"L 2.4 m", base(SheetShape::LShape, 2.4f, 2.4f, 17, 17), 40.0f, 2.4 * 2.4 * 0.75});
+    {
+        ShapeCase h{"half-pipe", base(SheetShape::Rect, pi * 1.0f, 2.0f, 23, 15), 40.0f, pi * 1.0 * 2.0};
+        h.d.curve = 1.0f;
+        v.push_back(h);
+    }
+    {
+        ShapeCase dm{"dome", base(SheetShape::Disc, 2.4f, 2.4f, 21, 21), 40.0f, 0};
+        dm.d.dome = 1.6f;
+        const double psi = 1.2 / 1.6; // cap area 2 pi R^2 (1 - cos(psi)) for an arc length of 1.2 m
+        dm.area = 2 * pi * 1.6 * 1.6 * (1 - std::cos(psi));
+        v.push_back(dm);
+    }
+    return v;
+}
+static std::unique_ptr<SoftBody> make_shape(const ShapeCase& c, const ShellMaterial& m, uint32_t seed) {
+    auto b = std::make_unique<SoftBody>();
+    b->name = std::string("shape ") + c.name;
+    const float area = add_sheet_mesh(*b, c.d);
+    b->shell_mat = m;
+    b->collision_radius = 0.04f;
+    b->finalize();
+    b->finalize_shells(c.kg_m2, kDefaultDt, seed);
+    (void)area;
+    return b;
+}
+
+static void test_shapes() {
+    printf("sheets of other shapes and sizes: mesh, kernel, topology\n");
+    uint32_t seed = 50;
+    for (const ShapeCase& c : shape_cases(vec3(0, 1.5f, 0), 0)) {
+        for (int mat = 0; mat < 2; mat++) {
+            const ShellMaterial m = mat == 0 ? mat_lead() : mat_glass();
+            auto s = make_shape(c, m, seed++);
+            char name[96];
+            snprintf(name, sizeof name, "%s, %s", c.name, mat == 0 ? "lead" : "glass");
+            const double a0 = shell_area(*s);
+            double mass0 = 0;
+            for (auto& n : s->nodes) mass0 += n.mass;
+            if (mat == 0) {
+                check_topology(*s, name);
+                CHECK(std::fabs(a0 - c.area) < 0.04 * c.area, "%s: area %.3f, expected %.3f", name, a0, c.area);
+                CHECK(std::fabs(mass0 - c.kg_m2 * a0) < 1e-3 * mass0, "%s: node masses %.3f, expected %.3f", name, mass0, c.kg_m2 * a0);
+            }
+            TRng r(seed * 7);
+            jitter(*s, r, 0.01f, 0.3f);
+            compare_kernels(*s, name);
+            random_topology(*s, r, 10, 40, 10);
+            char name2[128];
+            snprintf(name2, sizeof name2, "%s after refinement and cracks (%zu tris)", name, s->shells.size());
+            check_topology(*s, name2);
+            CHECK(std::fabs(shell_area(*s) - a0) < 1e-4 * a0, "%s: area %.6f vs %.6f", name2, shell_area(*s), a0);
+            jitter(*s, r, 0.03f, 1.0f);
+            compare_kernels(*s, name2);
+            std::vector<std::unique_ptr<SoftBody>> pieces;
+            s->pieces_check = true;
+            s->detach_pieces(pieces);
+            double a = shell_area(*s);
+            for (auto& p : pieces) {
+                a += shell_area(*p);
+                check_topology(*p, "piece");
+            }
+            CHECK(std::fabs(a - a0) < 1e-4 * a0, "%s: area after detaching %.6f vs %.6f", name2, a, a0);
+        }
+    }
+}
+
+// A ball through each shape (clamped at its border, or held at two corners), then a second one elsewhere
+static void test_shape_impacts() {
+    printf("sheets of other shapes: two balls through each, settling\n");
+    for (int clamp : {1, 4}) {
+        for (const ShapeCase& c : shape_cases(vec3(0, 1.5f, 0), clamp)) {
+            if (clamp == 4 && std::string(c.name) != "disc 2.4 m" && std::string(c.name) != "triangle 2.6 m" && std::string(c.name) != "dome") continue;
+            World W;
+            SoftBody* sb = W.add_body(make_shape(c, mat_lead(), 77));
+            const double a0 = shell_area(*sb);
+            const vec3 p1 = vec3(-0.3f, 2.1f, 0.2f), p2 = vec3(0.35f, 2.1f, -0.25f);
+            W.add_body(make_ball(p1, 0.2f, 50.0f, vec3(0, -12.0f, 0)));
+            for (int f = 0; f < 35; f++) W.step_substeps(33);
+            W.add_body(make_ball(p2, 0.2f, 50.0f, vec3(0, -12.0f, 0)));
+            for (int f = 0; f < 45; f++) W.step_substeps(33);
+            double area = 0;
+            int cracks = 0, fine = 0;
+            bool finite = true;
+            float ball_y = 1e9f;
+            for (auto& b : W.bodies()) {
+                area += shell_area(*b);
+                cracks += b->shell_stats.cracks;
+                for (auto& s : b->shells) fine += s.level >= 3;
+                for (auto& n : b->nodes) {
+                    finite &= std::isfinite(n.p.x + n.p.y + n.p.z);
+                    if (b->name == "test ball") ball_y = std::min(ball_y, n.p.y);
+                }
+            }
+            char name[96];
+            snprintf(name, sizeof name, "%s, %s", c.name, clamp == 1 ? "clamped border" : "hung at two corners");
+            printf("    %-34s %5zu triangles, %4d at level 3+, %3d cracks, %zu bodies\n", name, sb->shells.size(), fine, cracks, W.bodies().size());
+            CHECK(finite, "%s: non-finite state", name);
+            CHECK(std::fabs(area - a0) < 1e-4 * a0, "%s: area %.6f vs %.6f", name, area, a0);
+            CHECK(fine > 20, "%s: hardly refined (%d triangles at level 3+)", name, fine);
+            CHECK(cracks > 0 || clamp == 4, "%s: no cracks", name);
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------ laser
+// ------------------------------------------------------------------------------------------ fracture patterns
+// Crack edges (free edges that are neither the border nor a laser cut) of a sheet and its pieces: their total length,
+// the length within `near` of the lines of the sheet's impacts, and the length running along direction g (|cos| > 0.9).
+struct CrackStats {
+    double len = 0, near_line = 0, along = 0;
+    int edges = 0;
+};
+static void crack_stats(const SoftBody& b, CrackStats& r, vec2 g) {
+    for (uint32_t si = 0; si < b.shells.size(); si++) {
+        const Shell& s = b.shells[si];
+        for (int e = 0; e < 3; e++) {
+            if (s.nb[e] >= 0 || (s.edges & (9u << e))) continue;
+            const vec2 xa = b.shell_x(si, e), xb = b.shell_x(si, (e + 1) % 3);
+            const float l = length(xb - xa);
+            if (l < 1e-6f) continue;
+            r.len += l;
+            r.edges++;
+            const float tol = 0.25f * l + 0.002f;
+            const float d = std::max(b.pattern_nearest(xa, tol, 1).d, std::max(b.pattern_nearest(xb, tol, 1).d, b.pattern_nearest((xa + xb) * 0.5f, tol, 1).d));
+            if (d < tol) r.near_line += l;
+            if (std::fabs(dot((xb - xa) * (1.0f / l), g)) > 0.9f) r.along += l;
+        }
+    }
+}
+
+struct PatternRun {
+    double hash = 0, area = 0, area0 = 0;
+    bool finite = true;
+    int cracks = 0, impacts = 0;
+    size_t bodies = 0;
+    CrackStats cs;
+};
+static PatternRun run_pattern(const ShellMaterial& m, float kg_m2, float speed, bool mt, int frames, vec2 at, vec2 grain = vec2(1, 0),
+                              std::unique_ptr<SoftBody>* keep = nullptr, const std::vector<ShellImpact>* measure = nullptr) {
+    World w;
+    w.settings.multithreaded = mt;
+    auto sheet = make_sheet(vec3(0, 1.3f, 0), vec3(1, 0, 0), vec3(0, 0, -1), 1.7f, 1.7f, 14, 14, kg_m2 * 2.89f, 1, m, 21);
+    PatternRun r;
+    r.area0 = shell_area(*sheet);
+    SoftBody* sb = w.add_body(std::move(sheet));
+    w.add_body(make_ball(vec3(at.x, 1.9f, -at.y), 0.22f, 60.0f, vec3(0, -speed, 0)));
+    for (int f = 0; f < frames; f++) w.step_substeps(33);
+    r.bodies = w.bodies().size();
+    r.impacts = (int)sb->shell_impacts.size();
+    for (auto& b : w.bodies()) {
+        for (size_t i = 0; i < b->nodes.size(); i++) {
+            const Node& n = b->nodes[i];
+            r.hash += (n.p.x * 1.3 + n.p.y * 2.7 + n.p.z * 3.1) * (double)((i % 97) + 1);
+            r.finite &= std::isfinite(n.p.x + n.p.y + n.p.z);
+        }
+        if (b->shells.empty()) continue;
+        r.cracks += b->shell_stats.cracks;
+        r.area += shell_area(*b);
+        if (measure) b->shell_impacts = *measure; // (a sheet without a pattern measured against another run's lines)
+        crack_stats(*b, r.cs, grain);
+        check_topology(*b, "pattern run");
+    }
+    if (keep)
+        for (auto& b : w.bodies())
+            if (b.get() == sb) *keep = std::make_unique<SoftBody>(*sb);
+    return r;
+}
+
+static void test_patterns() {
+    printf("fracture patterns: the cracks follow the material's lines round the point of impact\n");
+    // the lines of an impact laid directly: refined level by level, nodes put on the lines, codes on both sides of
+    // every edge the same, the kernel as the reference on the patterned sheet
+    {
+        const ShellMaterial m = patterned(mat_glass(), ShellPattern::Radial, 0.35f, 3.0f);
+        auto s = make_sheet(vec3(0, 1.5f, 0), vec3(1, 0, 0), vec3(0, 0, -1), 1.7f, 1.7f, 14, 14, 25.0f * 2.89f, 0, m, 5);
+        const double a0 = shell_area(*s);
+        CHECK(s->pattern_on() && std::fabs(s->shell_uvm.x - 1.7f) < 1e-3f && std::fabs(s->shell_uvm.y - 1.7f) < 1e-3f, "material plane: %.4f x %.4f m per uv",
+              s->shell_uvm.x, s->shell_uvm.y);
+        CHECK(s->add_impact(vec2(0.9f, 0.8f), 12.0f), "the impact was not laid");
+        CHECK(!s->add_impact(vec2(0.92f, 0.8f), 12.0f), "a second impact on the same spot");
+        for (int k = 0; k < 8 && s->pattern_passes > 0; k++) s->process_shell_events();
+        int line_edges = 0, on_nodes = 0, near_nodes = 0;
+        for (uint32_t si = 0; si < s->shells.size(); si++)
+            for (int e = 0; e < 3; e++) line_edges += (s->shells[si].line >> e) & 1;
+        for (uint32_t v = 0; v < s->nodes.size(); v++) {
+            float lmin = 1e9f;
+            for (uint32_t si : s->node_shells[v])
+                for (int e = 0; e < 3; e++) lmin = std::min(lmin, s->shells[si].L0[e]);
+            const PatternLine ln = s->pattern_nearest(s->node_x(v), 0.3f * lmin, 1);
+            if (ln.d < 0.3f * lmin) {
+                near_nodes++;
+                on_nodes += ln.d < 1e-4f;
+            }
+        }
+        printf("    glass web laid: %zu triangles (%zu authored), %d edges on the lines, %d of %d nodes near a line on it\n", s->shells.size(), (size_t)338,
+               line_edges / 2, on_nodes, near_nodes);
+        CHECK(line_edges > 100, "only %d edges on the lines", line_edges);
+        CHECK(on_nodes * 3 > near_nodes * 2, "%d of %d nodes near a line are on it", on_nodes, near_nodes);
+        CHECK(std::fabs(shell_area(*s) - a0) < 1e-4 * a0, "area %.6f vs %.6f", shell_area(*s), a0);
+        check_topology(*s, "glass web");
+        {
+            // (the kernels compared on a strained copy: at rest the forces are rounding noise)
+            SoftBody x(*s);
+            TRng r(77);
+            for (auto& n : x.nodes) n.p += vec3(r.range(-1, 1), r.range(-1, 1), r.range(-1, 1)) * 0.002f;
+            compare_kernels(x, "glass web");
+        }
+    }
+    // balls into sheets of three materials
+    struct Case {
+        const char* name;
+        ShellMaterial m;
+        float kg_m2, speed;
+        int frames;
+        vec2 grain;
+    };
+    const float ga = 0.5f; // (wood: fibres at 0.5 rad from u)
+    const Case cases[] = {
+        {"glass", patterned(mat_glass(), ShellPattern::Radial, 0.35f, 3.0f), 25.0f, 9.0f, 40, vec2(1, 0)},
+        {"steel", patterned(mat_steel(), ShellPattern::Punch, 0.14f, 8.0f), 47.0f, 24.0f, 40, vec2(1, 0)},
+        {"plywood", patterned(mat_plywood(), ShellPattern::Grain, 0.2f, 5.0f, ga), 11.0f, 12.0f, 40, vec2(std::cos(ga), std::sin(ga))},
+    };
+    for (const Case& c : cases) {
+        std::unique_ptr<SoftBody> sheet;
+        const PatternRun a = run_pattern(c.m, c.kg_m2, c.speed, false, c.frames, vec2(0.1f, 0.05f), c.grain, &sheet);
+        const double on = a.cs.len > 0 ? a.cs.near_line / a.cs.len : 0, along = a.cs.len > 0 ? a.cs.along / a.cs.len : 0;
+        printf("    %-8s %d impacts, %d cracks, %zu bodies, %d crack edges: %.0f%% on the impact's lines, %.0f%% along the grain\n", c.name, a.impacts, a.cracks,
+               a.bodies, a.cs.edges, on * 100, along * 100);
+        CHECK(a.finite, "%s: non-finite state", c.name);
+        CHECK(a.impacts >= 1, "%s: no pattern laid", c.name);
+        CHECK(a.cracks > 10, "%s: %d cracks", c.name, a.cracks);
+        CHECK(std::fabs(a.area - a.area0) < 1e-4 * a.area0, "%s: area %.6f vs %.6f", c.name, a.area, a.area0);
+        if (c.m.pattern != ShellPattern::Grain && sheet) {
+            // the same impact on the sheet without a pattern, measured against the same lines
+            ShellMaterial plain = c.m;
+            plain.pattern = ShellPattern::None;
+            const PatternRun b = run_pattern(plain, c.kg_m2, c.speed, false, c.frames, vec2(0.1f, 0.05f), c.grain, nullptr, &sheet->shell_impacts);
+            const double base = b.cs.len > 0 ? b.cs.near_line / b.cs.len : 0;
+            printf("             without the pattern: %d cracks, %.0f%% on the same lines\n", b.cracks, base * 100);
+            CHECK(on > 1.4 * base, "%s: %.0f%% of the crack length on the pattern's lines, %.0f%% without the pattern", c.name, on * 100, base * 100);
+        }
+        if (sheet) compare_kernels(*sheet, c.name);
+        const PatternRun b = run_pattern(c.m, c.kg_m2, c.speed, true, c.frames, vec2(0.1f, 0.05f), c.grain);
+        CHECK(a.hash == b.hash, "%s: multithreaded run differs from the single-threaded one (%.9g vs %.9g)", c.name, a.hash, b.hash);
+    }
+    // wood: the cracks run along the fibres, whichever way they go (against the same sheet without a pattern: the
+    // mesh's own directions)
+    for (float gang : {0.5f, 1.5707963f}) {
+        const vec2 g(std::cos(gang), std::sin(gang));
+        const PatternRun a = run_pattern(patterned(mat_plywood(), ShellPattern::Grain, 0.2f, 5.0f, gang), 11.0f, 12.0f, false, 40, vec2(0.1f, 0.05f), g);
+        const PatternRun b = run_pattern(mat_plywood(), 11.0f, 12.0f, false, 40, vec2(0.1f, 0.05f), g);
+        const double along = a.cs.len > 0 ? a.cs.along / a.cs.len : 0, base = b.cs.len > 0 ? b.cs.along / b.cs.len : 0;
+        printf("    plywood, fibres at %.2f rad: %.0f%% of the crack length along them (%.0f%% without the grain)\n", gang, along * 100, base * 100);
+        CHECK(along > 1.5 * base && along > 0.35, "plywood (fibres at %.2f): %.0f%% of the crack length along the grain, %.0f%% without", gang, along * 100,
+              base * 100);
+    }
+}
+
+// ------------------------------------------------------------------------------------------ coarsening
+static void test_coarsen() {
+    printf("coarsening: a settled sheet goes back to its authored triangles\n");
+    for (int depth = 1; depth <= 3; depth++) {
+        // uniform: every triangle refined `depth` times, then coarsened back
+        auto s = make_sheet(vec3(0, 1.5f, 0), vec3(1, 0, 0), vec3(0, 0, -1), 1.7f, 1.7f, 14, 14, 100.0f, 0, mat_lead(), 7);
+        const size_t n0 = s->shells.size();
+        for (int d = 0; d < depth; d++) {
+            const size_t ns = s->shells.size();
+            for (uint32_t si = 0; si < ns; si++)
+                if (s->shells[si].level < d + 1) s->shell_events.push_back({si, 0, 0});
+            s->process_shell_events();
+            // (a pass may leave some at the old level: the neighbour was split first)
+            for (int k = 0; k < 4; k++) {
+                bool any = false;
+                for (uint32_t si = 0; si < s->shells.size(); si++)
+                    if (s->shells[si].level < d + 1) { s->shell_events.push_back({si, 0, 0}); any = true; }
+                if (!any) break;
+                s->process_shell_events();
+            }
+        }
+        const size_t n1 = s->shells.size();
+        int rounds = 0;
+        for (; rounds < 20 && s->coarsen_shells(100000); rounds++) check_topology(*s, "uniform coarsening");
+        printf("    uniform depth %d: %zu -> %zu -> %zu triangles in %d rounds\n", depth, n0, n1, s->shells.size(), rounds);
+        CHECK(s->shells.size() == n0, "uniform depth %d: %zu triangles left of %zu", depth, s->shells.size(), n0);
+    }
+    for (int variant = 0; variant < 4; variant++) {
+        // 0: refined only; 1: refined + cracks; 2: glass with a fracture pattern laid; 3: clamped border (fixed nodes)
+        const ShellMaterial m = variant == 2 ? patterned(mat_glass(), ShellPattern::Radial, 0.35f, 3.0f) : mat_lead();
+        auto s = make_sheet(vec3(0, 1.5f, 0), vec3(1, 0, 0), vec3(0, 0, -1), 1.7f, 1.7f, 14, 14, 100.0f, variant == 3 ? 1 : 0, m, 40 + variant);
+        const size_t n0 = s->shells.size();
+        const double a0 = shell_area(*s);
+        double mass0 = 0;
+        for (auto& n : s->nodes) mass0 += n.mass;
+        TRng r(9 + variant);
+        if (variant == 2) {
+            s->add_impact(vec2(0.9f, 0.8f), 12.0f);
+            for (int k = 0; k < 8 && s->pattern_passes > 0; k++) s->process_shell_events();
+        }
+        random_topology(*s, r, 10, 40, variant == 1 ? 6 : 0);
+        const size_t n1 = s->shells.size();
+        int merges = 0, rounds = 0;
+        for (; rounds < 40; rounds++) {
+            const int k = s->coarsen_shells(100000);
+            if (!k) break;
+            merges += k;
+            check_topology(*s, "coarsening");
+        }
+        double mass = 0;
+        for (auto& n : s->nodes) mass += n.mass;
+        char name[64];
+        snprintf(name, sizeof name, "coarsen variant %d", variant);
+        printf("    %s: %zu -> %zu -> %zu triangles, %d merges in %d rounds, finest level %d\n", name, n0, n1, s->shells.size(), merges, rounds, s->shell_level);
+        CHECK(merges > 0, "%s: nothing merged", name);
+        CHECK(std::fabs(shell_area(*s) - a0) < 1e-4 * a0, "%s: area %.6f vs %.6f", name, shell_area(*s), a0);
+        CHECK(std::fabs(mass - mass0) < 1e-4 * mass0, "%s: mass %.6f vs %.6f", name, mass, mass0);
+        if (variant != 1) CHECK(s->shells.size() <= n0 + n0 / 10, "%s: %zu triangles left of %zu authored", name, s->shells.size(), n0);
+        else CHECK(s->shells.size() < n1 / 2, "%s: %zu triangles left of %zu refined", name, s->shells.size(), n1);
+        {
+            SoftBody x(*s);
+            TRng r2(3);
+            for (auto& n : x.nodes) n.p += vec3(r2.range(-1, 1), r2.range(-1, 1), r2.range(-1, 1)) * 0.002f;
+            compare_kernels(x, name);
+        }
+        // and it refines again like a fresh sheet
+        random_topology(*s, r, 3, 40, 0);
+        check_topology(*s, name);
+        CHECK(std::fabs(shell_area(*s) - a0) < 1e-4 * a0, "%s: area after refining again %.6f vs %.6f", name, shell_area(*s), a0);
+    }
+}
+
+// ------------------------------------------------------------------------------------------ rigid pieces
+static void test_rigid() {
+    printf("rigid pieces: a shard moves as one body, keeps its momentum, comes to rest\n");
+    // a small free sheet made rigid while spinning: momentum and angular momentum kept, the shape kept
+    {
+        auto s = make_sheet(vec3(0, 3, 0), vec3(1, 0, 0), vec3(0, 0, -1), 0.4f, 0.4f, 5, 5, 2.0f, 0, mat_glass(), 3);
+        const vec3 w0(0, 0, 3.0f), v0(1, 0, 0);
+        vec3 com(0);
+        float M = 0;
+        for (auto& n : s->nodes) com += n.p * n.mass, M += n.mass;
+        com = com / M;
+        for (auto& n : s->nodes) n.v = v0 + cross(w0, n.p - com);
+        vec3 P0(0), L0(0);
+        for (auto& n : s->nodes) P0 += n.v * n.mass, L0 += cross(n.p - com, n.v) * n.mass;
+        s->make_rigid();
+        vec3 P1(0), L1(0);
+        for (auto& n : s->nodes) P1 += n.v * n.mass, L1 += cross(n.p - com, n.v) * n.mass;
+        CHECK(length(P1 - P0) < 1e-4f * length(P0) && length(L1 - L0) < 1e-3f * length(L0), "make_rigid: momentum %.4f -> %.4f, angular %.4f -> %.4f",
+              length(P0), length(P1), length(L0), length(L1));
+        CHECK(std::fabs(length(s->rb.w) - 3.0f) < 0.05f, "make_rigid: spin %.3f rad/s (3 expected)", length(s->rb.w));
+        // a second of free flight with gravity: the centre falls like a point mass, the shape does not change
+        const vec3 c0 = s->rb.com;
+        const float d01 = length(s->nodes[0].p - s->nodes[7].p);
+        for (auto& n : s->nodes) (void)n;
+        for (int k = 0; k < 2000; k++) {
+            s->clear_forces(vec3(0, -9.81f, 0));
+            vec3 mn(1e30f), mx(-1e30f);
+            float v2 = 0;
+            s->rigid_step(0.0005f, false, mn, mx, v2);
+        }
+        const vec3 expect = c0 + v0 * 1.0f + vec3(0, -0.5f * 9.81f, 0);
+        CHECK(length(s->rb.com - expect) < 0.01f, "rigid flight: centre at (%.3f %.3f %.3f), expected (%.3f %.3f %.3f)", s->rb.com.x, s->rb.com.y, s->rb.com.z,
+              expect.x, expect.y, expect.z);
+        CHECK(std::fabs(length(s->nodes[0].p - s->nodes[7].p) - d01) < 1e-4f, "rigid flight: the shape changed (%.5f -> %.5f)", d01,
+              length(s->nodes[0].p - s->nodes[7].p));
+    }
+    if (getenv("BL_RIGIDDBG")) {
+        // a rigid shard spinning flat on the ground: friction stops it
+        World w;
+        w.statics.terrain.create(21, 21, 1.0f, vec2(-10, -10));
+        w.statics.has_terrain = true;
+        w.statics.terrain.update_bounds();
+        auto s = make_sheet(vec3(0, 0.03f, 0), vec3(1, 0, 0), vec3(0, 0, -1), 0.3f, 0.3f, 4, 4, 0.5f, 0, mat_glass(), 3);
+        s->collision_radius = 0.04f;
+        vec3 com(0); float M = 0;
+        for (auto& n : s->nodes) com += n.p * n.mass, M += n.mass;
+        com = com / M;
+        for (auto& n : s->nodes) n.v = cross(vec3(0, 6, 0), n.p - com);
+        s->make_rigid();
+        SoftBody* b = w.add_body(std::move(s));
+        for (int f = 0; f < 60; f++) {
+            w.step_substeps(33);
+            if (f % 6 == 0) printf("DBG spin t=%.2f w=%.3f v=%.3f com y=%.4f contacts %d sleeping %d\n", (f + 1) / 60.0, length(b->rb.w), length(b->rb.v), b->rb.com.y, b->static_contacts, (int)b->sleeping);
+        }
+    }
+    // a glass sheet in the world with rigid pieces: the pieces that fall off are rigid, land, sleep; area kept
+    {
+        World w;
+        w.statics.terrain.create(21, 21, 1.0f, vec2(-10, -10)); // (flat ground at y = 0)
+        w.statics.has_terrain = true;
+        w.statics.terrain.update_bounds();
+        auto sheet = make_sheet(vec3(0, 1.3f, 0), vec3(1, 0, 0), vec3(0, 0, -1), 1.7f, 1.7f, 14, 14, 25.0f * 2.89f, 1, mat_glass(), 21);
+        const double a0 = shell_area(*sheet);
+        w.add_body(std::move(sheet));
+        w.add_body(make_ball(vec3(0.05f, 1.9f, 0.03f), 0.22f, 60.0f, vec3(0, -9.0f, 0)));
+        for (int f = 0; f < 180; f++) w.step_substeps(33);
+        int pieces = 0, rigid = 0, asleep = 0, off = 0;
+        double area = 0;
+        bool finite = true;
+        float vmax = 0;
+        for (auto& b : w.bodies()) {
+            if (b->shells.empty()) continue;
+            area += shell_area(*b);
+            for (auto& n : b->nodes) finite &= std::isfinite(n.p.x + n.p.y + n.p.z);
+            if (!b->is_piece) continue;
+            pieces++;
+            rigid += b->rigid;
+            asleep += b->sleeping;
+            for (auto& n : b->nodes) {
+                vmax = std::max(vmax, length(n.v));
+                if (n.p.y < -0.5f) off++;
+            }
+        }
+        printf("    %d pieces, %d rigid, %d asleep after 3 s, top speed %.2f m/s\n", pieces, rigid, asleep, vmax);
+        if (getenv("BL_RIGIDDBG")) {
+            int hist[6] = {0};
+            for (auto& b : w.bodies()) {
+                if (!b->is_piece || b->sleeping) continue;
+                float v = 0, ymin = 1e9f;
+                for (auto& n : b->nodes) v = std::max(v, length(n.v)), ymin = std::min(ymin, n.p.y);
+                hist[std::min(5, (int)(v / 0.1f))]++;
+                if (v > 0.3f) printf("DBG piece %s: %zu nodes, speed %.2f, lowest y %.3f, com y %.3f, w %.2f, timer %.2f\n", b->name.c_str(), b->nodes.size(), v, ymin, b->rb.com.y, length(b->rb.w), b->sleep_timer);
+            }
+            printf("DBG awake piece speeds: <0.1: %d, <0.2: %d, <0.3: %d, <0.4: %d, <0.5: %d, more: %d\n", hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+        }
+        CHECK(pieces > 5 && rigid == pieces, "%d pieces, %d rigid", pieces, rigid);
+        CHECK(finite && off == 0, "finite %d, %d nodes below the ground", (int)finite, off);
+        CHECK(asleep * 2 >= pieces, "%d of %d pieces asleep after 3 s", asleep, pieces);
+        CHECK(std::fabs(area - a0) < 1e-4 * a0, "area %.6f vs %.6f", area, a0);
+    }
+}
+
+static void test_laser() {
+    printf("laser: cuts along the swept plane, nothing moves\n");
+    // a free lead sheet lying at y 1.5, a laser from above sweeping across it along x = 0.1
+    for (int variant = 0; variant < 3; variant++) {
+        const ShellMaterial m = variant == 0 ? mat_lead() : variant == 1 ? mat_glass() : mat_fabric();
+        auto s = make_sheet(vec3(0, 1.5f, 0), vec3(1, 0, 0), vec3(0, 0, -1), 1.7f, 1.7f, 14, 14, 100.0f, 0, m, 90 + variant);
+        s->compute_aabb();
+        const double a0 = shell_area(*s);
+        std::vector<vec3> p0;
+        for (auto& n : s->nodes) p0.push_back(n.p);
+        const vec3 o(0.1f, 5.0f, 0.0f);
+        // full cut: the sector reaches past both edges of the sheet
+        const int cuts = s->cut_shells(o, normalize(vec3(0, -3.5f, -2.0f)), normalize(vec3(0, -3.5f, 2.0f)), 50.0f);
+        char name[64];
+        snprintf(name, sizeof name, "full cut, material %d", variant);
+        CHECK(cuts > 10, "%s: %d links cut", name, cuts);
+        {
+            // every free edge is the border or the cut (drawn scorched)
+            int unmarked = 0, marked = 0;
+            for (const Shell& sh : s->shells)
+                for (int e = 0; e < 3; e++)
+                    if (sh.nb[e] < 0) {
+                        if ((sh.edges >> (3 + e)) & 1) marked++;
+                        else if (!((sh.edges >> e) & 1)) unmarked++;
+                    }
+            CHECK(unmarked == 0 && marked >= 2 * cuts, "%s: %d cut edges marked, %d free edges neither border nor cut", name, marked, unmarked);
+        }
+        check_topology(*s, name);
+        float moved = 0;
+        for (size_t i = 0; i < p0.size(); i++) moved = std::max(moved, length(s->nodes[i].p - p0[i]));
+        CHECK(moved == 0.0f, "%s: nodes moved by %.3g m", name, moved);
+        std::vector<std::unique_ptr<SoftBody>> pieces;
+        s->pieces_check = true;
+        s->detach_pieces(pieces);
+        CHECK(pieces.size() == 1, "%s: %zu pieces cut off (1 expected)", name, pieces.size());
+        double a = shell_area(*s);
+        for (auto& p : pieces) a += shell_area(*p);
+        CHECK(std::fabs(a - a0) < 1e-4 * a0, "%s: area %.6f vs %.6f", name, a, a0);
+        // each part on its own side of the cut (triangle centroids against x = 0.1, within a finest triangle)
+        auto one_side = [](const SoftBody& b) {
+            int neg = 0, pos = 0;
+            for (auto& sh : b.shells) {
+                const float x = (b.nodes[sh.n[0]].p.x + b.nodes[sh.n[1]].p.x + b.nodes[sh.n[2]].p.x) / 3.0f - 0.1f;
+                if (x < -0.04f) neg++;
+                if (x > 0.04f) pos++;
+            }
+            return neg == 0 || pos == 0;
+        };
+        CHECK(one_side(*s) && (pieces.empty() || one_side(*pieces[0])), "%s: a part lies on both sides of the cut", name);
+    }
+    // cuts along (and very near) the grid lines of the mesh: the plane through rows of nodes, or a hair beside them,
+    // at a small slope; the sheet must come apart all the same
+    for (int variant = 0; variant < 4; variant++) {
+        auto s = make_sheet(vec3(0, 1.5f, 0), vec3(1, 0, 0), vec3(0, 0, -1), 3.0f, 2.0f, 13, 9, 47.0f * 6.0f, 0, mat_lead(), 11);
+        s->compute_aabb();
+        const float off[4] = {0.0f, 1e-5f, -1e-5f, 0.002f}, slope[4] = {0.0f, 0.0f, 0.003f, 0.01f};
+        // the plane through the camera above x = 0, z = off, tilted by `slope` across the sheet
+        const vec3 o(0.0f, 5.0f, off[variant]);
+        const int cuts = s->cut_shells(o, normalize(vec3(-3.0f, -3.5f, -3.0f * slope[variant])), normalize(vec3(3.0f, -3.5f, 3.0f * slope[variant])), 50.0f);
+        std::vector<std::unique_ptr<SoftBody>> pieces;
+        s->pieces_check = true;
+        s->detach_pieces(pieces);
+        CHECK(pieces.size() == 1, "cut along the grid, variant %d: %d links cut, %zu pieces cut off (1 expected)", variant, cuts, pieces.size());
+    }
+    // a sweep in narrow steps (the mouse over 40 frames) across a gate-like sheet: no link left across the cut
+    for (int variant = 0; variant < 2; variant++) {
+        auto s = make_sheet(vec3(0, 2.3f, 0), vec3(1, 0, 0), vec3(0, 1, 0), 6.0f, 4.0f, 25, 17, 47.0f * 24.0f, 2, mat_steel(), 12);
+        s->compute_aabb();
+        const vec3 o(0.5f, 2.6f, -2.4f);
+        auto target = [&](float t) { return vec3(-3.2f + 6.4f * t, (variant == 0 ? 2.4f : 2.3f) - (variant == 0 ? 0.2f : 0.0f) * t, 0.0f); };
+        int cuts = 0;
+        vec3 prev = normalize(target(0) - o);
+        for (int k = 1; k <= 40; k++) {
+            const vec3 d = normalize(target((float)k / 40.0f) - o);
+            cuts += s->cut_shells(o, prev, d, 150.0f);
+            prev = d;
+        }
+        // the parts joined by edges: the cut runs from side to side, the part above and the part below are apart
+        std::vector<int> comp(s->shells.size(), -1);
+        int ncomp = 0;
+        for (uint32_t s0 = 0; s0 < s->shells.size(); s0++) {
+            if (comp[s0] >= 0) continue;
+            std::vector<uint32_t> st{s0};
+            comp[s0] = ncomp;
+            while (!st.empty()) {
+                const uint32_t x = st.back();
+                st.pop_back();
+                for (int e = 0; e < 3; e++) {
+                    const int j = s->shells[x].nb[e];
+                    if (j >= 0 && comp[j] < 0) {
+                        comp[j] = ncomp;
+                        st.push_back((uint32_t)j);
+                    }
+                }
+            }
+            ncomp++;
+        }
+        auto part_at = [&](vec3 p) {
+            float best = 1e9f;
+            int c = -1;
+            for (uint32_t si = 0; si < s->shells.size(); si++) {
+                const Shell& sh = s->shells[si];
+                const float d = length((s->nodes[sh.n[0]].p + s->nodes[sh.n[1]].p + s->nodes[sh.n[2]].p) / 3.0f - p);
+                if (d < best) best = d, c = comp[si];
+            }
+            return c;
+        };
+        const int up = part_at(vec3(0, 3.5f, 0)), down = part_at(vec3(0, 1.0f, 0));
+        CHECK(up != down, "sweep in steps across a gate, variant %d: %d links cut, the parts above and below still joined (%d parts)", variant, cuts, ncomp);
+    }
+    {
+        // a slit: the sector ends in the middle of the sheet, the sheet stays in one piece
+        auto s = make_sheet(vec3(0, 1.5f, 0), vec3(1, 0, 0), vec3(0, 0, -1), 1.7f, 1.7f, 14, 14, 100.0f, 0, mat_lead(), 95);
+        s->compute_aabb();
+        const int cuts = s->cut_shells(vec3(0.1f, 5, 0), normalize(vec3(0, -3.5f, -2.0f)), normalize(vec3(0, -3.5f, 0)), 50.0f);
+        check_topology(*s, "slit");
+        std::vector<std::unique_ptr<SoftBody>> pieces;
+        s->pieces_check = true;
+        s->detach_pieces(pieces);
+        CHECK(cuts > 3 && pieces.empty(), "slit: %d links cut, %zu pieces (a slit, not a cut through)", cuts, pieces.size());
+    }
+    {
+        // in the world: a clamped sheet cut down the middle keeps hanging in two halves; a ring cut twice gives two pieces
+        World W;
+        SoftBody* sb = W.add_body(make_sheet(vec3(0, 1.3f, 0), vec3(1, 0, 0), vec3(0, 1, 0), 3.6f, 2.4f, 15, 11, 500.0f, 3, mat_lead(), 96));
+        for (int f = 0; f < 5; f++) W.step_substeps(33);
+        const double a0 = shell_area(*sb);
+        const int cuts = W.laser_cut(vec3(0.05f, 1.3f, 6.0f), normalize(vec3(0, 3, -6)), normalize(vec3(0, -3, -6)), 50.0f);
+        for (int f = 0; f < 90; f++) W.step_substeps(33);
+        double area = 0;
+        bool finite = true;
+        for (auto& b : W.bodies()) {
+            area += shell_area(*b);
+            for (auto& n : b->nodes) finite &= std::isfinite(n.p.x + n.p.y + n.p.z);
+        }
+        CHECK(cuts > 10 && finite, "hanging sheet: %d links cut, finite %d", cuts, (int)finite);
+        CHECK(std::fabs(area - a0) < 1e-4 * a0, "hanging sheet: area %.6f vs %.6f", area, a0);
+        // two halves (both hang from the bar, so they stay one body): two parts joined by no edge
+        std::vector<int> part(sb->shells.size(), -1);
+        int parts = 0;
+        for (size_t s0 = 0; s0 < sb->shells.size(); s0++) {
+            if (part[s0] >= 0) continue;
+            std::vector<size_t> stack{s0};
+            part[s0] = parts;
+            while (!stack.empty()) {
+                const size_t k = stack.back();
+                stack.pop_back();
+                for (int e = 0; e < 3; e++) {
+                    const int j = sb->shells[k].nb[e];
+                    if (j >= 0 && part[j] < 0) {
+                        part[j] = parts;
+                        stack.push_back((size_t)j);
+                    }
+                }
+            }
+            parts++;
+        }
+        printf("    hanging lead sheet cut top to bottom: %d links cut, %d parts\n", cuts, parts);
+        CHECK(parts == 2, "hanging sheet: %d parts after the cut", parts);
+    }
+    {
+        // beams: a ball cut through its middle loses the beams that cross the plane
+        auto ball = make_ball(vec3(0, 1, 0), 0.3f, 20, vec3(0));
+        World W;
+        SoftBody* b = W.add_body(std::move(ball));
+        const int cut = W.laser_cut(vec3(0.02f, 1, 5), normalize(vec3(0, 2, -5)), normalize(vec3(0, -2, -5)), 50.0f);
+        int broken = 0;
+        for (auto& bm : b->beams) broken += (bm.flags & BF_BROKEN) ? 1 : 0;
+        int torn = 0;
+        for (auto& t : b->tris) torn += t.torn ? 1 : 0;
+        CHECK(broken > 0 && cut == broken + torn, "ball: %d cut, %d beams broken, %d surface triangles torn", cut, broken, torn);
+    }
+    // many random cuts into hanging sheets, then the dynamics: nothing blows up
+    for (int variant = 0; variant < 3; variant++) {
+        const ShellMaterial m = variant == 0 ? mat_lead() : variant == 1 ? mat_glass() : mat_fabric();
+        World W;
+        SoftBody* sb = W.add_body(make_sheet(vec3(0, 1.4f, 0), vec3(1, 0, 0), vec3(0, 1, 0), 3.6f, 2.4f, 15, 11, 300.0f, 3, m, 120 + variant));
+        const double a0 = shell_area(*sb);
+        TRng r(700 + variant);
+        int cuts = 0;
+        for (int k = 0; k < 12; k++) {
+            for (int f = 0; f < 3; f++) W.step_substeps(33);
+            const vec3 o(r.range(-1.5f, 1.5f), r.range(0.5f, 2.3f), 5.0f);
+            const vec3 t0(r.range(-2.0f, 2.0f), r.range(0.2f, 2.6f), 0), t1(r.range(-2.0f, 2.0f), r.range(0.2f, 2.6f), 0);
+            cuts += W.laser_cut(o, normalize(t0 - o), normalize(t1 - o), 50.0f);
+        }
+        float vmax = 0;
+        bool finite = true;
+        for (int f = 0; f < 60; f++) W.step_substeps(33);
+        double area = 0;
+        for (auto& b : W.bodies()) {
+            area += shell_area(*b);
+            check_topology(*b, "after random cuts");
+            for (auto& n : b->nodes) {
+                finite &= std::isfinite(n.p.x + n.p.y + n.p.z);
+                vmax = std::max(vmax, length(n.v));
+            }
+        }
+        printf("    12 random cuts, material %d: %d links cut, %zu bodies, top speed after 1 s %.1f m/s\n", variant, cuts, W.bodies().size(), vmax);
+        CHECK(finite && vmax < 30.0f, "random cuts, material %d: finite %d, top speed %.1f m/s", variant, (int)finite, vmax);
+        CHECK(std::fabs(area - a0) < 2e-4 * a0, "random cuts, material %d: area %.5f vs %.5f", variant, area, a0);
+    }
+    // shapes: a ring and a dome cut through
+    for (const ShapeCase& c : shape_cases(vec3(0, 1.5f, 0), 0)) {
+        if (std::string(c.name) != "ring 2.4 m" && std::string(c.name) != "dome" && std::string(c.name) != "L 2.4 m") continue;
+        auto s = make_shape(c, mat_lead(), 97);
+        s->compute_aabb();
+        const double a0 = shell_area(*s);
+        const int cuts = s->cut_shells(vec3(0.07f, 6, 0), normalize(vec3(0, -4.5f, -3.0f)), normalize(vec3(0, -4.5f, 3.0f)), 50.0f);
+        std::vector<std::unique_ptr<SoftBody>> pieces;
+        s->pieces_check = true;
+        s->detach_pieces(pieces);
+        double a = shell_area(*s);
+        for (auto& p : pieces) {
+            a += shell_area(*p);
+            check_topology(*p, c.name);
+        }
+        check_topology(*s, c.name);
+        const size_t expect = std::string(c.name) == "ring 2.4 m" ? 2 : 1; // (a ring cut across falls into halves: the kept one and ... )
+        printf("    %-10s %d links cut, %zu pieces\n", c.name, cuts, pieces.size());
+        CHECK(pieces.size() >= 1 && pieces.size() <= expect, "%s: %zu pieces", c.name, pieces.size());
+        CHECK(std::fabs(a - a0) < 1e-4 * a0, "%s: area %.6f vs %.6f", c.name, a, a0);
+    }
+}
+
+static void test_stability() {
+    printf("stability: a clamped sheet refined to the finest level settles\n");
+    World w;
+    w.settings.coarsen_per_frame = 0; // (the sheet is refined by hand: it must stay so)
+    auto s = make_sheet(vec3(0, 2, 0), vec3(1, 0, 0), vec3(0, 0, -1), 1.7f, 1.7f, 14, 14, 136.0f, 1, mat_lead(), 5);
+    SoftBody* b = w.add_body(std::move(s));
+    b->shell_cap = 1u << 30;
+    for (int pass = 0; pass < 4; pass++) {
+        const uint32_t n = (uint32_t)b->shells.size();
+        for (uint32_t i = 0; i < n; i++) b->shell_events.push_back({i, 0, 0});
+        b->process_shell_events();
+    }
+    b->allow_break = false; // (only the dynamics)
+    size_t mid = 0;
+    for (size_t i = 0; i < b->nodes.size(); i++)
+        if (length(b->nodes[i].p - vec3(0, 2, 0)) < length(b->nodes[mid].p - vec3(0, 2, 0))) mid = i;
+    const vec3 p0 = b->nodes[mid].p;
+    for (int f = 0; f < 150; f++) w.step_substeps(33);
+    float vmax = 0, drift = 0;
+    bool finite = true;
+    for (auto& n : b->nodes) {
+        vmax = std::max(vmax, length(n.v));
+        finite &= std::isfinite(n.p.x + n.p.y + n.p.z);
+    }
+    // (the world renumbers a sheet that grew: the node is found again by where it hangs, not by its index)
+    size_t mid2 = 0;
+    for (size_t i = 0; i < b->nodes.size(); i++) {
+        auto dxz = [&](size_t k) { return (b->nodes[k].p.x - p0.x) * (b->nodes[k].p.x - p0.x) + (b->nodes[k].p.z - p0.z) * (b->nodes[k].p.z - p0.z); };
+        if (dxz(i) < dxz(mid2)) mid2 = i;
+    }
+    drift = length(b->nodes[mid2].p - p0);
+    CHECK(finite, "non-finite nodes");
+    CHECK(b->shell_level == 4, "refinement level %d", b->shell_level);
+    CHECK(vmax < 0.5f || b->sleeping, "still moving at %.3f m/s after 2.5 s (%zu tris)", vmax, b->shells.size());
+    CHECK(drift < 0.3f, "centre sagged %.3f m", drift);
+    printf("    %zu triangles, max speed %.4f m/s, sag %.3f m\n", b->shells.size(), vmax, drift);
+}
+
+// ------------------------------------------------------------------------------------------ timing
+static void bench() {
+    printf("bench: sheet force kernel\n");
+    auto s = make_sheet(vec3(0, 1.4f, 0), vec3(1, 0, 0), vec3(0, 1, 0), 3.6f, 2.4f, 15, 11, 588.0f, 2, mat_lead(), 9);
+    s->shell_cap = 1u << 30;
+    for (int pass = 0; pass < 4; pass++) {
+        const uint32_t n = (uint32_t)s->shells.size();
+        for (uint32_t i = 0; i < n; i++) s->shell_events.push_back({i, 0, 0});
+        s->process_shell_events();
+    }
+    TRng r(3);
+    jitter(*s, r, 0.002f, 0.05f);
+    s->allow_break = false;
+    s->allow_deform = false;
+    int hinges = 0;
+    for (uint32_t si = 0; si < s->shells.size(); si++)
+        for (int e = 0; e < 3; e++) hinges += s->shells[si].nb[e] > (int)si;
+    const int reps = 400;
+    ref::RefBody A(*s);
+    for (int pass = 0; pass < 2; pass++) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; i++) {
+            if (pass == 0) {
+                A.clear_forces(vec3(0));
+                A.ref_forces(kDefaultDt, 0, 1);
+            } else {
+                s->clear_forces(vec3(0));
+                s->compute_shell_forces(kDefaultDt, 0, 1);
+            }
+        }
+        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+        printf("    %s: %zu triangles, %d hinges, %zu nodes: %.1f us per evaluation, %.1f ns per triangle\n", pass == 0 ? "reference" : "current",
+               s->shells.size(), hinges, s->nodes.size(), us, us * 1000.0 / s->shells.size());
+    }
+    {
+        const KernelCacheReport cr = measure_kernel_cache(*s);
+        printf("%s", cr.text().c_str());
+    }
+    {
+        // the same sheet renumbered along a Morton curve (as the world does it once a fifth of a sheet is new)
+        SoftBody o(*s);
+        o.reorder_shells();
+        o.clear_forces(vec3(0));
+        o.compute_shell_forces(kDefaultDt, 0, 1);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; i++) {
+            o.clear_forces(vec3(0));
+            o.compute_shell_forces(kDefaultDt, 0, 1);
+        }
+        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+        printf("    current, Morton order: %.1f us per evaluation, %.1f ns per triangle\n", us, us * 1000.0 / o.shells.size());
+        const KernelCacheReport cr = measure_kernel_cache(o);
+        printf("%s", cr.text().c_str());
+    }
+    {
+        // parts of the current kernel
+        double t_begin = 0, t_eval = 0, t_end = 0, t_gather = 0;
+        for (int i = 0; i < reps; i++) {
+            s->clear_forces(vec3(0));
+            auto t0 = std::chrono::steady_clock::now();
+            const int ch = s->shell_begin(kDefaultDt, 0, 1);
+            auto t1 = std::chrono::steady_clock::now();
+            for (int c = 0; c < ch; c++) s->shell_eval(c);
+            auto t2 = std::chrono::steady_clock::now();
+            s->shell_end();
+            auto t3 = std::chrono::steady_clock::now();
+            s->shell_gather(0, s->nodes.size(), s->force.data());
+            auto t4 = std::chrono::steady_clock::now();
+            t_begin += std::chrono::duration<double, std::micro>(t1 - t0).count();
+            t_eval += std::chrono::duration<double, std::micro>(t2 - t1).count();
+            t_end += std::chrono::duration<double, std::micro>(t3 - t2).count();
+            t_gather += std::chrono::duration<double, std::micro>(t4 - t3).count();
+        }
+        printf("    current parts (us): begin %.1f, elements %.1f, events %.1f, gather %.1f\n", t_begin / reps, t_eval / reps, t_end / reps,
+               t_gather / reps);
+    }
+}
+
+// ./build/test_physics kernel [seconds]: only the kernel in a loop (for sampling profilers)
+static void kernel_loop(double seconds) {
+    auto s = make_sheet(vec3(0, 1.4f, 0), vec3(1, 0, 0), vec3(0, 1, 0), 3.6f, 2.4f, 15, 11, 588.0f, 2, mat_lead(), 9);
+    s->shell_cap = 1u << 30;
+    for (int pass = 0; pass < 4; pass++) {
+        const uint32_t n = (uint32_t)s->shells.size();
+        for (uint32_t i = 0; i < n; i++) s->shell_events.push_back({i, 0, 0});
+        s->process_shell_events();
+    }
+    TRng r(3);
+    jitter(*s, r, 0.002f, 0.05f);
+    s->allow_break = false;
+    s->allow_deform = false;
+    s->reorder_shells();
+    const auto t0 = std::chrono::steady_clock::now();
+    long n = 0;
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < seconds) {
+        for (int i = 0; i < 100; i++) {
+            s->clear_forces(vec3(0));
+            s->compute_shell_forces(kDefaultDt, 0, 1);
+        }
+        n += 100;
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / n;
+    printf("kernel: %.1f us per evaluation, %.1f ns per triangle\n", us, us * 1000 / s->shells.size());
+}
+
+// ./build/test_physics team: cost of a parallel phase (Team) with trivial and with real chunks
+static void team_bench() {
+    std::vector<double> sink(4096, 0.0);
+    for (int work_ns : {0, 2000, 10000}) {
+        for (int chunks : {1, 4, 12, 48}) {
+            const int phases = 20000;
+            JobSystem::get().parallel_items(1, [&](int, int) {
+                Team team(true);
+                auto t0 = std::chrono::steady_clock::now();
+                for (int p = 0; p < phases; p++)
+                    team.run(chunks, [&](int c) {
+                        if (work_ns == 0) return;
+                        auto s0 = std::chrono::steady_clock::now();
+                        double x = sink[c];
+                        while (std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - s0).count() < work_ns) x += 1.0;
+                        sink[c] = x;
+                    });
+                double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / phases;
+                double ideal = (double)work_ns * 1e-3 * chunks / JobSystem::get().num_threads();
+                printf("    %2d chunks of %5d ns: %.2f us per phase (ideal %.2f)\n", chunks, work_ns, us, std::max(ideal, work_ns * 1e-3));
+            });
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ frame elements
+// The FEM frame against the engineering results it has to reproduce: a cantilever's tip deflection and rotation, its
+// twist and stretch, a portal frame's sway, the first bending frequency; a free frame spinning keeps its shape and
+// energy; plastic hinges hold the plastic moment, keep their set and break past the material's ductility; a frame
+// with a sheet skin dropped on the ground stays sound and steps alike on one thread and many.
+namespace {
+
+FrameSection frame_tube(float damping) {
+    FrameSection s = make_frame_section("Steel", FrameShape::Tube, 0.04f, 0.002f);
+    s.damping = damping;
+    return s;
+}
+
+// n members from p0 to p1, the first node clamped (position and rotation), lumped masses of the members; the joint
+// of the first member at the root
+std::unique_ptr<SoftBody> frame_line(int n, vec3 p0, vec3 p1, const FrameSection& s, uint8_t root = FJ_RIGID) {
+    auto b = std::make_unique<SoftBody>();
+    b->name = "frame line";
+    b->can_sleep = false;
+    const uint16_t si = b->fem.add_section(s);
+    const float m = s.mass_per_m() * length(p1 - p0) / n;
+    for (int i = 0; i <= n; i++) b->add_node(p0 + (p1 - p0) * ((float)i / n), i == 0 || i == n ? m * 0.5f : m, i == 0 ? NF_FIXED : NF_NONE);
+    for (int i = 0; i < n; i++) b->fem.add_element(i, i + 1, si, i == 0 ? root : FJ_RIGID);
+    b->fem.finalize(*b);
+    return b;
+}
+
+// a straight chain of n members between two nodes that exist already (the frame's nodes added between them)
+void frame_chain(SoftBody& b, uint32_t a, uint32_t c, int n, uint16_t si, std::vector<uint32_t>* made = nullptr) {
+    const FrameSection& s = b.fem.sections[si];
+    const vec3 p0 = b.nodes[a].p, p1 = b.nodes[c].p;
+    const float m = s.mass_per_m() * length(p1 - p0) / n;
+    uint32_t prev = a;
+    b.nodes[a].mass += m * 0.5f;
+    b.nodes[c].mass += m * 0.5f;
+    for (int i = 1; i <= n; i++) {
+        uint32_t cur = c;
+        if (i < n) {
+            cur = b.add_node(p0 + (p1 - p0) * ((float)i / n), m, b.info[a].flags & ~NF_FIXED);
+            if (made) made->push_back(cur);
+        }
+        b.fem.add_element(prev, cur, si);
+        prev = cur;
+    }
+}
+
+void fix_inv_mass(SoftBody& b) {
+    for (size_t i = 0; i < b.nodes.size(); i++) b.nodes[i].inv_mass = (b.info[i].flags & NF_FIXED) || b.nodes[i].mass <= 0 ? 0.0f : 1.0f / b.nodes[i].mass;
+}
+
+float tip_rotation(const SoftBody& b, uint32_t n, int axis) {
+    const vec3 r = quat_log(b.fem.q[b.fem.slot(n)]);
+    return axis == 0 ? r.x : axis == 1 ? r.y : r.z;
+}
+
+double frame_energy(const SoftBody& b) {
+    double E = 0;
+    for (const Node& n : b.nodes) E += 0.5 * n.mass * length2(n.v);
+    for (size_t i = 0; i < b.fem.node.size(); i++) E += 0.5 * b.fem.inertia[i] * length2(b.fem.w[i]);
+    return E + b.fem.strain_energy(b);
+}
+
+} // namespace
+
+static void test_frame() {
+    printf("frame elements (FEM)\n");
+    const FrameSection tube = frame_tube(2e-4f);
+    const double EI = (double)tube.E * tube.Iz, GJ = (double)tube.G * tube.J, EA = (double)tube.E * tube.A, kGA = (double)tube.G * tube.As_y;
+    printf("    steel tube 40 x 2: %.2f kg/m, EA %.3g N, EI %.0f N m2, GJ %.0f N m2, Mp %.0f N m, Np %.0f N\n", tube.mass_per_m(), EA, EI, GJ, tube.Mp, tube.Np);
+    // (quasi-static cases: backward Euler with full dissipation settles fast; dynamic ones: the defaults)
+    auto world = [](bool settle) {
+        auto w = std::make_unique<World>();
+        w->settings.gravity = vec3(0);
+        if (settle) w->settings.frame_theta = 1.0f, w->settings.frame_dissipation = 1.0f;
+        return w;
+    };
+    const float L = 1.0f;
+    // a cantilever: tip load, then tip torque, then a pull along it (quasi-static: backward Euler, damped)
+    {
+        struct Case {
+            const char* name;
+            vec3 force, torque;
+        };
+        const Case cases[] = {{"bending", vec3(0, -50, 0), vec3(0)}, {"torsion", vec3(0), vec3(20, 0, 0)}, {"tension", vec3(1e4f, 0, 0), vec3(0)}};
+        for (const Case& c : cases) {
+            auto w = world(true);
+            SoftBody* b = w->add_body(frame_line(10, vec3(0, 1, 0), vec3(L, 1, 0), tube));
+            const uint32_t tip = 10;
+            const vec3 p0 = b->nodes[tip].p;
+            b->pre_substep = [&](SoftBody& x, float) {
+                x.force[tip] += c.force;
+                x.fem.torque[x.fem.slot(tip)] += c.torque;
+            };
+            for (int i = 0; i < 4000; i++) w->step_substeps(1);
+            const vec3 d = b->nodes[tip].p - p0;
+            if (c.force.y != 0) {
+                const double P = -c.force.y;
+                const double want = P * L * L * L / (3 * EI) + P * L / kGA, got = -d.y;
+                const double want_r = P * L * L / (2 * EI), got_r = -tip_rotation(*b, tip, 2);
+                printf("    cantilever %s: tip %.4f mm (theory %.4f), rotation %.5f rad (theory %.5f)\n", c.name, got * 1e3, want * 1e3, got_r, want_r);
+                CHECK(std::fabs(got / want - 1) < 0.01, "cantilever deflection %.5g vs %.5g", got, want);
+                CHECK(std::fabs(got_r / want_r - 1) < 0.01, "cantilever tip rotation %.5g vs %.5g", got_r, want_r);
+            } else if (c.torque.x != 0) {
+                const double want = c.torque.x * L / GJ, got = tip_rotation(*b, tip, 0);
+                printf("    cantilever %s: twist %.5f rad (theory %.5f)\n", c.name, got, want);
+                CHECK(std::fabs(got / want - 1) < 0.01, "twist %.5g vs %.5g", got, want);
+            } else {
+                const double want = c.force.x * L / EA, got = d.x;
+                printf("    cantilever %s: stretch %.4f mm (theory %.4f)\n", c.name, got * 1e3, want * 1e3);
+                CHECK(std::fabs(got / want - 1) < 0.02, "stretch %.5g vs %.5g", got, want);
+            }
+            CHECK(b->fem.solve_failures == 0, "%s: %d failed solves", c.name, b->fem.solve_failures);
+        }
+    }
+    // a portal frame with clamped feet and rigid corners: sway under a side load, K = 24 EI/H^3 (6k + 1)/(6k + 4),
+    // k = (Ib / W) / (Ic / H)
+    {
+        auto w = world(true);
+        auto body = std::make_unique<SoftBody>();
+        body->name = "portal";
+        body->can_sleep = false;
+        const uint16_t si = body->fem.add_section(tube);
+        const uint32_t f0 = body->add_node(vec3(0, 0, 0), 0.0f, NF_FIXED), f1 = body->add_node(vec3(1, 0, 0), 0.0f, NF_FIXED);
+        const uint32_t c0 = body->add_node(vec3(0, 1, 0), 0.0f, NF_NONE), c1 = body->add_node(vec3(1, 1, 0), 0.0f, NF_NONE);
+        frame_chain(*body, f0, c0, 4, si);
+        frame_chain(*body, f1, c1, 4, si);
+        frame_chain(*body, c0, c1, 4, si);
+        fix_inv_mass(*body);
+        body->fem.finalize(*body);
+        SoftBody* b = w->add_body(std::move(body));
+        const vec3 a0 = b->nodes[c0].p, a1 = b->nodes[c1].p;
+        const float P = 200;
+        b->pre_substep = [&](SoftBody& x, float) { x.force[c0] += vec3(P, 0, 0); };
+        for (int i = 0; i < 4000; i++) w->step_substeps(1);
+        const double got = 0.5 * ((b->nodes[c0].p - a0).x + (b->nodes[c1].p - a1).x);
+        const double k = 1.0, K = 24 * EI * (6 * k + 1) / (6 * k + 4), want = P / K;
+        printf("    portal frame: sway %.4f mm (theory %.4f)\n", got * 1e3, want * 1e3);
+        CHECK(std::fabs(got / want - 1) < 0.02, "portal sway %.5g vs %.5g", got, want);
+    }
+    // the joints: a portal on ball feet sways PH^3 (2k + 1) / (12 EI k); a cantilever on a hinge swings freely in its
+    // plane and stands as a cantilever across it, on a swivel twists freely and bends as a cantilever; on an elastic
+    // joint its tip goes PL^3 / 3EI + PL / kGA + PL^2 / kj
+    {
+        auto w = world(true);
+        auto body = std::make_unique<SoftBody>();
+        body->name = "portal on balls";
+        body->can_sleep = false;
+        const uint16_t si = body->fem.add_section(tube);
+        const uint32_t f0 = body->add_node(vec3(0, 0, 0), 0.0f, NF_FIXED), f1 = body->add_node(vec3(1, 0, 0), 0.0f, NF_FIXED);
+        const uint32_t c0 = body->add_node(vec3(0, 1, 0), 0.0f, NF_NONE), c1 = body->add_node(vec3(1, 1, 0), 0.0f, NF_NONE);
+        frame_chain(*body, f0, c0, 4, si);
+        frame_chain(*body, f1, c1, 4, si);
+        frame_chain(*body, c0, c1, 4, si);
+        for (FrameElement& e : body->fem.elems)
+            if (body->fem.node[e.a] == f0 || body->fem.node[e.a] == f1) e.end_a = FJ_BALL;
+        fix_inv_mass(*body);
+        body->fem.finalize(*body);
+        SoftBody* b = w->add_body(std::move(body));
+        const vec3 a0 = b->nodes[c0].p, a1 = b->nodes[c1].p;
+        const float P = 100;
+        b->pre_substep = [&](SoftBody& x, float) { x.force[c0] += vec3(P, 0, 0); };
+        for (int i = 0; i < 8000; i++) w->step_substeps(1);
+        const double got = 0.5 * ((b->nodes[c0].p - a0).x + (b->nodes[c1].p - a1).x), want = P * 3.0 / (12 * EI);
+        printf("    portal on ball joints: sway %.4f mm (theory %.4f)\n", got * 1e3, want * 1e3);
+        CHECK(std::fabs(got / want - 1) < 0.02, "ball-foot portal sway %.5g vs %.5g", got, want);
+    }
+    {
+        struct Case {
+            const char* name;
+            uint8_t root;
+            vec3 force, torque;
+            int kind; // 0 cantilever deflection along the force, 1 free (moves far), 2 free twist, 3 elastic joint
+        };
+        const Case cases[] = {{"hinge, across its swing", FJ_HINGE_V, vec3(0, 0, 50), vec3(0), 0}, {"hinge, in its swing", FJ_HINGE_V, vec3(0, -20, 0), vec3(0), 1},
+                              {"swivel, bent", FJ_SWIVEL, vec3(0, -50, 0), vec3(0), 0},        {"swivel, twisted", FJ_SWIVEL, vec3(0), vec3(5, 0, 0), 2},
+                              {"elastic joint", FJ_ELASTIC, vec3(0, -50, 0), vec3(0), 3}};
+        for (const Case& c : cases) {
+            auto w = world(true);
+            FrameSection s = tube;
+            s.joint_k = 5.0e4f;
+            SoftBody* b = w->add_body(frame_line(10, vec3(0, 1, 0), vec3(L, 1, 0), s, c.root));
+            const uint32_t tip = 10;
+            const vec3 p0 = b->nodes[tip].p;
+            b->pre_substep = [&](SoftBody& x, float) {
+                x.force[tip] += c.force;
+                x.fem.torque[x.fem.slot(tip)] += c.torque;
+            };
+            for (int i = 0; i < 4000; i++) w->step_substeps(1);
+            const vec3 d = b->nodes[tip].p - p0;
+            const double P = length(c.force);
+            if (c.kind == 0 || c.kind == 3) {
+                const double got = std::fabs(dot(d, normalize(c.force)));
+                double want = P * L * L * L / (3 * EI) + P * L / kGA;
+                if (c.kind == 3) want += P * L * L / s.joint_k;
+                printf("    cantilever on a %s: tip %.4f mm (theory %.4f)\n", c.name, got * 1e3, want * 1e3);
+                CHECK(std::fabs(got / want - 1) < 0.01, "%s: %.5g vs %.5g", c.name, got, want);
+            } else if (c.kind == 1) {
+                printf("    cantilever on a %s: the tip swings %.0f mm\n", c.name, length(d) * 1e3);
+                CHECK(length(d) > 0.3f, "%s: moved only %.4f m", c.name, length(d));
+            } else {
+                // (it spins on: the rate about its axis, the angle would wrap round)
+                const float spin = std::fabs(b->fem.w[b->fem.slot(tip)].x);
+                const float bend = length(vec3(0, b->fem.w[b->fem.slot(tip)].y, b->fem.w[b->fem.slot(tip)].z));
+                printf("    cantilever on a %s: spins on its axis at %.0f rad/s (%.2g across)\n", c.name, spin, bend);
+                CHECK(spin > 10.0f && bend < 0.01f * spin, "%s: spin %.3f rad/s, %.3g across", c.name, spin, bend);
+            }
+        }
+    }
+    // a member split while loaded keeps its state (the new node on its bent shape: the strain energy and the tip stay)
+    {
+        auto w = world(true);
+        FrameSection s = tube;
+        s.Np = s.Mp = s.Tp = 0; // (elastic)
+        SoftBody* b = w->add_body(frame_line(4, vec3(0, 1, 0), vec3(L, 1, 0), s));
+        const uint32_t tip = 4;
+        b->pre_substep = [&](SoftBody& x, float) {
+            x.force[tip] += vec3(0, -50, 30);
+            x.fem.torque[x.fem.slot(tip)] += vec3(20, 0, 0);
+        };
+        for (int i = 0; i < 4000; i++) w->step_substeps(1);
+        const double U0 = b->fem.strain_energy(*b);
+        const vec3 t0 = b->nodes[tip].p;
+        const size_t n0 = b->nodes.size();
+        const int fm = b->fem.split(*b, 0, 0.5f);
+        b->fem.process_events(*b); // (analysed again)
+        b->fem.break_near(*b, vec3(1e3f), 1e-3f);
+        const double U1 = b->fem.strain_energy(*b);
+        for (int i = 0; i < 2000; i++) w->step_substeps(1);
+        const vec3 t1 = b->nodes[tip].p;
+        printf("    split under load: strain energy %.6f -> %.6f J, tip moved %.2g mm after\n", U0, U1, length(t1 - t0) * 1e3);
+        CHECK(fm >= 0 && b->nodes.size() == n0 + 1 && b->fem.elems.size() == 5, "split: node %d, %zu nodes, %zu members", fm, b->nodes.size(), b->fem.elems.size());
+        CHECK(std::fabs(U1 / U0 - 1) < 1e-3, "split changed the strain energy %.6g -> %.6g", U0, U1);
+        CHECK(length(t1 - t0) < 2e-5f, "split moved the tip by %.3g m", length(t1 - t0));
+    }
+    // the destroy tool cuts a member where it passes: split there and torn apart (nothing removed)
+    {
+        auto w = world(true);
+        SoftBody* b = w->add_body(frame_line(2, vec3(0, 1, 0), vec3(L, 1, 0), tube));
+        const size_t n0 = b->nodes.size(), e0 = b->fem.elems.size();
+        const int torn = b->fem.break_near(*b, vec3(0.25f, 1, 0), 0.02f);
+        const vec3 v0 = b->nodes[2].p;
+        b->pre_substep = [&](SoftBody& x, float) { x.force[2] += vec3(0, -20, 0); };
+        for (int i = 0; i < 2000; i++) w->step_substeps(1);
+        printf("    cut by the destroy tool: %d tear, %zu -> %zu nodes, %zu -> %zu members, the free part fell %.0f mm\n", torn, n0, b->nodes.size(), e0,
+               b->fem.elems.size(), (v0.y - b->nodes[2].p.y) * 1e3);
+        CHECK(torn == 1 && b->nodes.size() == n0 + 2 && b->fem.elems.size() == e0 + 1, "cut: %d tears, %zu nodes, %zu members", torn, b->nodes.size(), b->fem.elems.size());
+        CHECK(v0.y - b->nodes[2].p.y > 0.2f, "the cut part did not come off (%.4f m)", v0.y - b->nodes[2].p.y);
+    }
+    // the first bending frequency of the cantilever (released from its loaded shape; the least numerical damping):
+    // f1 = 1.8751^2 / (2 pi) sqrt(EI / (m L^4))
+    {
+        auto w = world(true);
+        SoftBody* b = w->add_body(frame_line(10, vec3(0, 1, 0), vec3(L, 1, 0), tube));
+        const uint32_t tip = 10;
+        bool load = true;
+        b->pre_substep = [&](SoftBody& x, float) {
+            if (load) x.force[tip] += vec3(0, -50, 0);
+        };
+        for (int i = 0; i < 4000; i++) w->step_substeps(1);
+        const float y0 = 1.0f;
+        load = false;
+        b->fem.sections[0].damping = 0;
+        w->settings = World().settings;
+        w->settings.gravity = vec3(0);
+        std::vector<double> ups;
+        float prev = b->nodes[tip].p.y - y0, amp0 = std::fabs(prev), amp_last = 0;
+        const int steps = 1200;
+        for (int i = 1; i <= steps; i++) {
+            w->step_substeps(1);
+            const float y = b->nodes[tip].p.y - y0;
+            if (prev < 0 && y >= 0) ups.push_back(i - y / (y - prev));
+            if (i > steps - 200) amp_last = std::max(amp_last, std::fabs(y));
+            prev = y;
+        }
+        const double f = ups.size() >= 2 ? (ups.size() - 1) / ((ups.back() - ups.front()) * kDefaultDt) : 0;
+        const double want = 1.8751 * 1.8751 / (2 * kPi) * std::sqrt(EI / (tube.mass_per_m() * (double)L * L * L * L));
+        printf("    cantilever frequency %.2f Hz (theory %.2f), amplitude after %.1f s: %.0f%%\n", f, want, steps * kDefaultDt, 100.0 * amp_last / amp0);
+        CHECK(std::fabs(f / want - 1) < 0.03, "frequency %.4g vs %.4g", f, want);
+        CHECK(amp_last > 0.75f * amp0, "the free vibration died out too fast (%.0f%% left)", 100.0 * amp_last / amp0);
+    }
+    // a free square frame spinning and flying: it keeps its shape, and its energy (no damping)
+    {
+        auto w = world(false);
+        w->settings.frame_dissipation = 0;
+        auto body = std::make_unique<SoftBody>();
+        body->name = "spinner";
+        body->can_sleep = false;
+        FrameSection s = tube;
+        s.damping = 0;
+        const uint16_t si = body->fem.add_section(s);
+        const uint32_t c[4] = {body->add_node(vec3(0, 2, 0), 0.0f, NF_NONE), body->add_node(vec3(1, 2, 0), 0.0f, NF_NONE),
+                               body->add_node(vec3(1, 2, 1), 0.0f, NF_NONE), body->add_node(vec3(0, 2, 1), 0.0f, NF_NONE)};
+        for (int i = 0; i < 4; i++) frame_chain(*body, c[i], c[(i + 1) % 4], 2, si);
+        fix_inv_mass(*body);
+        body->fem.finalize(*body);
+        SoftBody* b = w->add_body(std::move(body));
+        const vec3 ctr(0.5f, 2, 0.5f), om(0.7f, 3.0f, -0.4f), v0(1, 0.5f, 0);
+        for (Node& n : b->nodes) n.v = v0 + cross(om, n.p - ctr);
+        for (vec3& x : b->fem.w) x = om;
+        const double E0 = frame_energy(*b);
+        const float d0 = length(b->nodes[c[0]].p - b->nodes[c[2]].p);
+        double umax = 0;
+        for (int i = 0; i < 4000; i++) {
+            w->step_substeps(1);
+            umax = std::max(umax, b->fem.strain_energy(*b));
+        }
+        const double E1 = frame_energy(*b);
+        const float d1 = length(b->nodes[c[0]].p - b->nodes[c[2]].p);
+        printf("    spinning frame: energy %.4f -> %.4f J, strain energy up to %.2g J, diagonal %.5f -> %.5f m\n", E0, E1, umax, d0, d1);
+        CHECK(std::fabs(E1 / E0 - 1) < 0.01, "energy %.6g -> %.6g", E0, E1);
+        CHECK(std::fabs(d1 - d0) < 1e-3f, "shape: diagonal %.6f -> %.6f", d0, d1);
+        CHECK(umax < 1e-3 * E0, "strain energy %.3g in a rigid spin", umax);
+    }
+    // plastic hinges: below the collapse load the cantilever springs back, above it a hinge forms at the root and
+    // holds the plastic moment (the tip sinks until the lever is short enough: cos a = Mp / (P L)) and keeps its set
+    // when unloaded; far above it the hinge breaks
+    {
+        const double Pc = tube.Mp / L;
+        struct Case {
+            double f;
+            double set_min, set_max;
+            bool breaks;
+        };
+        // (with hardening the balance is P L cos a = Mp (1 + h a): 1.05 Pc sinks some 150 mm; a follower load across the
+        // member keeps turning the hinge until it tears at its capacity)
+        const Case cases[] = {{0.8, 0.0, 0.002, false}, {1.05, 0.08, 0.22, false}, {1.4, 0, 1e9, true}};
+        for (const Case& c : cases) {
+            auto w = world(true);
+            FrameSection sec = tube;
+            if (c.breaks) sec.hardening = 0; // (the root hinge alone takes the rotation, up to its capacity)
+            SoftBody* b = w->add_body(frame_line(10, vec3(0, 1, 0), vec3(L, 1, 0), sec));
+            const uint32_t tip = 10;
+            double P = 0;
+            // (a dashpot on the tip: the collapse is a mechanism, without it the tip would overshoot the balance)
+            b->pre_substep = [&](SoftBody& x, float) {
+                if (x.fem.broken) return;
+                vec3 dir(0, -1, 0);
+                if (c.breaks) { // (across the root member: it keeps bending the root hinge)
+                    const vec3 d = normalize(x.nodes[1].p - x.nodes[0].p);
+                    dir = vec3(d.y, -d.x, 0);
+                }
+                x.force[tip] += dir * (float)P - x.nodes[tip].v * 40.0f;
+            };
+            float peak_util = 0, max_drop = 0;
+            for (int i = 0; i < 8000; i++) {
+                const double t = i * kDefaultDt; // 1 s up, 1 s held, 1 s down, 1 s at rest
+                P = c.f * Pc * (t < 1 ? t : t < 2 || c.breaks ? 1 : t < 3 ? 3 - t : 0);
+                w->step_substeps(1);
+                if (!b->fem.elems[0].broken) peak_util = std::max(peak_util, b->fem.elems[0].util);
+                max_drop = std::max(max_drop, 1.0f - b->nodes[tip].p.y);
+            }
+            const float set = 1.0f - b->nodes[tip].p.y;
+            const bool broke = b->fem.broken > 0;
+            if (broke) CHECK(b->fem.elems.size() >= 10 && b->nodes.size() > 11, "torn, not removed: %zu members, %zu nodes", b->fem.elems.size(), b->nodes.size());
+            printf("    plastic, %.2f x collapse load%s: peak %.3f of the yield at the root, sank %.1f mm, set %.1f mm, hinge %.2f rad%s\n", c.f, c.breaks ? " (following)" : "",
+                   peak_util, max_drop * 1e3, set * 1e3, b->fem.elems[0].dmg_a, broke ? ", torn off" : "");
+            CHECK(broke == c.breaks, "%.2f Pc: broken %d", c.f, (int)broke);
+            if (!c.breaks) {
+                CHECK(set >= c.set_min && set <= c.set_max, "%.2f Pc: set %.4f m (%.3f - %.3f)", c.f, set, c.set_min, c.set_max);
+                CHECK(peak_util <= 1.02f, "%.2f Pc: the root moment reached %.3f of the (hardened) yield", c.f, peak_util);
+            } else {
+                CHECK(b->fem.elems[0].dmg_a >= tube.hinge_capacity * 0.99f, "torn before the joint's capacity: %.3f of %.3f rad", b->fem.elems[0].dmg_a,
+                      tube.hinge_capacity);
+            }
+        }
+    }
+    // a frame box with a sheet-metal roof, dropped on the ground: sound, and the same on one thread and on many
+    {
+        auto run = [&](bool mt, double& hash, float& vmax, int& failures, int& broken, bool& finite) {
+            World w;
+            w.settings.multithreaded = mt;
+            w.statics.terrain.create(21, 21, 1.0f, vec2(-10, -10));
+            w.statics.has_terrain = true;
+            w.statics.terrain.update_bounds();
+            auto body = std::make_unique<SoftBody>();
+            body->name = "frame box";
+            const uint16_t si = body->fem.add_section(frame_tube(2e-5f));
+            const float y0 = 0.4f, H = 0.6f, S = 1.0f;
+            const int n = 4; // (roof edges split to take the sheet)
+            uint32_t k[8];
+            for (int i = 0; i < 8; i++) k[i] = body->add_node(vec3((i & 1) ? S : 0, y0 + ((i & 4) ? H : 0), (i & 2) ? S : 0), 0.0f);
+            // the roof grid (n x n cells) with its border on the roof's members
+            std::vector<uint32_t> g((n + 1) * (n + 1), ~0u);
+            auto gid = [&](int i, int j) -> uint32_t& { return g[j * (n + 1) + i]; };
+            gid(0, 0) = k[4], gid(n, 0) = k[5], gid(0, n) = k[6], gid(n, n) = k[7];
+            auto edge = [&](uint32_t a, uint32_t b, int i0, int j0, int di, int dj) {
+                std::vector<uint32_t> made;
+                frame_chain(*body, a, b, n, si, &made);
+                for (int t = 1; t < n; t++) gid(i0 + di * t, j0 + dj * t) = made[t - 1];
+            };
+            edge(k[4], k[5], 0, 0, 1, 0);
+            edge(k[6], k[7], 0, n, 1, 0);
+            edge(k[4], k[6], 0, 0, 0, 1);
+            edge(k[5], k[7], n, 0, 0, 1);
+            for (int j = 1; j < n; j++)
+                for (int i = 1; i < n; i++) gid(i, j) = body->add_node(vec3(S * i / n, y0 + H, S * j / n), 0.0f);
+            // the posts and the floor
+            frame_chain(*body, k[0], k[1], 2, si), frame_chain(*body, k[2], k[3], 2, si);
+            frame_chain(*body, k[0], k[2], 2, si), frame_chain(*body, k[1], k[3], 2, si);
+            for (int i = 0; i < 4; i++) frame_chain(*body, k[i], k[i + 4], 2, si);
+            for (int j = 0; j < n; j++)
+                for (int i = 0; i < n; i++) {
+                    const uint32_t a = gid(i, j), bb = gid(i + 1, j), cc = gid(i + 1, j + 1), e = gid(i, j + 1);
+                    auto uv = [&](int x, int y) { return vec2((float)x / n, (float)y / n); };
+                    body->add_shell(a, e, cc, uv(i, j), uv(i, j + 1), uv(i + 1, j + 1));
+                    body->add_shell(a, cc, bb, uv(i, j), uv(i + 1, j + 1), uv(i + 1, j));
+                }
+            body->shell_mat = mat_steel();
+            fix_inv_mass(*body);
+            body->finalize();
+            body->finalize_shells(8.0f, kDefaultDt, 3, true);
+            body->fem.finalize(*body);
+            for (Node& x : body->nodes) x.v = vec3(0.3f, -3.0f, 0);
+            SoftBody* b = w.add_body(std::move(body));
+            vmax = 0;
+            for (int f = 0; f < 60; f++) {
+                w.step_substeps(33);
+                if (f > 40)
+                    for (const Node& x : b->nodes) vmax = std::max(vmax, length(x.v));
+            }
+            hash = 0;
+            finite = true;
+            for (size_t i = 0; i < b->nodes.size(); i++) {
+                const Node& x = b->nodes[i];
+                hash += (x.p.x * 1.3 + x.p.y * 2.7 + x.p.z * 3.1) * (double)((i % 97) + 1);
+                finite &= std::isfinite(x.p.x + x.p.y + x.p.z);
+            }
+            failures = b->fem.solve_failures;
+            broken = b->fem.broken;
+        };
+        double h1, h2;
+        float v1, v2;
+        int f1, f2, b1, b2;
+        bool ok1, ok2;
+        run(false, h1, v1, f1, b1, ok1);
+        run(true, h2, v2, f2, b2, ok2);
+        printf("    frame box with a roof dropped: speed after 1.4 s %.3f m/s, %d failed solves, %d members broken\n", v1, f1, b1);
+        CHECK(ok1 && ok2, "non-finite state");
+        CHECK(f1 == 0 && b1 == 0, "failed solves %d, broken members %d", f1, b1);
+        CHECK(v1 < 0.5f, "still moving at %.3f m/s", v1);
+        CHECK(h1 == h2, "multithreaded run differs (%.9g vs %.9g)", h1, h2);
+    }
+    // a small piece torn off a frame leaves it as a rigid body (the frame goes on without those members) and falls
+    {
+        World w;
+        w.statics.terrain.create(21, 21, 1.0f, vec2(-10, -10));
+        w.statics.has_terrain = true;
+        w.statics.terrain.update_bounds();
+        auto body = std::make_unique<SoftBody>();
+        body->name = "frame box";
+        const uint16_t si = body->fem.add_section(frame_tube(2e-5f));
+        uint32_t k[8];
+        for (int i = 0; i < 8; i++) k[i] = body->add_node(vec3((i & 1) ? 1.0f : 0, 0.3f + ((i & 4) ? 0.6f : 0), (i & 2) ? 1.0f : 0), 0.0f);
+        for (int i = 0; i < 8; i += 4) {
+            frame_chain(*body, k[i], k[i + 1], 2, si), frame_chain(*body, k[i + 2], k[i + 3], 2, si);
+            frame_chain(*body, k[i], k[i + 2], 2, si), frame_chain(*body, k[i + 1], k[i + 3], 2, si);
+        }
+        for (int i = 0; i < 4; i++) frame_chain(*body, k[i], k[i + 4], 2, si);
+        const uint32_t tip = body->add_node(vec3(1.6f, 0.9f, 0), 0.0f);
+        const uint32_t stick = (uint32_t)body->fem.elems.size();
+        frame_chain(*body, k[5], tip, 2, si);
+        fix_inv_mass(*body);
+        body->finalize();
+        body->fem.finalize(*body);
+        SoftBody* b = w.add_body(std::move(body));
+        for (int f = 0; f < 30; f++) w.step_substeps(33);
+        const size_t members0 = b->fem.elems.size(), bodies0 = w.bodies().size();
+        const bool torn = b->fem.tear(*b, stick, 0);
+        b->topo_changed = true, b->topo_version++, b->shk.version++;
+        for (int f = 0; f < 90; f++) w.step_substeps(33);
+        const SoftBody* piece = nullptr;
+        for (size_t i = bodies0; i < w.bodies().size(); i++)
+            if (!w.bodies()[i]->fem.empty()) piece = w.bodies()[i].get();
+        float ymin = 1e9f, vmax = 0;
+        if (piece)
+            for (const Node& x : piece->nodes) ymin = std::min(ymin, x.p.y), vmax = std::max(vmax, length(x.v));
+        printf("    stick torn off a frame box: %s, %zu members (the box %zu -> %zu), at rest %.3f m/s, lowest point %.3f m\n", piece ? "a rigid piece" : "no piece",
+               piece ? piece->fem.elems.size() : 0, members0, b->fem.elems.size(), vmax, ymin);
+        CHECK(torn, "the tear was refused");
+        CHECK(piece && piece->rigid && piece->fem.elems.size() == 2, "the stick did not leave as a rigid piece of 2 members");
+        CHECK(b->fem.elems.size() == members0 - 2 && b->fem.solve_failures == 0, "the box has %zu members (want %zu), %d failed solves", b->fem.elems.size(), members0 - 2,
+              b->fem.solve_failures);
+        CHECK(piece && ymin > -0.05f && vmax < 0.3f, "the piece is not resting on the ground (lowest %.3f, speed %.3f)", ymin, vmax);
+    }
+}
+
+int main(int argc, char** argv) {
+    JobSystem::get().init(std::max(1, JobSystem::performance_cores() - 1)); // (as the application: performance cores only)
+    if (argc > 1 && std::strcmp(argv[1], "team") == 0) {
+        team_bench();
+        JobSystem::get().shutdown();
+        return 0;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "kernel") == 0) {
+        kernel_loop(argc > 2 ? atof(argv[2]) : 3.0);
+        JobSystem::get().shutdown();
+        return 0;
+    }
+    const bool do_bench = argc > 1 && std::strcmp(argv[1], "bench") == 0;
+    setvbuf(stdout, nullptr, _IOLBF, 0); // (lines in order with the warnings on stderr)
+    // `only <name>`: one section (kernel, momentum, topology, reorder, repeat, shapes, shape_impacts, patterns, laser,
+    // stability, world, frame)
+    const char* only = argc > 2 && std::strcmp(argv[1], "only") == 0 ? argv[2] : nullptr;
+    auto run = [&](const char* name, void (*f)()) {
+        if (!only || std::strcmp(only, name) == 0) f();
+    };
+    run("kernel", test_kernel_equivalence);
+    run("momentum", test_momentum);
+    run("topology", test_topology);
+    run("reorder", test_reorder);
+    run("repeat", test_repeat_impacts);
+    run("shapes", test_shapes);
+    run("shape_impacts", test_shape_impacts);
+    run("patterns", test_patterns);
+    run("coarsen", test_coarsen);
+    run("rigid", test_rigid);
+    run("laser", test_laser);
+    run("stability", test_stability);
+    run("world", test_world);
+    run("frame", test_frame);
+    if (do_bench) bench();
+    printf("\n%d checks passed, %d failed\n", g_pass, g_fail);
+    JobSystem::get().shutdown();
+    return g_fail == 0 ? 0 : 1;
+}

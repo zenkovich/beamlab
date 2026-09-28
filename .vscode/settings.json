@@ -1,0 +1,6 @@
+{
+    "cmake.configureOnOpen": false,
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+    "clangd.arguments": ["--compile-commands-dir=${workspaceFolder}/build"],
+    "files.associations": { "*.glsl": "glsl", "*.vert": "glsl", "*.frag": "glsl", "*.truck": "plaintext" }
+}

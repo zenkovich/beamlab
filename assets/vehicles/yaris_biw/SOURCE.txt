@@ -1,0 +1,2 @@
+Crash-test FE models
+2010 Toyota Yaris coarse finite element model v1l by the Center for Collision Safety and Analysis (George Mason University), sponsored by the Federal Highway Administration: https://www.ccsa.gmu.edu/models/2010-toyota-yaris/ (CCSA and FHWA acknowledged). Simplified to a node-beam frame with sheet panels by tools/import_lsdyna_car.py; the FE model itself is not included.
