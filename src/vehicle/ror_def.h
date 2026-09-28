@@ -347,6 +347,16 @@ struct Document {
         float joint_k = 2.0e4f;     // elastic joints (N m/rad)
     };
     std::vector<FrameSectionDef> frame_sections;
+    // (BeamLab) `welds`: anchor, sheet node, radius m, break force N[, stiffness N/m[, anchor2, t]]: the sheet held on a frame node (or the point t of the way to anchor2) at
+    // a point, the pull spread over the sheet's nodes round the weld's node (their weights falling off to zero at the
+    // radius) instead of on the one node (phys::SoftBody::Weld); no stiffness: the most the step allows
+    struct WeldDef {
+        int anchor = 0, node = 0;
+        float radius = 0.2f, brk = 0, k = 0;
+        int anchor2 = -1;           // (`..., stiffness, anchor2, t`: held at the point t of the way to anchor2)
+        float t = 0;
+    };
+    std::vector<WeldDef> welds;
     std::vector<JointDef> joints;
     std::vector<ShellDef> shells;
     std::vector<TieDef> ties;

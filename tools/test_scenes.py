@@ -7,7 +7,8 @@ sheet_run: the car drives through all three lead sheets, each cracks, pieces fal
 materials: glass shatters, rubber holds, the metals punch through, the ball lays each material's fracture pattern;
 physics lab: cannonballs through the steel sheet;
 sheet shapes: the car through the 6 x 4 m gate and the dome, cannonballs through each panel, a laser cut across the gate;
-frame car: hung from a crane tilted about both axes, its wheels hang in their travel;
+frame car: hung from a crane tilted about both axes, its wheels hang in their travel; standing its welded panels hold,
+it steers past 25 degrees, into the wall its rear wheels stay straight;
 steel barrels (and with FEM rings): dropped, rolled, thrown and stacked they dent but keep their shape, a 40 kg ball dents
 them without sticking, nothing tears; tipped over or dropped they come to rest where they land; left alone they stay put;
 the pile of 15 with three thrown in within a 30 FPS frame; the editor's drum from a circle lands and rests;
@@ -169,6 +170,25 @@ for roll, pitch in ((8, 6), (-12, -9)):
     ang = max(max(abs(h[3]), abs(h[4])) for h in hang) if ok else 99
     check("frame_car: hung tilted %+d/%+d deg, the wheels hang" % (roll, pitch), ok and drop < 0.04 and track < 0.02 and ang < 3 and st and st[-1] == ("0", "0") and unstable(out) == 0,
           "wheels %.1f cm lower, track %+.1f cm, camber/toe up to %.1f deg, %s splits, %s torn" % (drop * 100, track * 100, ang, st[-1][0] if st else "?", st[-1][1] if st else "?"))
+
+# ---- the Frame Car (a hatchback's panels welded on its frame): standing 4 s nothing tears (no weld, no crack), the
+# steering turns the front wheels past 25 degrees, and launched at the wall the rear wheels stay within 20 degrees of
+# straight (their short toe links turned them through 90 degrees when the tail lifted; the toe stops)
+out = run(["--scene", "frame_car", "--size", "640x360", "--frames", "240", "--hidden", "--novsync", "--drive", "0,1.0",
+           "--screenshot", os.path.join(TMP, "fc2.png")], {"BL_SHELLDBG": "235", "BL_WHEELDBG": "1"})
+wb = re.findall(r"(\d+) of (\d+) welds broken", out)
+cr = re.findall(r"Frame Car\s+shells.*?cracks\s+(\d+)", out)
+toe = [abs(float(t)) for t in re.findall(r"toe ([-\d.]+) camber", out)[-4:]]
+check("frame car: standing, steering", bool(wb and cr and toe) and wb[-1][0] == "0" and int(wb[-1][1]) > 500 and cr[-1] == "0" and min(toe[:2]) > 25 and max(toe[2:]) < 2,
+      "%s welds broken of %s, %s cracks, front toe %s, rear toe %s deg" % (wb[-1][0] if wb else "?", wb[-1][1] if wb else "?", cr[-1] if cr else "?",
+                                                                         ", ".join("%.1f" % t for t in toe[:2]), ", ".join("%.1f" % t for t in toe[2:])))
+out = run(["--scene", "frame_car", "--size", "640x360", "--frames", "400", "--hidden", "--novsync", "--drive", "0,0.0001", "--action", "Launch at the wall",
+           "--screenshot", os.path.join(TMP, "fc3.png")], {"BL_WHEELDBG": "1", "BL_SHELLDBG": "395"})
+toe = [abs(float(t)) for t in re.findall(r"toe ([-\d.]+) camber", out)[-4:]]
+fr = re.findall(r"frame: (\d+) members, (\d+) splits, (\d+) torn, (\d+) failed solves", out)
+check("frame car: into the wall at 60 km/h", bool(toe and fr) and max(toe[2:]) < 20 and fr[-1][3] == "0" and unstable(out) == 0,
+      "rear toe %s deg, %s splits, %s torn, %s failed solves, %d warnings" % (", ".join("%.1f" % t for t in toe[2:]), fr[-1][1] if fr else "?", fr[-1][2] if fr else "?",
+                                                                          fr[-1][3] if fr else "?", unstable(out)))
 
 # ---- steel barrels (a closed sheet: its volume in the BL_SHELLDBG block, 100% = 0.2232 m3): dropped on its bottom, side and
 # rim, rolled down the ramp, thrown at another and stacked it dents but keeps its shape (a few percent); the 40 kg ball

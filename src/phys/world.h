@@ -160,7 +160,8 @@ public:
     // Laser cut: everything the sector swept by a ray from `o` turning from d0 to d1 passes through (within `range`) is cut
     // along it: sheets are cut (SoftBody::cut_shells), beams, joints and surface triangles crossing it break. No impulse.
     // Returns the number of links / beams cut.
-    int laser_cut(vec3 o, vec3 d0, vec3 d1, float range);
+    // `skip`: a body left whole (the blade that does the cutting).
+    int laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip = nullptr);
     void wake_all();
     // A sheet cracked a loose piece off: it is a new body now (the game gives it a visual).
     std::function<void(SoftBody* parent, SoftBody* piece)> on_piece;

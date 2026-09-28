@@ -48,7 +48,7 @@ const char* const kTieOpts = "nvis";
 enum class Kw : uint8_t {
     NONE,
     // blocks with a handler here
-    AXLES, BEAMS, BRAKES, CAB, CAMERAS, CINECAM, COMMANDS, COMMANDS2, CONTACTERS, ENGINE, ENGOPTION, FIXES, JOINTS, SHELLS,
+    AXLES, BEAMS, BRAKES, CAB, CAMERAS, CINECAM, COMMANDS, COMMANDS2, CONTACTERS, ENGINE, ENGOPTION, FIXES, JOINTS, SHELLS, WELDS,
     FLEXBODIES, FLEXBODYWHEELS, GLOBALS, GUISETTINGS, HYDROS, MANAGEDMATERIALS, MESHWHEELS, MESHWHEELS2, MINIMASS,
     NODES, NODES2, PROPS, ROPES, SHOCKS, SHOCKS2, SHOCKS3, TEXCOORDS, TIES, TORQUECURVE, WHEELDETACHERS, WHEELS,
     WHEELS2,
@@ -107,7 +107,7 @@ const KwInfo kKeywords[] = {
     {"guisettings", Kw::GUISETTINGS, false}, {"help", Kw::HELP, false}, {"hideinchooser", Kw::HIDEINCHOOSER, false},
     {"hookgroup", Kw::HOOKGROUP, false}, {"hooks", Kw::HOOKS, false}, {"hydros", Kw::HYDROS, false},
     {"importcommands", Kw::IMPORTCOMMANDS, false}, {"interaxles", Kw::INTERAXLES, false},
-    {"joints", Kw::JOINTS, false}, {"lockgroups", Kw::LOCKGROUPS, false}, {"lockgroup_default_nolock", Kw::LOCKGROUP_DEFAULT_NOLOCK, false},
+    {"joints", Kw::JOINTS, false}, {"welds", Kw::WELDS, false}, {"lockgroups", Kw::LOCKGROUPS, false}, {"lockgroup_default_nolock", Kw::LOCKGROUP_DEFAULT_NOLOCK, false},
     {"managedmaterials", Kw::MANAGEDMATERIALS, false}, {"materialflarebindings", Kw::MATERIALFLAREBINDINGS, false},
     {"meshwheels", Kw::MESHWHEELS, false}, {"meshwheels2", Kw::MESHWHEELS2, false},
     {"minimass", Kw::MINIMASS, false}, {"nodecollision", Kw::NODECOLLISION, false}, {"nodes", Kw::NODES, false},
@@ -902,6 +902,18 @@ void Parser::data_line() {
         md().joints.push_back(j);
         return;
     }
+    case Kw::WELDS: { // (BeamLab) anchor, sheet node, radius m, break force N[, stiffness N/m]
+        if (!need(2)) return;
+        Document::WeldDef w;
+        w.anchor = ref(0);
+        w.node = ref(1);
+        if (ntok_ > 2) w.radius = f(2);
+        if (ntok_ > 3) w.brk = f(3);
+        if (ntok_ > 4) w.k = f(4);
+        if (ntok_ > 6) w.anchor2 = ref(5), w.t = f(6);
+        md().welds.push_back(w);
+        return;
+    }
     case Kw::SHELLS: // (BeamLab) the cab triangles that are triangle elements: n1, n2, n3
         if (!need(3)) return;
         md().shells.push_back({ref(0), ref(1), ref(2), shell_mat_});
@@ -1597,6 +1609,7 @@ void Parser::merge(const Module& m) {
     app(doc_.ties, s.ties);
     app(doc_.fixes, s.fixes);
     app(doc_.joints, s.joints);
+    app(doc_.welds, s.welds);
     {
         // (a module's shell materials follow the ones before: its shells' indices move with them)
         const int off = (int)doc_.shell_materials.size();
@@ -1692,6 +1705,10 @@ template <class F> void Parser::for_each_ref(F&& fix) {
         if (j.ref_y >= 0) fix(j.ref_y);
     }
     for (auto& s : d.shells) fix(s.n1), fix(s.n2), fix(s.n3);
+    for (auto& w : d.welds) {
+        fix(w.anchor), fix(w.node);
+        if (w.anchor2 >= 0) fix(w.anchor2);
+    }
     for (auto& s : d.slidenodes) {
         fix(s.node);
         for (int& n : s.rail) fix(n);

@@ -120,6 +120,7 @@ private:
     std::vector<phys::Shock> m_spawn_shocks;
     std::vector<phys::Frame> m_spawn_frames;
     std::vector<phys::Joint> m_spawn_joints;
+    std::vector<phys::Weld> m_spawn_welds;  // (the sheet's welds on the frame as built: make_sheet_body)
     phys::FemFrame m_spawn_fem;             // the frame elements as built (rest orientations: definition space)
     std::unique_ptr<ShellVisual> m_sheet;   // sheet body (make_sheet_body): its visual, and the pristine sheet for resets
     std::unique_ptr<FrameVisual> m_frame;   // the frame elements' tubes

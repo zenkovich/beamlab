@@ -222,6 +222,20 @@ struct SoftBoxDesc {
 };
 std::unique_ptr<DynamicObject> build_soft_box(phys::World& w, const SoftBoxDesc& d, const std::string& name);
 
+// A giant axe on a pendulum: a handle hung from its pivot (two fixed nodes on the axis, which runs along z) and a
+// blade at its foot, released at `angle` from hanging straight down (towards -x): it swings down under its weight.
+// Its cutting edge is the blade's leading side (the one it swings towards): edge_node its middle.
+struct AxeDesc {
+    vec3 pivot;
+    float length = 8.2f;                                // pivot to the blade's edge
+    float blade_w = 1.8f, blade_h = 1.5f, thick = 0.12f; // the blade: across the swing, along the handle, thickness (z)
+    float handle = 0.24f;                               // the handle's section
+    float mass = 2000.0f;
+    float angle = 1.3f;
+    MaterialPtr mat;
+};
+std::unique_ptr<DynamicObject> build_axe(phys::World& w, const AxeDesc& d, const std::string& name, uint32_t* edge_node = nullptr);
+
 struct SoftSphereDesc {
     vec3 center;
     float radius = 0.6f;

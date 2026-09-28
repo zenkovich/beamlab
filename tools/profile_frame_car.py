@@ -2,9 +2,10 @@
 """The Frame Car's stress tests, profiled (headless, fixed 60 Hz frames): per scenario the physics and frame time
 (mean, 95th percentile, worst) after the action, the frame elements' share, the members torn and split.
 
-    python3 tools/profile_frame_car.py [scenario ...]      (names: drive, drop, roof, roll, curb, wall, ramp, balls)
+    python3 tools/profile_frame_car.py [scenario ...]      (names: drive, drop, roof, roll, curb, wall, ramp, balls, steel,
+                                                            drop10, headon, tbone, slab, pole, axe; BL_PROF_OUT=dir keeps the CSVs)
 """
-import csv, os, re, subprocess, sys, tempfile
+import csv, os, re, shutil, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, "build", "beamlab")
@@ -19,6 +20,12 @@ SCEN = {
     "ramp": (["--action", "Off the ramp"], 420),
     "balls": (["--shoot", "1,45,0.12", "--camera", "look:0,1.6,-7,0,0.6,0"], 600),
     "steel": (["--shoot", "0,40,0.1", "--camera", "look:0,6,-3,0,0.6,0"], 900),
+    "drop10": (["--action", "Drop from 10"], 420),
+    "headon": (["--action", "Head-on into another"], 420),
+    "tbone": (["--action", "Another Frame Car into its side"], 420),
+    "slab": (["--action", "Drop a 5 t concrete slab"], 360),
+    "pole": (["--action", "Launch at the pole"], 420),
+    "axe": (["--action", "The giant axe"], 360),
 }
 
 
@@ -35,6 +42,9 @@ def run(name):
     env = dict(os.environ, BL_PROFCSV=path)
     out = subprocess.run([EXE, "--scene", "frame_car", "--size", "1280x720", "--frames", str(frames), "--hidden", "--novsync",
                           "--screenshot", os.path.join(TMP, name + ".png")] + args, env=env, capture_output=True, text=True, timeout=1800)
+    if os.environ.get("BL_PROF_OUT"):   # (the per-frame CSV kept: charts)
+        os.makedirs(os.environ["BL_PROF_OUT"], exist_ok=True)
+        shutil.copy(path, os.path.join(os.environ["BL_PROF_OUT"], name + ".csv"))
     rows = list(csv.DictReader(open(path)))[10:]
     phys = [float(r["physics_ms"]) for r in rows]
     cpu = [float(r["cpu_ms"]) for r in rows]

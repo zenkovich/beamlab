@@ -831,6 +831,92 @@ std::unique_ptr<DynamicObject> build_soft_box(World& w, const SoftBoxDesc& d, co
     return obj;
 }
 
+// ====================================================================================== axe
+std::unique_ptr<DynamicObject> build_axe(World& w, const AxeDesc& d, const std::string& name, uint32_t* edge_node) {
+    auto body = std::make_unique<SoftBody>();
+    body->name = name;
+    auto sv = std::make_unique<SurfaceVisual>();
+    sv->mat = d.mat ? d.mat : SharedAssets::get().metal;
+    // (hanging straight down from the pivot, then turned by the release angle about the axis)
+    const float c = std::cos(d.angle), sn = std::sin(d.angle);
+    auto place = [&](vec3 l) { return d.pivot + vec3(l.x * c + l.y * sn, -l.x * sn + l.y * c, l.z); };
+    const float h = d.handle * 0.5f;
+    struct Box {
+        int nx, ny, nz;
+        uint32_t first;
+        uint32_t id(int x, int y, int z) const { return first + (uint32_t)((z * ny + y) * nx + x); }
+    };
+    // a box of nodes (lo..hi in the axe's own frame), its beams to all neighbours, its six faces
+    auto box = [&](int nx, int ny, int nz, vec3 lo, vec3 hi, float mass) {
+        Box b{nx, ny, nz, (uint32_t)body->nodes.size()};
+        const float nm = mass / (float)(nx * ny * nz);
+        for (int z = 0; z < nz; z++)
+            for (int y = 0; y < ny; y++)
+                for (int x = 0; x < nx; x++) {
+                    const vec3 t((float)x / (nx - 1), (float)y / (ny - 1), (float)z / (nz - 1));
+                    body->add_node(place(lo + (hi - lo) * t), nm, NF_GROUND | NF_CONTACTER);
+                }
+        const float kk = clamp_k(5e8f, nm);
+        for (int z = 0; z < nz; z++)
+            for (int y = 0; y < ny; y++)
+                for (int x = 0; x < nx; x++)
+                    for (int dz = -1; dz <= 1; dz++)
+                        for (int dy = -1; dy <= 1; dy++)
+                            for (int dx = -1; dx <= 1; dx++) {
+                                const int x2 = x + dx, y2 = y + dy, z2 = z + dz;
+                                if (x2 < 0 || y2 < 0 || z2 < 0 || x2 >= nx || y2 >= ny || z2 >= nz || b.id(x2, y2, z2) <= b.id(x, y, z)) continue;
+                                body->add_beam(b.id(x, y, z), b.id(x2, y2, z2), kk, 0.02f * kk * kDefaultDt, 1e12f, 1e12f);
+                            }
+        const int dims[3] = {nx, ny, nz};
+        for (int axis = 0; axis < 3; axis++)
+            for (int side = 0; side < 2; side++) {
+                const int u_ax = (axis + 1) % 3, v_ax = (axis + 2) % 3, fixed = side ? dims[axis] - 1 : 0;
+                for (int v = 0; v < dims[v_ax] - 1; v++)
+                    for (int u = 0; u < dims[u_ax] - 1; u++) {
+                        uint32_t q[4];
+                        vec2 uv[4];
+                        const int du[4] = {0, 1, 1, 0}, dv[4] = {0, 0, 1, 1};
+                        for (int k = 0; k < 4; k++) {
+                            int cc[3];
+                            cc[axis] = fixed, cc[u_ax] = u + du[k], cc[v_ax] = v + dv[k];
+                            q[k] = b.id(cc[0], cc[1], cc[2]);
+                            uv[k] = vec2((float)(u + du[k]), (float)(v + dv[k])) * 0.5f;
+                        }
+                        const int o[6] = {0, 1, 2, 0, 2, 3}, r[6] = {0, 2, 1, 0, 3, 2};
+                        const int* t = side ? o : r;
+                        for (int k = 0; k < 6; k += 3) {
+                            add_face_surface(*sv, q[t[k]], q[t[k + 1]], q[t[k + 2]], uv[t[k]], uv[t[k + 1]], uv[t[k + 2]]);
+                            body->add_triangle(q[t[k]], q[t[k + 1]], q[t[k + 2]]);
+                        }
+                    }
+            }
+        return b;
+    };
+    const float top = -(d.length - d.blade_h); // (the blade's top, the handle's foot)
+    const Box hb = box(2, 7, 2, vec3(-h, top, -h), vec3(h, -0.35f, h), 0.25f * d.mass);
+    const Box bb = box(5, 3, 2, vec3(-0.5f * d.blade_w, -d.length, -0.5f * d.thick), vec3(0.5f * d.blade_w, top, 0.5f * d.thick), 0.75f * d.mass);
+    // the handle's foot into the blade's top; its head on the pivot (two fixed nodes on the axis: it swings about it)
+    const float kj = clamp_k(5e8f, 0.25f * d.mass / 28.0f);
+    for (int z = 0; z < 2; z++)
+        for (int x = 0; x < 2; x++)
+            for (int bz = 0; bz < 2; bz++)
+                for (int bx = 0; bx < 5; bx++) body->add_beam(hb.id(x, 0, z), bb.id(bx, 2, bz), kj, 0.02f * kj * kDefaultDt, 1e12f, 1e12f);
+    for (float z : {-0.45f, 0.45f}) {
+        const uint32_t p = body->add_node(place(vec3(0, 0, z)), 1.0f, NF_FIXED);
+        for (int hz = 0; hz < 2; hz++)
+            for (int x = 0; x < 2; x++) body->add_beam(p, hb.id(x, 6, hz), kj, 0.02f * kj * kDefaultDt, 1e12f, 1e12f);
+    }
+    if (edge_node) *edge_node = bb.id(4, 1, 0); // (released towards -x it swings towards +x: the blade's +x side leads)
+    body->collision_radius = 0.04f;
+    body->finalize();
+    body->stabilize(kDefaultDt);
+    auto obj = std::make_unique<DynamicObject>();
+    obj->name = name;
+    obj->body = w.add_body(std::move(body));
+    obj->surfaces.push_back(std::move(sv));
+    return obj;
+}
+
 // ====================================================================================== soft sphere
 std::unique_ptr<DynamicObject> build_soft_sphere(World& w, const SoftSphereDesc& d, const std::string& name) {
     // icosphere

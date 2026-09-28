@@ -171,6 +171,7 @@ void Vehicle::reset(vec3 pos, float yaw_deg) {
     b.shocks = m_spawn_shocks;
     b.frames = m_spawn_frames;
     b.joints = m_spawn_joints;
+    b.welds = m_spawn_welds;
     b.fem = m_spawn_fem;
     if (!m_sheet && !m_spawn_info.empty()) {
         b.info = m_spawn_info;
@@ -377,6 +378,14 @@ void Vehicle::make_sheet_body(const ShellMaterial& mat, float kg_m2, MaterialPtr
     // beam, would be put in Morton order here, and the editor's drum of 64 triangles came apart on its first frame)
     b.keep_node_order = true;
     b.finalize_shells(kg_m2, kDefaultDt, 7, true);
+    // the sheet's welds on the frame (`welds`): built on the sheet as spawned, kept for the resets
+    int bad_welds = 0;
+    for (const auto& w : m_def.welds)
+        if (w.anchor < 0 || w.node < 0 || !b.add_weld((uint32_t)w.anchor, (uint32_t)w.node, w.radius, w.brk, w.k, kDefaultDt / (float)(1 << b.shell_min_shift), w.anchor2, w.t))
+            bad_welds++;
+    if (bad_welds) log_warn("vehicle '%s': %d welds on no sheet node", name.c_str(), bad_welds);
+    if (!b.welds.empty()) log_info("vehicle '%s': the sheet on %zu welds (%zu nodes held), membrane %.3g N/m, %d short steps", name.c_str(), b.welds.size(), b.weld_nodes.size(), b.shell_mat.membrane, 1 << b.shell_min_shift);
+    m_spawn_welds = b.welds;
 
     m_mass = 0;
     for (const Node& n : b.nodes) m_mass += n.mass;

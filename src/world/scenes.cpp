@@ -1195,20 +1195,29 @@ void apply_vehicle_sheet_body(Vehicle* v, bool player) {
         } else {
             m.min_piece = std::max(m.min_piece, 12);
         }
+        // (a car's glass is set in its frame: the frame's twist bends it, a windscreen driven at full lock in place
+        // cracked; it takes three times the plate's bend before it breaks, still shatters when hit)
+        if (mname == "Glass") m.bend_break *= getenv("BL_GLASS_BEND") ? (float)atof(getenv("BL_GLASS_BEND")) : 3.0f;
         if (const char* ml = getenv("BL_SHEET_MAXLEVEL")) m.max_level = atoi(ml); // diagnostics: refinement depth
         return m;
     };
     // A body of the sheet alone (no beam holds it: the model editor's drum from a circle): a metal's plane held by the
     // membrane projection (its yield force sigma_y t), as the Steel Barrels' (with the springs the step allows, a car's
     // panels on their frame, a 2 mm steel drum dropped 1.5 m lay flat)
+    // Panels welded on a frame (`welds`: nodes of their own, no beam) are the same: the welds hold them, their plane
+    // held by the projection, and the sheet takes 4 short steps a substep (its hinges the budget of 1 mm of steel
+    // bending: on its own light nodes at one step the budget left a panel as limp as cloth, the glass cracked standing)
     const bool sheet_alone = v->body && v->body->beams.empty();
+    const bool welded = v->body && !v->def().welds.empty();
+    if (welded) v->body->shell_min_shift = std::max(v->body->shell_min_shift, getenv("BL_CAR_SHIFT") ? atoi(getenv("BL_CAR_SHIFT")) : 0); // (diagnostics: 2, 4 short steps: more cracks standing, no faster)
     auto membrane = [&](phys::ShellMaterial& m, const std::string& mname, float kgm2) {
-        if (!sheet_alone) return;
-        const float sy = mname == "Steel" ? 250e6f : mname == "Aluminium" ? 150e6f : mname == "Lead" ? 12e6f : 0.0f;
-        const float rho = mname == "Steel" ? 7850.0f : mname == "Aluminium" ? 2700.0f : 11340.0f;
+        if (!sheet_alone && !welded) return;
+        // (glass: its tensile strength, it flows past it only to crack at its fracture strain soon after)
+        const float sy = mname == "Steel" ? 250e6f : mname == "Aluminium" ? 150e6f : mname == "Lead" ? 12e6f : mname == "Glass" ? 40e6f : 0.0f;
+        const float rho = mname == "Steel" ? 7850.0f : mname == "Aluminium" ? 2700.0f : mname == "Glass" ? 2500.0f : 11340.0f;
         if (sy <= 0) return;
         m.membrane = sy * kgm2 / rho;
-        m.yield = 0.0015f;
+        m.yield = mname == "Glass" ? 0.0008f : 0.0015f;
     };
     auto look = [&](const std::string& mname, vec3 color) {
         auto vis = mat_visual(mat_spec(mname.c_str()));
@@ -1792,6 +1801,26 @@ void frame_car_grab(Game& g, float lift, float strength) {
     b.wake();
 }
 
+// what the stress tests put into the scene besides the player's car (a second car, the slab, the axe): cleared by
+// the next test
+struct FrameCarExtras {
+    Vehicle* other = nullptr;
+    DynamicObject* slab = nullptr;
+    DynamicObject* axe = nullptr;
+    uint32_t axe_edge = 0;
+    vec3 axe_pivot{0};
+    vec3 axe_dir{0};  // (the edge's direction from the pivot last frame: the sector it swept is cut)
+    float axe_reach = 0; // (the pivot to the edge's lower end)
+};
+FrameCarExtras s_fc;
+
+void frame_car_clear(Game& g) {
+    if (s_fc.other) g.remove_vehicle(s_fc.other);
+    if (s_fc.slab) g.remove_object(s_fc.slab);
+    if (s_fc.axe) g.remove_object(s_fc.axe);
+    s_fc = FrameCarExtras();
+}
+
 } // namespace
 
 void scene_frame_car(Game& g) {
@@ -1811,11 +1840,75 @@ void scene_frame_car(Game& g) {
     g.no_player_vehicle = true;
     g.set_spawn(vec3(0, 0, 0), 0);
     g.spawn_vehicle("frame_car/frame_car", vec3(0, 0, 0), 0, true);
+    g.add_static_cylinder(vec3(16, 0, 150), 0.16f, 4.0f, SURF_CONCRETE, A.concrete); // (a pole beside the wall)
     g.labels.push_back({vec3(0, 3.6f, 150), "WALL"});
+    g.labels.push_back({vec3(16, 4.4f, 150), "POLE"});
     g.labels.push_back({vec3(40, 3.0f, 84), "RAMP"});
     g.labels.push_back({vec3(-40, 1.0f, 48), "CURB"});
     const float kmh = 1.0f / 3.6f;
-    g.scene_actions.push_back({"Drop from 5 m", [](Game& gg) { frame_car_stunt(gg, vec3(0, 0, 20), 0, 5.0f, quat(), vec3(0), vec3(0)); }});
+    frame_car_clear(g);
+    s_fc = FrameCarExtras();
+    // the axe's cut: each frame, the sector its edge swept about the pivot (a plane across the car) cuts what it crosses
+    // (ahead of the blade: from where the edge is to where it will be in a frame and a half, so the edge meets what it
+    // cut, not the car it has to push through first)
+    g.scene_update = [](Game& gg, float dt) {
+        if (!s_fc.axe || !s_fc.axe->body) return;
+        const SoftBody& ab = *s_fc.axe->body;
+        const vec3 e = ab.nodes[s_fc.axe_edge].p - s_fc.axe_pivot, v = ab.nodes[s_fc.axe_edge].v;
+        const float r = length(e);
+        if (r < 1e-3f || length(v) < 2.0f) return;
+        // (half a metre ahead at least: the blade's edge is a flat face 12 cm wide, it pushed the car along with it
+        // from the door's skin before the cut reached the frame's tubes inside)
+        const float vl = length(v), lead = std::max(vl * 1.5f * std::max(dt, 1.0f / 60.0f), 0.5f);
+        const vec3 d0 = e / r, d1 = normalize(e + v * (lead / vl));
+        const vec3 from = length2(s_fc.axe_dir) > 0 && dot(s_fc.axe_dir, d0) < 0.99999f ? s_fc.axe_dir : d0;
+        const int n = gg.world.laser_cut(s_fc.axe_pivot, from, d1, s_fc.axe_reach + 0.02f, &ab);
+        if (getenv("BL_AXEDBG")) {
+            const Vehicle* car = gg.player_vehicle();
+            printf("axe: edge (%.2f %.2f %.2f) v %.1f from (%.3f %.3f %.3f) to (%.3f %.3f %.3f), %d cut; car box (%.2f %.2f %.2f)-(%.2f %.2f %.2f)\n", ab.nodes[s_fc.axe_edge].p.x,
+                   ab.nodes[s_fc.axe_edge].p.y, ab.nodes[s_fc.axe_edge].p.z, length(v), from.x, from.y, from.z, d1.x, d1.y, d1.z, n, car ? car->body->aabb.mn.x : 0,
+                   car ? car->body->aabb.mn.y : 0, car ? car->body->aabb.mn.z : 0, car ? car->body->aabb.mx.x : 0, car ? car->body->aabb.mx.y : 0, car ? car->body->aabb.mx.z : 0);
+        }
+        s_fc.axe_dir = d1;
+    };
+    g.scene_actions.push_back({"Drop from 5 m", [](Game& gg) { frame_car_clear(gg), frame_car_stunt(gg, vec3(0, 0, 20), 0, 5.0f, quat(), vec3(0), vec3(0)); }});
+    g.scene_actions.push_back({"Drop from 10 m", [](Game& gg) { frame_car_clear(gg), frame_car_stunt(gg, vec3(0, 0, 20), 0, 10.0f, quat(), vec3(0), vec3(0)); }});
+    g.scene_actions.push_back({"Head-on into another Frame Car (50 km/h each)", [kmh](Game& gg) {
+                                   frame_car_clear(gg);
+                                   frame_car_stunt(gg, vec3(0, 0, 50), 0, 0.0f, quat(), vec3(0, 0, 50 * kmh), vec3(0));
+                                   s_fc.other = gg.spawn_vehicle("frame_car/frame_car", vec3(0.25f, 0, 72), 180, false);
+                                   if (s_fc.other) s_fc.other->launch(vec3(0, 0, -50 * kmh));
+                               }});
+    g.scene_actions.push_back({"Another Frame Car into its side at 50 km/h", [kmh](Game& gg) {
+                                   frame_car_clear(gg);
+                                   frame_car_stunt(gg, vec3(0, 0, 60), 0, 0.0f, quat(), vec3(0), vec3(0));
+                                   s_fc.other = gg.spawn_vehicle("frame_car/frame_car", vec3(-9, 0, 59.6f), 90, false);
+                                   if (s_fc.other) s_fc.other->launch(vec3(50 * kmh, 0, 0));
+                               }});
+    g.scene_actions.push_back({"Drop a 5 t concrete slab on it from 2.5 m", [](Game& gg) {
+                                   frame_car_clear(gg);
+                                   frame_car_stunt(gg, vec3(0, 0, 20), 0, 0.0f, quat(), vec3(0), vec3(0));
+                                   SoftBoxDesc d;
+                                   d.center = vec3(0, 1.45f + 2.5f + 0.15f, 20);
+                                   d.size = vec3(2.2f, 0.3f, 4.2f);
+                                   d.nx = 3, d.ny = 2, d.nz = 5;
+                                   d.mass = 5000.0f;
+                                   d.beams = {1e9f, 4e4f, 1e12f, 1e12f, 0.0f};
+                                   d.mat = SharedAssets::get().concrete;
+                                   s_fc.slab = gg.add_object(build_soft_box(gg.world, d, "slab"));
+                               }});
+    g.scene_actions.push_back({"Launch at the pole at 50 km/h", [kmh](Game& gg) {
+                                   frame_car_clear(gg), frame_car_stunt(gg, vec3(16.4f, 0, 115), 0, 0.0f, quat(), vec3(0, 0, 50 * kmh), vec3(0));
+                               }});
+    g.scene_actions.push_back({"The giant axe (it swings down and cuts the car in two)", [](Game& gg) {
+                                   frame_car_clear(gg);
+                                   frame_car_stunt(gg, vec3(-25, 0, 120), 0, 0.0f, quat(), vec3(0), vec3(0));
+                                   AxeDesc d;
+                                   d.pivot = vec3(-25, 8.35f, 120);
+                                   s_fc.axe_pivot = d.pivot;
+                                   s_fc.axe_reach = std::sqrt(0.25f * d.blade_w * d.blade_w + d.length * d.length);
+                                   s_fc.axe = gg.add_object(build_axe(gg.world, d, "axe", &s_fc.axe_edge));
+                               }});
     g.scene_actions.push_back(
         {"Drop on the roof from 1.5 m", [](Game& gg) { frame_car_stunt(gg, vec3(0, 0, 20), 0, 3.3f, quat::axis_angle(vec3(0, 0, 1), kPi), vec3(0), vec3(0)); }});
     g.scene_actions.push_back({"Barrel roll at 50 km/h", [kmh](Game& gg) {

@@ -586,8 +586,8 @@ void App::frame(float dt) {
             vec3 c(0);
             for (const auto& n : b.nodes) c += n.p / (float)b.nodes.size();
             if (!b.fem.empty())
-                printf("    frame: %zu members, %d splits, %d torn, %d failed solves, %d clamps, %d energy cuts\n", b.fem.elems.size(), b.fem.splits, b.fem.broken,
-                       b.fem.solve_failures, b.fem.clamps, b.guard_cuts);
+                printf("    frame: %zu members, %d splits, %d torn, %d failed solves, %d clamps, %d energy cuts, %d of %zu welds broken\n", b.fem.elems.size(), b.fem.splits,
+                       b.fem.broken, b.fem.solve_failures, b.fem.clamps, b.guard_cuts, b.stats.broken_welds, b.welds.size());
             if (closed) printf("    area %.5f m2 (the sheet and its pieces), volume %.5f m3, centre (%.3f %.3f %.3f)\n", area, std::abs(vol), c.x, c.y, c.z);
             else printf("    area %.5f m2 (the sheet and its pieces)\n", area);
             printf("  %-18s shells %5zu (levels %d %d %d %d %d) nodes %5zu refined %5d cracks %5d pieces %zu (%zu triangles, biggest %zu)%s | k %.3g bend %.3g | impacts %zu\n",

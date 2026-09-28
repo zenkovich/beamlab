@@ -389,9 +389,26 @@ struct SlideNode {
 class SoftBody;
 using SubstepCallback = std::function<void(SoftBody& body, float dt)>;
 
+// A sheet held on a frame at a point (a spot weld, a rivet, a bolt): the anchor (a frame node) holds the weighted
+// centre of the sheet's nodes round the weld's node at its rest offset (turned with the anchor's frame node), a spring
+// with damping; the weights fall off with the distance from the weld's node, to zero at the weld's radius, so the pull
+// is spread over the sheet there instead of tearing one node out of it. Past `brk` it lets go for good.
+struct Weld {
+    uint32_t anchor = 0;
+    uint32_t anchor2 = 0;           // a weld on a frame member between two nodes: the second, at `t` from `anchor`
+    float t = 0;                    // (0: at `anchor` alone)
+    int32_t slot = -1;              // the anchor's frame node (FemFrame::slot): its turn turns the offset; -1: none
+    uint32_t first = 0, count = 0;  // the sheet's nodes: SoftBody::weld_nodes / weld_w [first, first + count)
+    vec3 off{0, 0, 0};              // the anchor's rest offset from the nodes' weighted centre (the frame node's space)
+    float k = 0, c = 0;             // stiffness N/m, damping N s/m
+    float brk = 0;                  // force at which it lets go (0: never)
+    bool broken = false;
+};
+
 struct BodyStats {
     int broken_beams = 0;
     int broken_joints = 0;
+    int broken_welds = 0;
     float max_speed = 0;
 };
 
@@ -407,6 +424,9 @@ public:
     std::vector<Shock> shocks;
     std::vector<Frame> frames;
     std::vector<Joint> joints;
+    std::vector<Weld> welds;             // sheets held on the frame (see Weld)
+    std::vector<uint32_t> weld_nodes;
+    std::vector<float> weld_w;
     std::vector<Triangle> tris;
     std::vector<Capsule> capsules;
     std::vector<Wheel> wheels;
@@ -664,6 +684,13 @@ public:
     void compute_beam_forces();
     void compute_shock_forces();
     void compute_joint_forces();
+    // A weld of the sheet's node `node` on the frame node `anchor` (the nodes where they are now: its rest state): the
+    // sheet's nodes within `radius` of it, reached across its triangles, weighted (1 - d / radius)^2; stiffness `k`
+    // (0: the most the short step `h` allows on the nodes' effective mass, as does any given), damped to a third of
+    // critical. With anchor2: the point `t` of the way from the anchor to it on the member between them holds it (the
+    // pull shared in that proportion). Returns false if the node is on no triangle.
+    bool add_weld(uint32_t anchor, uint32_t node, float radius, float brk, float k, float h, int anchor2 = -1, float t = 0);
+    void compute_weld_forces();
     void compute_wheel_forces(float dt);
     void compute_slide_forces();
     // Edge springs + bending hinges of the shells; overloads are queued as events.

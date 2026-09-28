@@ -1712,6 +1712,7 @@ void World::simulate_island(Island& isl, int substeps) {
         b.compute_beam_forces();
         if (!b.shocks.empty()) b.compute_shock_forces();
         if (!b.joints.empty()) b.compute_joint_forces();
+        if (!b.welds.empty()) b.compute_weld_forces();
         if (!b.fem.empty() && (controller || b.fem_every_step) && !b.rigid) { // (once per substep: the frame's step, FemFrame::solve)
             PROFILE_ACCUM("Frame elements");
             b.fem.compute_forces(b);
@@ -2212,7 +2213,7 @@ int World::destroy_at(vec3 p, float radius, float impulse) {
     return broken;
 }
 
-int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range) {
+int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip) {
     vec3 m = cross(d0, d1);
     if (length2(m) < 1e-14f) return 0; // (the ray did not move: nothing swept)
     m = normalize(m);
@@ -2230,6 +2231,7 @@ int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range) {
     int cut = 0;
     for (auto& bp : m_bodies) {
         SoftBody& b = *bp;
+        if (&b == skip) continue;
         int pos = 0, neg = 0;
         for (int k = 0; k < 8; k++) {
             const vec3 c((k & 1) ? b.aabb.mx.x : b.aabb.mn.x, (k & 2) ? b.aabb.mx.y : b.aabb.mn.y, (k & 4) ? b.aabb.mx.z : b.aabb.mn.z);
@@ -2249,6 +2251,12 @@ int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range) {
             b.stats.broken_joints++;
             cut++;
         }
+        for (Weld& wd : b.welds) { // (a weld whose sheet reaches across the cut: it holds neither side)
+            if (wd.broken) continue;
+            const vec3 ap = b.nodes[wd.anchor].p * (1 - wd.t) + b.nodes[wd.anchor2].p * wd.t;
+            for (uint32_t i = wd.first; i < wd.first + wd.count && !wd.broken; i++)
+                if (crosses(ap, b.nodes[b.weld_nodes[i]].p)) wd.broken = true, b.stats.broken_welds++, cut++;
+        }
         if (!b.fem.empty() && !b.rigid) {
             // frame members: cut where they cross the swept plane (the ones hit first, then the cuts: a split adds members)
             std::vector<std::pair<uint32_t, float>> hits;
@@ -2259,6 +2267,13 @@ int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range) {
                 const float sa = side(pa), sc = side(pc);
                 if ((sa < 0) == (sc < 0)) continue;
                 const float t = sa / (sa - sc);
+                static const bool ldbg = getenv("BL_LASERDBG") != nullptr;
+                if (ldbg) {
+                    const vec3 x = pa + (pc - pa) * t, w = x - o;
+                    auto ang = [&](vec3 v) { return std::atan2(dot(cross(vec3(0, -1, 0), v), m), dot(vec3(0, -1, 0), v)) * 57.2958f; };
+                    printf("  member %zu crosses at (%.2f %.2f %.2f) r %.2f angle %.2f, wedge %.2f..%.2f -> %d\n", ei, x.x, x.y, x.z, length(w), ang(w), ang(d0), ang(d1),
+                           (int)in_wedge(x));
+                }
                 if (in_wedge(pa + (pc - pa) * t)) hits.push_back({(uint32_t)ei, t});
             }
             int tears = 0;
