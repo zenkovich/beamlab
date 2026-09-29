@@ -49,6 +49,7 @@ enum class Kw : uint8_t {
     NONE,
     // blocks with a handler here
     AXLES, BEAMS, BRAKES, CAB, CAMERAS, CINECAM, COMMANDS, COMMANDS2, CONTACTERS, ENGINE, ENGOPTION, FIXES, JOINTS, SHELLS, WELDS, MOUNTS, FEM_TRIS,
+    COLLISION_VOLUMES,
     FLEXBODIES, FLEXBODYWHEELS, GLOBALS, GUISETTINGS, HYDROS, MANAGEDMATERIALS, MESHWHEELS, MESHWHEELS2, MINIMASS,
     NODES, NODES2, PROPS, ROPES, SHOCKS, SHOCKS2, SHOCKS3, TEXCOORDS, TIES, TORQUECURVE, WHEELDETACHERS, WHEELS,
     WHEELS2,
@@ -107,7 +108,7 @@ const KwInfo kKeywords[] = {
     {"guisettings", Kw::GUISETTINGS, false}, {"help", Kw::HELP, false}, {"hideinchooser", Kw::HIDEINCHOOSER, false},
     {"hookgroup", Kw::HOOKGROUP, false}, {"hooks", Kw::HOOKS, false}, {"hydros", Kw::HYDROS, false},
     {"importcommands", Kw::IMPORTCOMMANDS, false}, {"interaxles", Kw::INTERAXLES, false},
-    {"joints", Kw::JOINTS, false}, {"welds", Kw::WELDS, false}, {"mounts", Kw::MOUNTS, false}, {"fem_tris", Kw::FEM_TRIS, false}, {"lockgroups", Kw::LOCKGROUPS, false}, {"lockgroup_default_nolock", Kw::LOCKGROUP_DEFAULT_NOLOCK, false},
+    {"joints", Kw::JOINTS, false}, {"welds", Kw::WELDS, false}, {"mounts", Kw::MOUNTS, false}, {"fem_tris", Kw::FEM_TRIS, false}, {"collision_volumes", Kw::COLLISION_VOLUMES, false}, {"lockgroups", Kw::LOCKGROUPS, false}, {"lockgroup_default_nolock", Kw::LOCKGROUP_DEFAULT_NOLOCK, false},
     {"managedmaterials", Kw::MANAGEDMATERIALS, false}, {"materialflarebindings", Kw::MATERIALFLAREBINDINGS, false},
     {"meshwheels", Kw::MESHWHEELS, false}, {"meshwheels2", Kw::MESHWHEELS2, false},
     {"minimass", Kw::MINIMASS, false}, {"nodecollision", Kw::NODECOLLISION, false}, {"nodes", Kw::NODES, false},
@@ -959,6 +960,31 @@ void Parser::data_line() {
         md().mounts.push_back(m);
         return;
     }
+    case Kw::COLLISION_VOLUMES: { // (BeamLab) "volume name[, break rms m]", then its "anchors n1, n2, ..." and its hull's "vertex x, y, z"
+        std::string key(tok_[0]);
+        for (char& c : key) c = (char)std::tolower((unsigned char)c);
+        if (key == "volume") {
+            Document::VolumeDef v;
+            if (ntok_ > 1) v.name = std::string(tok_[1]);
+            if (ntok_ > 2) v.break_rms = f(2);
+            md().volumes.push_back(v);
+            return;
+        }
+        if (md().volumes.empty()) {
+            warn_at(line_no_, "collision_volumes: '%.*s' before a volume", (int)tok_[0].size(), tok_[0].data());
+            return;
+        }
+        Document::VolumeDef& v = md().volumes.back();
+        if (key == "anchors") {
+            for (int i = 1; i < ntok_; i++) v.anchors.push_back(ref(i));
+        } else if (key == "vertex") {
+            if (!need(4)) return;
+            v.verts.push_back(vec3(f(1), f(2), f(3)));
+        } else {
+            warn_at(line_no_, "collision_volumes: unknown line '%.*s'", (int)tok_[0].size(), tok_[0].data());
+        }
+        return;
+    }
     case Kw::FEM_TRIS: { // (BeamLab) triangle elements of the FEM frame: n1, n2, n3
         if (!need(3)) return;
         if (fem_shell_ < 0 || fem_shell_ >= (int)md().fem_shells.size()) {
@@ -1665,6 +1691,7 @@ void Parser::merge(const Module& m) {
     app(doc_.joints, s.joints);
     app(doc_.welds, s.welds);
     app(doc_.mounts, s.mounts);
+    app(doc_.volumes, s.volumes);
     {
         // (a module's triangle elements' shells follow the ones before)
         const int off = (int)doc_.fem_shells.size();
@@ -1773,7 +1800,12 @@ template <class F> void Parser::for_each_ref(F&& fix) {
         fix(w.anchor), fix(w.node);
         if (w.anchor2 >= 0) fix(w.anchor2);
     }
-    for (auto& m : d.mounts) fix(m.a), fix(m.b);
+    for (auto& m : d.mounts) {
+        fix(m.a), fix(m.b);
+        if (m.b2 >= 0) fix(m.b2);
+    }
+    for (auto& v : d.volumes)
+        for (int& n : v.anchors) fix(n);
     for (auto& t : d.fem_tris) fix(t.n1), fix(t.n2), fix(t.n3);
     for (auto& s : d.slidenodes) {
         fix(s.node);

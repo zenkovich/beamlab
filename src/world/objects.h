@@ -9,6 +9,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace bl::phys {
@@ -47,19 +48,23 @@ struct SurfaceVisual {
 // nodes; the pieces of torn ones go with them. The vertices follow the nodes every frame, the indices only when the
 // members change.
 // Its triangle elements (FemFrame::tris) are plates of their section's thickness: both faces offset by half of it,
-// shaded smooth across edges that bend less than 35 degrees, in `plate_mat` (a torn-out triangle is gone).
+// shaded smooth across edges that bend less than 35 degrees, in `plate_mat` or their section's own material (a torn-out
+// triangle is gone).
 struct FrameVisual {
     MaterialPtr mat;
     MaterialPtr plate_mat;
+    std::vector<MaterialPtr> section_mats;              // per shell section (none / null: plate_mat): a section's own colour
+    std::vector<std::pair<int, int>> plate_ranges;      // per shell section: its plates' indices (first, count)
     GpuMesh mesh, plate_mesh;
     std::vector<Vertex> verts, plate_verts;
     std::vector<uint32_t> idx, plate_idx;
     size_t built = ~size_t(0), plate_built = ~size_t(0);
     bool rebuilt = false, plate_rebuilt = false;
     std::vector<vec3> node_normal;   // (scratch: the plates' smooth normals per frame node)
+    mutable std::unordered_map<const Material*, std::unique_ptr<Material>> ghosts; // see-through copies of the materials
     void update(const phys::SoftBody& b);
     void upload();
-    void draw(Renderer& r) const;
+    void draw(Renderer& r, float alpha = 1.0f) const;   // (alpha below 1: see-through, as the editor's preview draws a vehicle)
 };
 MaterialPtr frame_plate_material(); // (bare steel plate, shared)
 MaterialPtr frame_tube_material(); // (painted steel tube, shared)
@@ -256,6 +261,17 @@ struct SoftSphereDesc {
     MaterialPtr mat;
 };
 std::unique_ptr<DynamicObject> build_soft_sphere(phys::World& w, const SoftSphereDesc& d, const std::string& name);
+
+// A ball as one collision shape (the Shoot tool's projectiles): a single node of the ball's mass, its sphere against
+// the ground and the static world (the node's radius), against other bodies' triangles and nodes (a capsule of no
+// length round it) and the sheets' sphere contacts (SoftBody::sphere_ball); no beams. It slides rather than rolls
+// (no spin); bounce: the restitution of its static contacts.
+struct BallDesc {
+    vec3 center;
+    float radius = 0.22f, mass = 40.0f, bounce = 0.2f, friction = 0.5f;
+    MaterialPtr mat;
+};
+std::unique_ptr<DynamicObject> build_ball(phys::World& w, const BallDesc& d, const std::string& name);
 
 struct RopeDesc {
     vec3 a, b;

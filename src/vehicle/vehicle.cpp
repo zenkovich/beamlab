@@ -326,6 +326,17 @@ void Vehicle::update_visuals() {
                 m->color = vec4(c, 1.0f);
                 m->specular = 0.7f, m->gloss = 60.0f;
                 m_frame->plate_mat = m;
+                // (the sections of a colour of their own: a car's plastic bumpers, its lamps)
+                const auto& secs = body->fem.shell_sections;
+                m_frame->section_mats.assign(secs.size(), nullptr);
+                for (size_t k = 0; k < secs.size(); k++)
+                    if (secs[k].color.x >= 0) {
+                        auto sm = std::make_shared<Material>(*frame_plate_material());
+                        sm->name = format("%s plates %zu", name.c_str(), k);
+                        sm->color = vec4(secs[k].color, 1.0f);
+                        sm->specular = 0.35f, sm->gloss = 30.0f;
+                        m_frame->section_mats[k] = sm;
+                    }
                 // (a body of triangles and members - pillars, sills, rails: the members in its paint too)
                 auto t = std::make_shared<Material>(*frame_tube_material());
                 t->name = name + " members";
@@ -341,7 +352,7 @@ void Vehicle::draw(Renderer& r, InstanceCollector&, const DebugView& dbg) {
     if (m_visual && !dbg.hide_meshes) m_visual->draw(r, ghost);
     if (m_frame && !dbg.hide_meshes && ghost > 0.001f) {
         m_frame->upload();
-        m_frame->draw(r);
+        m_frame->draw(r, ghost); // (the editor's preview: see-through as its meshes)
     }
     if (m_sheet) {
         m_sheet->upload(m_sheet_first);

@@ -2038,6 +2038,7 @@ static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt)
                                    s_fc.axe_pivot = d.pivot;
                                    s_fc.axe_reach = std::sqrt(0.25f * d.blade_w * d.blade_w + d.length * d.length);
                                    s_fc.axe = gg.add_object(build_axe(gg.world, d, "axe", &s_fc.axe_edge));
+                                   if (s_fc.axe) s_fc.axe->body->volume_pass = true; // (a cutter: through the cars' volumes)
                                }});
     g.scene_actions.push_back({"Drop on the roof from 1.5 m", [](Game& gg) {
                                    // (turned over about its centre of mass its top goes to 2 com - top: lifted to 1.5 m)
@@ -2045,6 +2046,16 @@ static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt)
                                    vec3 com;
                                    if (!frame_car_measure(gg, vec3(0, 0, 20), top, com)) return;
                                    frame_car_stunt(gg, vec3(0, 0, 20), 0, 1.5f + top - 2.0f * com.y, quat::axis_angle(vec3(0, 0, 1), kPi), vec3(0), vec3(0));
+                               }});
+    g.scene_actions.push_back({"Lay it on its side (from 0.3 m)", [](Game& gg) {
+                                   frame_car_clear(gg);
+                                   Vehicle* car = gg.player_vehicle();
+                                   if (!car) return;
+                                   frame_car_stunt(gg, vec3(0, 0, 20), 0, 0.0f, quat::axis_angle(vec3(0, 0, 1), 0.5f * kPi), vec3(0), vec3(0));
+                                   SoftBody& b = *car->body;
+                                   float lo = 1e9f;
+                                   for (const Node& n : b.nodes) lo = std::min(lo, n.p.y);
+                                   b.transform(quat(), b.center_of_mass(), vec3(0, 0.3f - lo, 0));
                                }});
     g.scene_actions.push_back({"Barrel roll at 50 km/h", [kmh](Game& gg) {
                                    frame_car_stunt(gg, vec3(0, 0, 10), 0, 0.6f, quat(), vec3(0, 3.5f, 50 * kmh), vec3(0, 0, 5.0f));
@@ -2091,11 +2102,11 @@ static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt)
                           "frame, orange where bent for good. Scene menu: drop it, turn it over, trip it on the curb, launch it at the wall or off "
                           "the ramp. R resets it.";
     if (std::string(vid).find("shell_car") != std::string::npos)
-        g.scene_hint = "A saloon on the BMW E36's lines: its body-in-white FEM members (sills, pillars, rails) with sheets of FEM "
-                       "triangles between them (floor, roof, firewall, aprons, quarters), the hood and fenders FEM triangles, the doors, "
-                       "trunk lid and bumpers sheet metal on FEM inner shells - on hinges, latches, clamped bolts, buffers and stays that "
+        g.scene_hint = "A saloon on the BMW E36's lines, all FEM: its body-in-white members (sills, pillars, rails) with sheets of FEM "
+                       "triangles between them (floor, roof, firewall, aprons, quarters); the hood, fenders, doors (with their window "
+                       "frames), trunk lid, bumpers and tail lights FEM triangles on hinges, latches, clamped bolts, buffers and stays that "
                        "let go; the Frame Car's suspension. F3: the elements, orange where the steel has yielded. Scene menu: crashes, "
-                       "drops, rolls, the whoops, the jump, the rough field, the latches. R resets it.";
+                       "drops, rolls, on its side, the whoops, the jump, the rough field, the latches. R resets it.";
 }
 
 void scene_frame_car(Game& g) { scene_fem_pad(g, "frame_car/frame_car", "Frame Car", false); }
@@ -2833,8 +2844,38 @@ const std::vector<SceneInfo>& scene_registry() {
          [](Game& g) { scene_frame_car_test(g, "whoops", vec3(88, 2.5f, 30), vec3(80, 0.8f, 45), "Through ten 0.5 m whoops at 80 km/h.", scene_buggy); }},
         {"bg_jump", "Buggy: Jump", "Test cars/Buggy", "Over the tabletop jump at 90 km/h",
          [](Game& g) { scene_frame_car_test(g, "jump", vec3(95, 4.0f, 160), vec3(80, 2.2f, 172), "Over the 2.2 m tabletop at 90 km/h.", scene_buggy); }},
-        {"shell_car", "Shell Car", "Test cars", "A saloon on the BMW E36's lines: a body-in-white of FEM members and sheets, parts on hinges, bolts, buffers",
+        {"shell_car", "Shell Car", "Test cars/Shell Car", "A saloon on the BMW E36's lines, all FEM: a body-in-white of members and sheets, parts on hinges, bolts, buffers",
          scene_shell_car},
+        {"sc_headon", "Shell Car: Head-on", "Test cars/Shell Car", "Two Shell Cars head-on at 50 km/h each",
+         [](Game& g) { scene_frame_car_test(g, "Head-on into another", vec3(5.2f, 2.0f, 56.5f), vec3(0, 0.6f, 62.5f), "Two Shell Cars meet head-on at 50 km/h each.", scene_shell_car); }},
+        {"sc_side", "Shell Car: Side impact", "Test cars/Shell Car", "Another Shell Car into its side at 50 km/h",
+         [](Game& g) {
+             scene_frame_car_test(g, "into its side", vec3(7.0f, 3.0f, 53.0f), vec3(-1.5f, 0.7f, 60), "A second Shell Car hits the standing one in the side at 50 km/h.", scene_shell_car);
+         }},
+        {"sc_wall", "Shell Car: Wall", "Test cars/Shell Car", "Into a concrete wall at 60 km/h",
+         [](Game& g) { scene_frame_car_test(g, "Launch at the wall", vec3(7.0f, 2.5f, 139.0f), vec3(0, 0.7f, 146), "The Shell Car into a concrete wall at 60 km/h.", scene_shell_car); }},
+        {"sc_pole", "Shell Car: Pole", "Test cars/Shell Car", "Into a concrete pole at 50 km/h",
+         [](Game& g) { scene_frame_car_test(g, "Launch at the pole", vec3(22.5f, 2.5f, 140.5f), vec3(16, 0.7f, 147), "The Shell Car into a concrete pole at 50 km/h.", scene_shell_car); }},
+        {"sc_drop", "Shell Car: Drop 10 m", "Test cars/Shell Car", "Dropped on its wheels from 10 m",
+         [](Game& g) { scene_frame_car_test(g, "Drop from 10", vec3(8.5f, 4.5f, 12), vec3(0, 1.8f, 20), "The Shell Car dropped on its wheels from 10 m.", scene_shell_car); }},
+        {"sc_roof", "Shell Car: On the roof", "Test cars/Shell Car", "Turned over and dropped on its roof from 1.5 m",
+         [](Game& g) { scene_frame_car_test(g, "Drop on the roof", vec3(8, 3.0f, 13), vec3(0, 0.8f, 20), "The Shell Car turned over and dropped on its roof from 1.5 m.", scene_shell_car); }},
+        {"sc_side_lay", "Shell Car: On its side", "Test cars/Shell Car", "Laid on its side from 0.3 m: the doors rest on their openings, the wheels keep their toe",
+         [](Game& g) { scene_frame_car_test(g, "Lay it on its side", vec3(0, 2.2f, 13), vec3(0, 0.8f, 20), "The Shell Car laid on its side from 0.3 m.", scene_shell_car); }},
+        {"sc_slab", "Shell Car: Slab", "Test cars/Shell Car", "A 5 t concrete slab dropped on it from 2.5 m",
+         [](Game& g) { scene_frame_car_test(g, "Drop a 5 t concrete slab", vec3(6.5f, 3.8f, 14), vec3(0, 1.2f, 20), "A 5 t concrete slab falls on the roof from 2.5 m.", scene_shell_car); }},
+        {"sc_axe", "Shell Car: Giant axe", "Test cars/Shell Car", "A 2 t pendulum axe swings down and cuts it in two",
+         [](Game& g) { scene_frame_car_test(g, "The giant axe", vec3(-15.5f, 5.0f, 110.0f), vec3(-25, 3.0f, 120), "A 2 t axe on a pendulum swings down and cuts the car in two.", scene_shell_car); }},
+        {"sc_roll", "Shell Car: Barrel roll", "Test cars/Shell Car", "Thrown up and spun at 50 km/h: it rolls over",
+         [](Game& g) { scene_frame_car_test(g, "Barrel roll", vec3(9.5f, 4, 18), vec3(0, 1, 32), "Thrown up and spun at 50 km/h: the Shell Car rolls over.", scene_shell_car); }},
+        {"sc_curb", "Shell Car: Curb", "Test cars/Shell Car", "Sideways into a curb at 40 km/h",
+         [](Game& g) { scene_frame_car_test(g, "Trip over the curb", vec3(-32, 3.0f, 51), vec3(-41, 0.8f, 60), "The Shell Car slides sideways into a curb at 40 km/h.", scene_shell_car); }},
+        {"sc_whoops", "Shell Car: Whoops", "Test cars/Shell Car", "Through the whoops at 80 km/h",
+         [](Game& g) { scene_frame_car_test(g, "whoops", vec3(88, 2.5f, 30), vec3(80, 0.8f, 45), "Through ten 0.5 m whoops at 80 km/h.", scene_shell_car); }},
+        {"sc_jump", "Shell Car: Jump", "Test cars/Shell Car", "Over the tabletop jump at 90 km/h",
+         [](Game& g) { scene_frame_car_test(g, "jump", vec3(95, 4.0f, 160), vec3(80, 2.2f, 172), "Over the 2.2 m tabletop at 90 km/h.", scene_shell_car); }},
+        {"sc_latches", "Shell Car: Latches let go", "Test cars/Shell Car", "The hood's, the lid's and the doors' latches let go: they rest on their buffers and stays",
+         [](Game& g) { scene_frame_car_test(g, "Let the latches go", vec3(7, 2.6f, -5.5f), vec3(0, 0.8f, 0), "The latches let go: the hood and the lid rest on their buffers.", scene_shell_car); }},
         {"sheet_car", "Sheet Car", "Test cars", "A car whose body panels are a steel sheet of triangle elements: crash it into a parked one, poles or a wall",
          scene_sheet_car},
         {"lab", "Primitives", "Physics lab", "Primitive tests: collisions, deformation, breaking, joints", scene_lab},

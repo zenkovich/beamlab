@@ -625,7 +625,7 @@ void FrameVisual::update(const phys::SoftBody& b) {
             const uint32_t o = (uint32_t)(e * kSides * 2);
             for (int k = 0; k < kSides; k++) {
                 const uint32_t a0 = o + k, a1 = o + (k + 1) % kSides, b0 = a0 + kSides, b1 = a1 + kSides;
-                idx.insert(idx.end(), {a0, b0, b1, a0, b1, a1});
+                idx.insert(idx.end(), {a0, b1, b0, a0, a1, b1}); // (counter-clockwise seen from outside: the faces out)
             }
         }
         rebuilt = true;
@@ -658,10 +658,15 @@ void FrameVisual::update(const phys::SoftBody& b) {
         plate_built = f.tris.size() * 1000003 + live;
         plate_verts.assign(f.tris.size() * 6, Vertex{});
         plate_idx.clear();
-        for (size_t i = 0; i < f.tris.size(); i++) {
-            if (f.tris[i].broken) continue;
-            const uint32_t o = (uint32_t)(i * 6);
-            plate_idx.insert(plate_idx.end(), {o, o + 1, o + 2, o + 3, o + 5, o + 4});
+        plate_ranges.assign(f.shell_sections.size(), {0, 0});
+        for (size_t sec = 0; sec < f.shell_sections.size(); sec++) { // (by section: each drawn in its material)
+            plate_ranges[sec].first = (int)plate_idx.size();
+            for (size_t i = 0; i < f.tris.size(); i++) {
+                if (f.tris[i].broken || f.tris[i].section != sec) continue;
+                const uint32_t o = (uint32_t)(i * 6);
+                plate_idx.insert(plate_idx.end(), {o, o + 1, o + 2, o + 3, o + 5, o + 4});
+            }
+            plate_ranges[sec].second = (int)plate_idx.size() - plate_ranges[sec].first;
         }
         plate_rebuilt = true;
     }
@@ -729,9 +734,29 @@ void FrameVisual::upload() {
     }
 }
 
-void FrameVisual::draw(Renderer& r) const {
-    if (mesh.valid() && mat && !verts.empty()) r.draw_mesh(&mesh, mat.get(), mat4());
-    if (plate_mesh.valid() && !plate_idx.empty()) r.draw_mesh(&plate_mesh, (plate_mat ? plate_mat : frame_plate_material()).get(), mat4());
+void FrameVisual::draw(Renderer& r, float alpha) const {
+    auto see = [&](const Material* m) -> const Material* {
+        if (!m || alpha >= 0.999f) return m;
+        auto& g = ghosts[m];
+        if (!g) g = std::make_unique<Material>(*m);
+        g->blend = true, g->cast_shadow = false, g->double_sided = true, g->alpha_ref = 0.0f;
+        g->color = vec4(m->color.x, m->color.y, m->color.z, m->color.w * alpha);
+        return g.get();
+    };
+    if (mesh.valid() && mat && !verts.empty()) r.draw_mesh(&mesh, see(mat.get()), mat4());
+    if (!plate_mesh.valid() || plate_idx.empty()) return;
+    const Material* base = see((plate_mat ? plate_mat : frame_plate_material()).get());
+    bool own = false;
+    for (size_t sec = 0; sec < plate_ranges.size(); sec++) own |= sec < section_mats.size() && section_mats[sec] && plate_ranges[sec].second > 0;
+    if (!own) {
+        r.draw_mesh(&plate_mesh, base, mat4());
+        return;
+    }
+    for (size_t sec = 0; sec < plate_ranges.size(); sec++) {
+        if (plate_ranges[sec].second <= 0) continue;
+        const Material* m = sec < section_mats.size() && section_mats[sec] ? see(section_mats[sec].get()) : base;
+        r.draw_mesh(&plate_mesh, m, mat4(), plate_ranges[sec].first, plate_ranges[sec].second);
+    }
 }
 
 void ShellVisual::draw(Renderer& r) const {
@@ -1107,6 +1132,31 @@ std::unique_ptr<DynamicObject> build_soft_sphere(World& w, const SoftSphereDesc&
     obj->name = name;
     obj->body = w.add_body(std::move(body));
     obj->surfaces.push_back(std::move(sv));
+    return obj;
+}
+
+std::unique_ptr<DynamicObject> build_ball(World& w, const BallDesc& d, const std::string& name) {
+    auto body = std::make_unique<SoftBody>();
+    body->name = name;
+    const uint32_t c = body->add_node(d.center, d.mass, NF_GROUND | NF_CONTACTER);
+    body->capsules.push_back({c, c, d.radius});
+    body->collision_radius = 0.01f; // (its node against triangles: the capsule's sphere does that)
+    body->sphere_ball = d.radius;
+    body->ground_friction = d.friction;
+    body->bounce = d.bounce;
+    body->finalize();
+    body->info[c].radius = d.radius; // (the ground and the static world: a sphere)
+    auto obj = std::make_unique<DynamicObject>();
+    obj->name = name;
+    obj->body = w.add_body(std::move(body));
+    MaterialPtr mat = d.mat ? d.mat : SharedAssets::get().metal;
+    obj->stick_mats.push_back(mat); // (kept alive: the visual holds it by pointer)
+    auto rv = std::make_unique<RigidVisual>();
+    rv->parts = {{&SharedAssets::get().sphere, mat.get()}};
+    rv->n0 = rv->na = rv->nb = c;
+    rv->local = mat4::scale(vec3(d.radius));
+    rv->model = mat4::translate(d.center) * rv->local;
+    obj->rigid = std::move(rv);
     return obj;
 }
 

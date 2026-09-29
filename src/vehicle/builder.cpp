@@ -725,7 +725,11 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
                 warnings.push_back(format("fem triangle %d %d %d: degenerate or no such nodes", t.n1, t.n2, t.n3));
                 continue;
             }
-            if (shell_id[t.shell] < 0) shell_id[t.shell] = body.fem.add_shell_section(phys::make_shell_section(d.fem_shells[t.shell].material, d.fem_shells[t.shell].thickness));
+            if (shell_id[t.shell] < 0) {
+                phys::ShellSection sec = phys::make_shell_section(d.fem_shells[t.shell].material, d.fem_shells[t.shell].thickness);
+                sec.color = d.fem_shells[t.shell].color;
+                shell_id[t.shell] = body.fem.add_shell_section(sec);
+            }
             const uint32_t k = body.fem.add_tri((uint32_t)t.n1, (uint32_t)t.n2, (uint32_t)t.n3, (uint16_t)shell_id[t.shell], (int32_t)ti, fem_tri_coll[ti]);
             body.fem.tris[k].mass = body.fem.shell_sections[shell_id[t.shell]].mass_per_m2() * 0.5f * length(cross(pos[t.n2] - pos[t.n1], pos[t.n3] - pos[t.n1]));
         }
@@ -741,6 +745,16 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
             warnings.push_back(format("mount %d-%d: not between frame nodes", m.a, m.b));
     }
     if (!body.fem.empty()) body.fem.finalize(body);
+    // ---- the collision volumes (`collision_volumes`: hulls riding on frame nodes, phys::CollisionVolume)
+    for (const auto& v : d.volumes) {
+        std::vector<uint32_t> an;
+        for (int a : v.anchors)
+            if (a >= 0 && a < N) an.push_back((uint32_t)a);
+        if (body.add_volume(v.name, an, v.verts, v.break_rms) < 0)
+            warnings.push_back(format("collision volume '%s': needs 3 anchors and a hull of 4 points or more", v.name.c_str()));
+    }
+    if (const int in = body.find_volume_parts(); in > 0) // (the parts they hold off: nodes inside one as built are left out)
+        warnings.push_back(format("collision volumes: %d nodes of the parts inside them as built (not held off)", in));
     drive.hydros.clear();
     for (auto& [pi, c] : hyd)
         if (beam_index[pi] >= 0) {

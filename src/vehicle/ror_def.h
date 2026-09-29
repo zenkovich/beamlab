@@ -377,6 +377,15 @@ struct Document {
         int b2 = -1;                // (a hinge's second node)
     };
     std::vector<MountDef> mounts;
+    // (BeamLab) `collision_volumes`: convex hulls (phys::CollisionVolume) riding on frame nodes - "volume name[, break
+    // rms]", its "anchors n1, n2, ..." and its "vertex x, y, z" lines (the hull's points, in the definition's space)
+    struct VolumeDef {
+        std::string name;
+        float break_rms = 0.12f;
+        std::vector<int> anchors;
+        std::vector<vec3> verts;
+    };
+    std::vector<VolumeDef> volumes;
     // (BeamLab) `fem_tris`: n1, n2, n3 - triangle elements of the FEM frame (a shell: membrane and bending in the frame's
     // implicit step; phys::FrameTri), of the `set_fem_shell material, thickness m[, r, g, b]` in effect before them (none:
     // 1 mm steel). Their nodes are frame nodes (shared with the frame elements); their mass goes on them
