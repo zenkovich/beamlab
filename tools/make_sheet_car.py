@@ -323,7 +323,7 @@ with open(OUT, "w") as f:
     for n1, n2, arm, front in wheels:
         f.write("%.2f, 0.20, 12, %d, %d, 9999, %d, %d, %d, 45.0, 120000.0, 900.0, tracks/wheelface tracks/wheelband\n" % (WHEEL_R, n1, n2, 1, 1 if front else 0, arm))
     f.write("engine\n;min rpm, max rpm, torque, differential, reverse, neutral, gears...\n1000.0, 6000.0, 260.0, 4.1, 3.2, 1.0, 3.2, 2.0, 1.4, 1.0, 0.8, -1.0\n")
-    f.write("engoption\n0.4, c, 200.0, 0.3, 0.4, 0.3\n")
+    f.write("engoption\n0.08, c, 1000.0, 0.3, 0.4, 0.3\n")
     f.write("brakes\n3000\n")
     mid = j_of[round(-0.15, 3)]
     centre, back, left = spine[mid], spine[-1], rail[1][mid]

@@ -391,6 +391,19 @@ void Game::draw_debug(Renderer& r) {
                 if (e.end_a > 0 && e.end_a < 6 && Lm > 1e-4f) r.point(a + (c - a) * std::min(0.2f, 0.06f / Lm), jcol[e.end_a]);
                 if (e.end_b > 0 && e.end_b < 6 && Lm > 1e-4f) r.point(c + (a - c) * std::min(0.2f, 0.06f / Lm), jcol[e.end_b]);
             }
+            // triangle elements (FEM shells): their edges, steel blue, orange where the plate has yielded; by stress their
+            // load against the yield, green -> red
+            for (const phys::FrameTri& t : b.fem.tris) {
+                if (t.broken) continue;
+                uint32_t col;
+                if (debug.stress) {
+                    const float u = clampf(t.util, 0, 1);
+                    col = Renderer::rgba(0.2f + 0.8f * u, 0.9f - 0.7f * u, 0.2f);
+                } else {
+                    col = t.dmg > 0 ? Renderer::rgba(1.0f, 0.55f, 0.15f) : Renderer::rgba(0.45f, 0.62f, 0.95f);
+                }
+                for (int k = 0; k < 3; k++) r.line(b.nodes[b.fem.node[t.n[k]]].p, b.nodes[b.fem.node[t.n[(k + 1) % 3]]].p, col);
+            }
             // triangle elements: each edge once, on the face towards the camera. Pale blue (not the beams' grey: they are
             // no beams), the authored border brighter; plastically stretched or shortened (> 1%) orange; cracks and cuts
             // red; by stress: the edge strain against the fracture strain, green -> red
@@ -440,14 +453,21 @@ void Game::draw_debug(Renderer& r) {
             }
         }
         if (debug.collision) {
+            static const bool hull_only = getenv("BL_COLLISION") && atoi(getenv("BL_COLLISION")) == 2; // (the hulls alone)
             for (const auto& t : b.tris) {
+                if (t.torn || (hull_only && t.two_sided)) continue; // (no longer colliding)
                 vec3 a = b.nodes[t.a].p, c = b.nodes[t.b].p, d = b.nodes[t.c].p;
-                if (sheet) {
+                if (sheet && t.two_sided) {
                     a += lift[t.a];
                     c += lift[t.b];
                     d += lift[t.c];
                 }
-                uint32_t col = Renderer::rgba(0.2f, 1.0f, 0.9f, 0.5f);
+                // (a hull triangle amber, with a tick along its outward normal from its centre)
+                uint32_t col = t.two_sided ? Renderer::rgba(0.2f, 1.0f, 0.9f, 0.5f) : Renderer::rgba(1.0f, 0.62f, 0.15f, 0.9f);
+                if (!t.two_sided) {
+                    const vec3 m = (a + c + d) / 3.0f;
+                    r.line(m, m + normalize_or(cross(c - a, d - a), vec3(0)) * 0.12f, col);
+                }
                 r.line(a, c, col);
                 r.line(c, d, col);
                 r.line(d, a, col);

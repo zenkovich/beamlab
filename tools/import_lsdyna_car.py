@@ -529,7 +529,7 @@ def main():
         for radius, i1, i2, arm, front in wheels:
             f.write("%.3f, 0.20, 12, %d, %d, 9999, 1, %d, %d, 30.0, 120000.0, 900.0, tracks/wheelface tracks/wheelband\n" % (radius, i1, i2, 1 if front else 0, arm))
         if wheels:
-            f.write("engine\n1000.0, 6000.0, 400.0, 4.3, 3.4, 1.0, 3.6, 2.2, 1.5, 1.0, 0.8, -1.0\nengoption\n0.4, c, 300.0\nbrakes\n4000\n")
+            f.write("engine\n1000.0, 6000.0, 400.0, 4.3, 3.4, 1.0, 3.6, 2.2, 1.5, 1.0, 0.8, -1.0\nengoption\n0.08, c, 1000.0\nbrakes\n4000\n")
         f.write("contacters\n")
         for i in nid:
             f.write("%d\n" % i)

@@ -317,6 +317,14 @@ void Vehicle::update_visuals() {
         if (!m_frame) {
             m_frame = std::make_unique<FrameVisual>();
             m_frame->mat = frame_tube_material();
+            if (!body->fem.tris.empty()) { // (the triangle elements' plates: the shell's colour, else a red paint)
+                auto m = std::make_shared<Material>(*frame_plate_material());
+                m->name = name + " plates";
+                const vec3 c = !m_def.fem_shells.empty() && m_def.fem_shells[0].color.x >= 0 ? m_def.fem_shells[0].color : vec3(0.78f, 0.12f, 0.10f);
+                m->color = vec4(c, 1.0f);
+                m->specular = 0.7f, m->gloss = 60.0f;
+                m_frame->plate_mat = m;
+            }
         }
         m_frame->update(*body);
     }
@@ -331,7 +339,8 @@ void Vehicle::draw(Renderer& r, InstanceCollector&, const DebugView& dbg) {
     if (m_sheet) {
         m_sheet->upload(m_sheet_first);
         m_sheet_first = false;
-        if (!dbg.hide_meshes && ghost > 0.001f) m_sheet->draw(r);
+        static const bool no_panels = getenv("BL_NOPANELS") != nullptr; // (the frame alone: pictures of its tubes)
+        if (!dbg.hide_meshes && ghost > 0.001f && !no_panels) m_sheet->draw(r);
     }
 }
 

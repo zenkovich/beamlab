@@ -565,6 +565,12 @@ void App::frame(float dt) {
             if (b.shells.empty() || b.name.find(" piece") != std::string::npos) continue;
             int hist[5] = {0};
             for (const auto& sh : b.shells) hist[std::min(4, (int)sh.level)]++;
+            if (getenv("BL_SHELLWHERE")) // (where the sheet was refined: the refined triangles' centres, in the body's frame)
+                for (const auto& sh : b.shells)
+                    if (sh.level > 0) {
+                        const vec3 c = (b.nodes[sh.n[0]].p + b.nodes[sh.n[1]].p + b.nodes[sh.n[2]].p) / 3.0f;
+                        printf("    refined L%d at (%.2f %.2f %.2f) nodes %u %u %u\n", sh.level, c.x, c.y, c.z, sh.n[0], sh.n[1], sh.n[2]);
+                    }
             size_t np = 0, npt = 0, nps = 0; // pieces cracked off this sheet (bodies named after it)
             double area = 0;
             for (const auto& sh : b.shells) area += sh.area0;
@@ -651,6 +657,23 @@ void App::frame(float dt) {
                        c.x, c.y, c.z, e.x, e.y, e.z, b->max_speed, b->stats.broken_joints, b->stats.broken_beams);
             }
     }
+    if (const char* fd = getenv("BL_FEMDBG"); fd && m_frame_index % std::max(1, atoi(fd)) == 0) // (the bodies of FEM triangles)
+        for (auto& b : m_game.world.bodies()) {
+            const phys::FemFrame& f = b->fem;
+            if (f.tris.empty()) continue;
+            int dented = 0;
+            float peak = 0, low = 1e9f, fast = 0;
+            for (const phys::FrameTri& t : f.tris)
+                if (!t.broken) dented += t.dmg > 0, peak = std::max(peak, t.util);
+            vec3 c(0), fp(0);
+            for (const auto& n : b->nodes) {
+                c += n.p / (float)b->nodes.size(), low = std::min(low, n.p.y);
+                if (length(n.v) > fast) fast = length(n.v), fp = n.p;
+            }
+            printf("fem f%d %-24s tris %4zu torn %3d dented %4d peak %.2f failed %d sleep %d fastest %.3f centre (%.3f %.3f %.3f) lowest %.3f\n", m_frame_index,
+                   b->name.c_str(), f.tris.size(), f.tris_torn, dented, peak, f.solve_failures, (int)b->sleeping, fast, c.x, c.y, c.z, low);
+            if (getenv("BL_FEMFAST")) printf("    fastest node at (%.3f %.3f %.3f)\n", fp.x - c.x, fp.y - c.y, fp.z - c.z);
+        }
     if (const char* en = getenv("BL_ENERGYDBG")) // (a body's energy every frame: its motion as a whole, the rest, its height)
         for (auto& b : m_game.world.bodies())
             if (b->name == en) {
@@ -682,6 +705,18 @@ void App::frame(float dt) {
                 printf("wheel at (%+.3f %+.3f %+.3f) camber %+.1f toe %+.1f deg\n", dot(m, f), dot(m, u), dot(m, l), -std::asin(clampf(dot(ax, u), -1, 1)) * kRad2Deg,
                        -std::atan2(dot(ax, f), std::fabs(dot(ax, l))) * kRad2Deg);
             }
+        }
+    if (getenv("BL_SHOCKLOG")) // (diagnostics: the player's springs each frame, % of the stroke to the short bound, - past it)
+        if (Vehicle* v = m_game.player_vehicle()) {
+            const phys::SoftBody& b = *v->body;
+            printf("shocklog f%d t %.3f:", m_frame_index, m_game.world.time());
+            for (const phys::Shock& sh : b.shocks) {
+                const phys::Beam& bm = b.beams[sh.beam];
+                if (sh.spring < 1000 || (bm.flags & phys::BF_BROKEN) || ((b.info[bm.a].flags | b.info[bm.b].flags) & (phys::NF_TYRE | phys::NF_RIM))) continue; // (not the tyres')
+                const float len = length(b.nodes[bm.a].p - b.nodes[bm.b].p), lo = bm.L * (1 - sh.short_bound), hi = bm.L * (1 + sh.long_bound);
+                printf(" %.0f", 100.0f * (len - lo) / (hi - lo));
+            }
+            printf("\n");
         }
     if (const char* sd = getenv("BL_SHOCKDBG"); sd && m_frame_index == atoi(sd)) {
         for (const auto& bp : m_game.world.bodies()) {
@@ -717,7 +752,35 @@ void App::frame(float dt) {
             m_game.shoot(c.pos, c.forward());
         }
     }
-    if ((!m_opt.action.empty() || !m_opt.autoshoot.empty() || !m_opt.drive.empty() || !m_opt.crane.empty()) && m_frame_index % 120 == 0)
+    // (the panels' visible shake: how far the welded nodes' centre moves against the frame's point from one frame to the
+    // next, rms and most over the status line's frames)
+    static std::vector<vec3> shake_prev;
+    static double shake_s2 = 0, shake_t = -1;
+    static float shake_most = 0;
+    static int shake_n = 0;
+    if (!m_opt.action.empty() || !m_opt.autoshoot.empty() || !m_opt.drive.empty() || !m_opt.crane.empty())
+        if (Vehicle* v = m_game.player_vehicle(); v && !v->body->welds.empty()) {
+            const phys::SoftBody& b = *v->body;
+            const double t = m_game.world.time();
+            const bool have = shake_prev.size() == b.welds.size() && t > shake_t;
+            shake_prev.resize(b.welds.size());
+            for (size_t k = 0; k < b.welds.size(); k++) {
+                const phys::Weld& wd = b.welds[k];
+                vec3 cp(0);
+                for (uint32_t i = wd.first; i < wd.first + wd.count; i++) cp += b.nodes[b.weld_nodes[i]].p * b.weld_w[i];
+                const vec3 off = cp - (b.nodes[wd.anchor].p * (1 - wd.t) + b.nodes[wd.anchor2].p * wd.t);
+                if (have && !wd.broken) {
+                    const float r = length(off - shake_prev[k]) / (float)(t - shake_t);
+                    shake_s2 += (double)r * r, shake_most = std::max(shake_most, r), shake_n++;
+                    if (getenv("BL_MOVEDBG") && r > (float)atof(getenv("BL_MOVEDBG"))) // (diagnostics: which welds move)
+                        printf("  frame %d weld %zu moves %.0f mm/s: node %u (%.2f %.2f %.2f) anchors %u %u\n", m_frame_index, k, r * 1000.0f,
+                               b.weld_nodes[wd.first], cp.x, cp.y, cp.z, wd.anchor, wd.anchor2);
+                }
+                shake_prev[k] = off;
+            }
+            shake_t = t;
+        }
+    if ((!m_opt.action.empty() || !m_opt.autoshoot.empty() || !m_opt.drive.empty() || !m_opt.crane.empty()) && m_frame_index % (getenv("BL_STATUS_EVERY") ? atoi(getenv("BL_STATUS_EVERY")) : 120) == 0)
         if (Vehicle* v = m_game.player_vehicle()) {
             vec3 p = v->position();
             printf("t=%6.1fs  %5.1f km/h  pos (%.0f %.0f %.0f)  broken %4d  | %s | %s", m_game.world.time(), v->speed_kmh(), p.x, p.y, p.z,
@@ -725,6 +788,34 @@ void App::frame(float dt) {
             if (!v->body->fem.empty())
                 printf(" | frame: %zu members, %d splits, %d torn, %d failed solves, %d clamps", v->body->fem.elems.size(), v->body->fem.splits, v->body->fem.broken,
                        v->body->fem.solve_failures, v->body->fem.clamps);
+            if (const phys::FemFrame& f = v->body->fem; !f.tris.empty()) { // (its FEM triangles: how many torn out, dented for good)
+                int dented = 0;
+                for (const phys::FrameTri& t : f.tris) dented += !t.broken && t.dmg > 0;
+                printf(" | tris %zu, %d torn, %d dented", f.tris.size(), f.tris_torn, dented);
+            }
+            if (!v->body->welds.empty()) {
+                // (and how the panels shake on their welds: the welded nodes' centre against the frame's point, rms and most)
+                const phys::SoftBody& b = *v->body;
+                double s2 = 0;
+                float most = 0;
+                int n = 0;
+                for (const phys::Weld& wd : b.welds) {
+                    if (wd.broken) continue;
+                    vec3 cv(0);
+                    for (uint32_t i = wd.first; i < wd.first + wd.count; i++) cv += b.nodes[b.weld_nodes[i]].v * b.weld_w[i];
+                    const vec3 av = b.nodes[wd.anchor].v * (1 - wd.t) + b.nodes[wd.anchor2].v * wd.t;
+                    const float r = length(cv - av);
+                    s2 += (double)r * r, most = std::max(most, r), n++;
+                    if (getenv("BL_JITTERDBG") && r > 0.25f) // (diagnostics: which welds shake)
+                        printf("\n  weld %d shakes %.0f mm/s: node %u (%.2f %.2f %.2f), k %.0f, c %.1f, %u nodes", (int)(&wd - b.welds.data()), r * 1000.0f,
+                               b.weld_nodes[wd.first], b.nodes[b.weld_nodes[wd.first]].p.x, b.nodes[b.weld_nodes[wd.first]].p.y, b.nodes[b.weld_nodes[wd.first]].p.z, wd.k,
+                               wd.c, wd.count);
+                }
+                printf(" | welds: %d of %zu broken, panels shake %.0f mm/s rms, %.0f most, move %.1f mm/s rms, %.0f most", b.stats.broken_welds, b.welds.size(),
+                       n ? 1000.0 * std::sqrt(s2 / n) : 0.0, most * 1000.0f, shake_n ? 1000.0 * std::sqrt(shake_s2 / shake_n) : 0.0, shake_most * 1000.0f);
+                shake_s2 = 0, shake_most = 0, shake_n = 0;
+                if (getenv("BL_JITTERDBG")) printf(" | membrane: %d edges out of band, %d moved", b.mem_edges_out, b.mem_moved);
+            }
             printf("\n");
         }
     if (m_opt.launch_kmh > 0 && m_frame_index == 5)

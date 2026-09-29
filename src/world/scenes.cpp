@@ -1,6 +1,7 @@
 // Scene registry: test worlds for the vehicle and physics demos.
 #include "core/util.h"
 #include "game/game.h"
+#include "phys/fem_shell.h"
 #include "vehicle/vehicle.h"
 #include "world/ai.h"
 #include "world/stage.h"
@@ -1118,6 +1119,7 @@ const MatSpec kMats[] = {
     {"Acrylic", {0.95f, 0.45f, 0.12f, 1}, 0.9f, 80, false, 0, 1190, 9.5f, 1.5e6f, 0.05f, 0.08f, 3.0e6f, 0.05f, 0.08f, 40, false, 0.2f},
     {"Plywood", {1, 1, 1, 1}, 0.1f, 8, false, 1, 600, 11, 3.0e6f, 0.01f, 0.018f, 4.0e6f, 0.012f, 0.02f, 80, false, 0.3f},
     {"Rubber", {0.1f, 0.1f, 0.11f, 1}, 0.25f, 12, false, 0, 1100, 11, 1.5e5f, 1e4f, 3.0f, 1.5e5f, 1e4f, 3.0f, 10, false, 0},
+    {"Plastic", {0.13f, 0.13f, 0.14f, 1}, 0.5f, 24, false, 0, 950, 2.8f, 1.5e6f, 0.03f, 0.3f, 2.0e6f, 0.04f, 0.3f, 40, true, 0},
     {"Cardboard", {0.72f, 0.56f, 0.36f, 1}, 0.05f, 6, false, 0, 250, 1.5f, 4.0e5f, 0.01f, 0.05f, 4.0e5f, 0.02f, 0.1f, 20, false, 0.2f},
     {"Foam", {0.95f, 0.85f, 0.3f, 1}, 0.05f, 6, false, 0, 30, 1, 3.0e4f, 0.05f, 0.6f, 2.0e4f, 0.05f, 0.6f, 30, false, 0},
     {"Concrete", {1, 1, 1, 1}, 0.1f, 8, false, 3, 2400, 50, 1.0e7f, 0.002f, 0.002f, 1.0e7f, 0.01f, 0.01f, 300, false, 0.4f},
@@ -1210,14 +1212,26 @@ void apply_vehicle_sheet_body(Vehicle* v, bool player) {
     const bool sheet_alone = v->body && v->body->beams.empty();
     const bool welded = v->body && !v->def().welds.empty();
     if (welded) v->body->shell_min_shift = std::max(v->body->shell_min_shift, getenv("BL_CAR_SHIFT") ? atoi(getenv("BL_CAR_SHIFT")) : 0); // (diagnostics: 2, 4 short steps: more cracks standing, no faster)
+    // (welded panels: the membrane damped, SoftBody::membrane_damp - 0.6 of the rate of stretch of the edges that left
+    // their band lately took the rattle of the floors and the door glass (frames that moved a node group over 0.3 mm) to a
+    // third, 0.3 to a half; BL_MEM_DAMP to try others)
+    if (welded) v->body->membrane_damp = getenv("BL_MEM_DAMP") ? (float)atof(getenv("BL_MEM_DAMP")) : 0.6f;
     auto membrane = [&](phys::ShellMaterial& m, const std::string& mname, float kgm2) {
         if (!sheet_alone && !welded) return;
         // (glass: its tensile strength, it flows past it only to crack at its fracture strain soon after)
-        const float sy = mname == "Steel" ? 250e6f : mname == "Aluminium" ? 150e6f : mname == "Lead" ? 12e6f : mname == "Glass" ? 40e6f : 0.0f;
-        const float rho = mname == "Steel" ? 7850.0f : mname == "Aluminium" ? 2700.0f : mname == "Glass" ? 2500.0f : 11340.0f;
+        const float sy = mname == "Steel" ? 250e6f : mname == "Aluminium" ? 150e6f : mname == "Lead" ? 12e6f : mname == "Glass" ? 40e6f : mname == "Plastic" ? 30e6f : 0.0f;
+        const float rho = mname == "Steel" ? 7850.0f : mname == "Aluminium" ? 2700.0f : mname == "Glass" ? 2500.0f : mname == "Plastic" ? 950.0f : 11340.0f;
         if (sy <= 0) return;
         m.membrane = sy * kgm2 / rho;
-        m.yield = mname == "Glass" ? 0.0008f : 0.0015f;
+        m.yield = mname == "Glass" ? 0.0008f : mname == "Plastic" ? 0.003f : 0.0015f; // (polypropylene gives more)
+        // (welded panels bend as the plate they are, D = E t^3 / 12 (1 - nu^2), t from the areal density, the step's
+        // budget above it; at the budget alone a sheet of even triangles had every hinge at its limit at once and its
+        // skin rang from step to step, 1.2 mm aluminium on the Buggy eight times stiffer than it is)
+        if (welded) {
+            const float E = mname == "Steel" ? 200e9f : mname == "Aluminium" ? 70e9f : mname == "Glass" ? 70e9f : mname == "Plastic" ? 1.5e9f : 16e9f;
+            const float t = kgm2 / rho;
+            m.bend = std::min(m.bend, E * t * t * t / (12.0f * (1.0f - 0.3f * 0.3f)) * (getenv("BL_PLATE_BEND") ? (float)atof(getenv("BL_PLATE_BEND")) : 1.0f));
+        }
     };
     auto look = [&](const std::string& mname, vec3 color) {
         auto vis = mat_visual(mat_spec(mname.c_str()));
@@ -1278,6 +1292,9 @@ phys::ShellMaterial sheet_material(const std::string& name) {
     } else if (name == "Plywood") {
         m.k = 3e6f, m.damp = 80, m.yield = 0.012f, m.brk = 0.025f, m.refine = 0.4f, m.flaw = 0.3f;
         m.bend = 1e9f, m.bend_yield = 0.15f, m.bend_break = 0.25f, m.refine_angle = 0.12f;
+    } else if (name == "Plastic") { // (polypropylene: a bumper's cover; it bends far, keeps some of the dent, tears late)
+        m.k = 1.5e6f, m.damp = 40, m.yield = 0.03f, m.brk = 0.3f, m.refine = 0.4f, m.refine_yield = 0.1f;
+        m.bend = 1e9f, m.bend_yield = 0.25f, m.refine_angle = 0.5f;
     } else if (name == "Rubber") {
         m.k = 1.5e5f, m.damp = 10, m.brk = 2.5f, m.refine = 0.3f;
         m.bend = 5, m.refine_angle = 0.5f;
@@ -1742,10 +1759,12 @@ void scene_sheet_car(Game& g) {
                    "Drive into the parked car, the poles or the wall, or Scene > Launch at 50/80 km/h. R resets the body.";
 }
 
-// ------------------------------------------------------------------------------------------- frame car
-// The Frame Car (assets/vehicles/frame_car, tools/make_frame_car.py): a welded space frame of FEM frame elements with
-// sheet metal panels on it, double wishbones on ball joints. A flat test pad: a lane to a concrete wall, a ramp, a curb
-// to trip over; the Scene menu's stress tests drop it, turn it over, trip it, launch it at the wall and off the ramp.
+// ------------------------------------------------------------------------------------------- frame car, buggy
+// The FEM cars' test pad: the Frame Car (assets/vehicles/frame_car, tools/make_frame_car.py), a welded space frame of
+// FEM frame elements with sheet metal panels on it, double wishbones on ball joints; the Buggy (assets/vehicles/buggy,
+// tools/make_buggy.py), a desert racer's tube cage with aluminium panels on it, long-travel wishbones and trailing arms.
+// A flat test pad: a lane to a concrete wall, a ramp, a curb to trip over (the Buggy's: a gravel lane with whoops and a
+// tabletop jump); the Scene menu's stress tests drop the car, turn it over, trip it, launch it at the wall and off the ramp.
 namespace {
 
 // the player's car put back at pos (facing +z turned by yaw), then moved and set spinning: lifted by `lift`, turned
@@ -1811,8 +1830,57 @@ struct FrameCarExtras {
     vec3 axe_pivot{0};
     vec3 axe_dir{0};  // (the edge's direction from the pivot last frame: the sector it swept is cut)
     float axe_reach = 0; // (the pivot to the edge's lower end)
+    // two cars: how far one car's frame got into the other - its frame nodes inside the other's collision hull (the
+    // generalized winding number of the hull's triangles about the node), the deepest from the hull's surface
+    vec3 axis{0};
+    int inside = 0, inside_max = 0;
+    float depth = 0, depth_max = 0;
 };
+
+// the frame nodes of `a` inside the collision hull (the one-sided triangles, not torn) of `h`: how many, the deepest (m)
+void frame_nodes_inside(const SoftBody& a, const SoftBody& h, int& count, float& deepest) {
+    count = 0, deepest = 0;
+    std::vector<const Triangle*> hull;
+    for (const Triangle& t : h.tris)
+        if (!t.two_sided && !t.torn) hull.push_back(&t);
+    if (hull.empty()) return;
+    const AABB box = h.aabb;
+    for (uint32_t n : a.fem.node) {
+        const vec3 p = a.nodes[n].p;
+        if (p.x < box.mn.x || p.y < box.mn.y || p.z < box.mn.z || p.x > box.mx.x || p.y > box.mx.y || p.z > box.mx.z) continue;
+        double w = 0; // (the solid angles, Van Oosterom and Strackee)
+        float dmin = 1e9f;
+        for (const Triangle* t : hull) {
+            const vec3 A = h.nodes[t->a].p - p, B = h.nodes[t->b].p - p, C = h.nodes[t->c].p - p;
+            const double la = length(A), lb = length(B), lc = length(C);
+            const double num = dot(A, cross(B, C)), den = la * lb * lc + dot(A, B) * lc + dot(A, C) * lb + dot(B, C) * la;
+            w += 2.0 * std::atan2(num, den);
+            vec3 bary;
+            dmin = std::min(dmin, length(closest_on_triangle(p, h.nodes[t->a].p, h.nodes[t->b].p, h.nodes[t->c].p, bary) - p));
+        }
+        if (std::fabs(w) / (4.0 * kPi) > 0.5) {
+            count++, deepest = std::max(deepest, dmin);
+            static const bool dbg = getenv("BL_INSIDEDBG") != nullptr; // (diagnostics: which nodes)
+            if (dbg) printf("  inside: node %u of %s, %.0f cm deep\n", n, a.name.c_str(), dmin * 100.0f);
+        }
+    }
+}
 FrameCarExtras s_fc;
+
+// the pad's car: the player's vehicle, the one the crash tests spawn a second of
+struct PadCar {
+    std::string id = "frame_car/frame_car", name = "Frame Car";
+};
+PadCar s_pad;
+
+// the player's car put back on its wheels at pos and what the drops need of it: its top (m) and its centre of mass
+bool frame_car_measure(Game& g, vec3 pos, float& top, vec3& com) {
+    Vehicle* car = g.player_vehicle();
+    if (!car) return false;
+    car->reset(pos, 0);
+    top = car->body->aabb.mx.y, com = car->body->center_of_mass();
+    return true;
+}
 
 void frame_car_clear(Game& g) {
     if (s_fc.other) g.remove_vehicle(s_fc.other);
@@ -1823,11 +1891,37 @@ void frame_car_clear(Game& g) {
 
 } // namespace
 
-void scene_frame_car(Game& g) {
+// a gravel lane on the pad (the Buggy's): whoops, 0.5 m high every 8 m, from z = 20 to 100, and a tabletop jump
+// (a 2.2 m kicker, its face curving up over 6 m to 12 degrees at the lip, a 16 m table, a 20 m landing); the
+// terrain's grid is 1 m
+static void pad_dirt_lane(phys::Heightfield& hf, float x0, float half) {
+    auto bump = [](float z) {
+        if (z > 20 && z < 100) return 0.25f * (1.0f - std::cos(2.0f * kPi * (z - 20) / 8.0f)); // (the whoops)
+        const float g = std::tan(12.0f * kDeg2Rad), arc = 6.0f, kick = arc + (2.2f - 0.5f * g * arc) / g; // (13.4 m)
+        if (z > 150 && z < 150 + arc) return 0.5f * g * (z - 150) * (z - 150) / arc;
+        if (z >= 150 + arc && z < 150 + kick) return 0.5f * g * arc + g * (z - 150 - arc);
+        if (z >= 150 + kick && z < 166 + kick) return 2.2f;
+        if (z >= 166 + kick && z < 186 + kick) return 2.2f * (0.5f + 0.5f * std::cos(kPi * (z - 166 - kick) / 20.0f));
+        return 0.0f;
+    };
+    for (int iz = 0; iz < hf.nz(); iz++)
+        for (int ix = 0; ix < hf.nx(); ix++) {
+            const vec2 w = hf.origin() + vec2((float)ix, (float)iz) * hf.cell();
+            const float dx = std::fabs(w.x - x0);
+            if (dx > half + 3 || w.y < 0 || w.y > 230) continue;
+            const float edge = dx < half ? 1.0f : 0.5f + 0.5f * std::cos(kPi * (dx - half) / 3.0f); // (3 m shoulders)
+            hf.h(ix, iz) += bump(w.y) * edge;
+            if (dx < half + 1) hf.surf(ix, iz) = SURF_GRAVEL;
+        }
+}
+
+static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt) {
+    s_pad.id = vid, s_pad.name = name;
     auto& A = SharedAssets::get();
     g.create_terrain(241, 401, 1.0f, vec2(-120, -100));
     auto& hf = g.world.statics.terrain;
     te::flatten_rect(hf, vec2(0, 100), vec2(116, 196), 0, 0.0f, 3, SURF_ASPHALT);
+    if (dirt) pad_dirt_lane(hf, 80, 5);
     g.finish_terrain();
     // the wall across the main lane, a 15 degree ramp 1.5 m high on the right lane, a curb along the left lane
     g.add_static_box(vec3(0, 1.5f, 150), vec3(4, 1.5f, 0.6f), quat(), SURF_CONCRETE, A.concrete);
@@ -1839,12 +1933,13 @@ void scene_frame_car(Game& g) {
     add_cone_line(g, vec3(5, 0, 0), vec3(5, 0, 140), 12);
     g.no_player_vehicle = true;
     g.set_spawn(vec3(0, 0, 0), 0);
-    g.spawn_vehicle("frame_car/frame_car", vec3(0, 0, 0), 0, true);
+    g.spawn_vehicle(s_pad.id, vec3(0, 0, 0), 0, true);
     g.add_static_cylinder(vec3(16, 0, 150), 0.16f, 4.0f, SURF_CONCRETE, A.concrete); // (a pole beside the wall)
     g.labels.push_back({vec3(0, 3.6f, 150), "WALL"});
     g.labels.push_back({vec3(16, 4.4f, 150), "POLE"});
     g.labels.push_back({vec3(40, 3.0f, 84), "RAMP"});
     g.labels.push_back({vec3(-40, 1.0f, 48), "CURB"});
+    if (dirt) g.labels.push_back({vec3(80, 1.6f, 18), "WHOOPS"}), g.labels.push_back({vec3(80, 3.6f, 148), "JUMP"});
     const float kmh = 1.0f / 3.6f;
     frame_car_clear(g);
     s_fc = FrameCarExtras();
@@ -1852,6 +1947,17 @@ void scene_frame_car(Game& g) {
     // (ahead of the blade: from where the edge is to where it will be in a frame and a half, so the edge meets what it
     // cut, not the car it has to push through first)
     g.scene_update = [](Game& gg, float dt) {
+        if (s_fc.other && length2(s_fc.axis) > 0)
+            if (const Vehicle* car = gg.player_vehicle(); car && !car->body->fem.empty() && !s_fc.other->body->fem.empty()) {
+                int n1, n2;
+                float d1, d2;
+                frame_nodes_inside(*car->body, *s_fc.other->body, n1, d1);
+                frame_nodes_inside(*s_fc.other->body, *car->body, n2, d2);
+                s_fc.inside = n1 + n2, s_fc.depth = std::max(d1, d2);
+                s_fc.inside_max = std::max(s_fc.inside_max, s_fc.inside), s_fc.depth_max = std::max(s_fc.depth_max, s_fc.depth);
+                gg.scene_status = format("frame nodes inside the other car: %d, %.0f cm deep (most %d, %.0f cm); centres %.2f m apart", s_fc.inside, s_fc.depth * 100.0f,
+                                         s_fc.inside_max, s_fc.depth_max * 100.0f, length(car->body->center_of_mass() - s_fc.other->body->center_of_mass()));
+            }
         if (!s_fc.axe || !s_fc.axe->body) return;
         const SoftBody& ab = *s_fc.axe->body;
         const vec3 e = ab.nodes[s_fc.axe_edge].p - s_fc.axe_pivot, v = ab.nodes[s_fc.axe_edge].v;
@@ -1873,23 +1979,26 @@ void scene_frame_car(Game& g) {
     };
     g.scene_actions.push_back({"Drop from 5 m", [](Game& gg) { frame_car_clear(gg), frame_car_stunt(gg, vec3(0, 0, 20), 0, 5.0f, quat(), vec3(0), vec3(0)); }});
     g.scene_actions.push_back({"Drop from 10 m", [](Game& gg) { frame_car_clear(gg), frame_car_stunt(gg, vec3(0, 0, 20), 0, 10.0f, quat(), vec3(0), vec3(0)); }});
-    g.scene_actions.push_back({"Head-on into another Frame Car (50 km/h each)", [kmh](Game& gg) {
+    g.scene_actions.push_back({format("Head-on into another %s (50 km/h each)", name), [kmh](Game& gg) {
                                    frame_car_clear(gg);
                                    frame_car_stunt(gg, vec3(0, 0, 50), 0, 0.0f, quat(), vec3(0, 0, 50 * kmh), vec3(0));
-                                   s_fc.other = gg.spawn_vehicle("frame_car/frame_car", vec3(0.25f, 0, 72), 180, false);
-                                   if (s_fc.other) s_fc.other->launch(vec3(0, 0, -50 * kmh));
+                                   s_fc.other = gg.spawn_vehicle(s_pad.id, vec3(0.25f, 0, 72), 180, false);
+                                   if (s_fc.other) s_fc.other->launch(vec3(0, 0, -50 * kmh)), s_fc.axis = vec3(0, 0, 1);
                                }});
-    g.scene_actions.push_back({"Another Frame Car into its side at 50 km/h", [kmh](Game& gg) {
+    g.scene_actions.push_back({format("Another %s into its side at 50 km/h", name), [kmh](Game& gg) {
                                    frame_car_clear(gg);
                                    frame_car_stunt(gg, vec3(0, 0, 60), 0, 0.0f, quat(), vec3(0), vec3(0));
-                                   s_fc.other = gg.spawn_vehicle("frame_car/frame_car", vec3(-9, 0, 59.6f), 90, false);
-                                   if (s_fc.other) s_fc.other->launch(vec3(50 * kmh, 0, 0));
+                                   s_fc.other = gg.spawn_vehicle(s_pad.id, vec3(-9, 0, 59.6f), 90, false);
+                                   if (s_fc.other) s_fc.other->launch(vec3(50 * kmh, 0, 0)), s_fc.axis = vec3(-1, 0, 0);
                                }});
     g.scene_actions.push_back({"Drop a 5 t concrete slab on it from 2.5 m", [](Game& gg) {
                                    frame_car_clear(gg);
+                                   float top;
+                                   vec3 com;
+                                   if (!frame_car_measure(gg, vec3(0, 0, 20), top, com)) return;
                                    frame_car_stunt(gg, vec3(0, 0, 20), 0, 0.0f, quat(), vec3(0), vec3(0));
                                    SoftBoxDesc d;
-                                   d.center = vec3(0, 1.45f + 2.5f + 0.15f, 20);
+                                   d.center = vec3(0, top + 2.5f + 0.15f, 20);
                                    d.size = vec3(2.2f, 0.3f, 4.2f);
                                    d.nx = 3, d.ny = 2, d.nz = 5;
                                    d.mass = 5000.0f;
@@ -1909,8 +2018,13 @@ void scene_frame_car(Game& g) {
                                    s_fc.axe_reach = std::sqrt(0.25f * d.blade_w * d.blade_w + d.length * d.length);
                                    s_fc.axe = gg.add_object(build_axe(gg.world, d, "axe", &s_fc.axe_edge));
                                }});
-    g.scene_actions.push_back(
-        {"Drop on the roof from 1.5 m", [](Game& gg) { frame_car_stunt(gg, vec3(0, 0, 20), 0, 3.3f, quat::axis_angle(vec3(0, 0, 1), kPi), vec3(0), vec3(0)); }});
+    g.scene_actions.push_back({"Drop on the roof from 1.5 m", [](Game& gg) {
+                                   // (turned over about its centre of mass its top goes to 2 com - top: lifted to 1.5 m)
+                                   float top;
+                                   vec3 com;
+                                   if (!frame_car_measure(gg, vec3(0, 0, 20), top, com)) return;
+                                   frame_car_stunt(gg, vec3(0, 0, 20), 0, 1.5f + top - 2.0f * com.y, quat::axis_angle(vec3(0, 0, 1), kPi), vec3(0), vec3(0));
+                               }});
     g.scene_actions.push_back({"Barrel roll at 50 km/h", [kmh](Game& gg) {
                                    frame_car_stunt(gg, vec3(0, 0, 10), 0, 0.6f, quat(), vec3(0, 3.5f, 50 * kmh), vec3(0, 0, 5.0f));
                                }});
@@ -1923,6 +2037,14 @@ void scene_frame_car(Game& g) {
     g.scene_actions.push_back({"Off the ramp at 70 km/h", [kmh](Game& gg) {
                                    frame_car_stunt(gg, vec3(40, 0, 40), 0, 0.0f, quat(), vec3(0, 0, 70 * kmh), vec3(0));
                                }});
+    if (dirt) {
+        g.scene_actions.push_back({"Through the whoops at 80 km/h", [kmh](Game& gg) {
+                                       frame_car_clear(gg), frame_car_stunt(gg, vec3(80, 0, 2), 0, 0.0f, quat(), vec3(0, 0, 80 * kmh), vec3(0));
+                                   }});
+        g.scene_actions.push_back({"Over the jump at 90 km/h", [kmh](Game& gg) {
+                                       frame_car_clear(gg), frame_car_stunt(gg, vec3(80, 0, 115), 0, 0.0f, quat(), vec3(0, 0, 90 * kmh), vec3(0));
+                                   }});
+    }
     g.scene_actions.push_back({"Hang it from a crane (1 m up)", [](Game& gg) {
                                    if (Vehicle* car = gg.player_vehicle()) car->reset(vec3(0, 0, 20), 0), gg.crane_vehicle(car, 1.0f);
                                }});
@@ -1934,9 +2056,187 @@ void scene_frame_car(Game& g) {
                                    frame_car_grab(gg, 1.5f, s ? (float)atof(s) : 5.0f);
                                }});
     g.scene_actions.push_back({"Let go (the crane, the grab)", [](Game& gg) { gg.crane_release(), gg.grab_end(); }});
-    g.scene_hint = "A space frame of welded tubes (FEM frame elements) with sheet panels on it, double wishbones on ball joints. F3: the "
-                   "frame, orange where bent for good. Scene menu: drop it, turn it over, trip it on the curb, launch it at the wall or off "
-                   "the ramp. R resets it.";
+    g.scene_hint = dirt ? "A desert racer's cage of welded tubes (FEM frame elements) with aluminium panels, long-travel wishbones and trailing "
+                          "arms. F3: the frame, orange where bent for good. Scene menu: the whoops and the jump on the gravel lane, drop it, "
+                          "turn it over, launch it at the wall. R resets it."
+                        : "A space frame of welded tubes (FEM frame elements) with sheet panels on it, double wishbones on ball joints. F3: the "
+                          "frame, orange where bent for good. Scene menu: drop it, turn it over, trip it on the curb, launch it at the wall or off "
+                          "the ramp. R resets it.";
+    if (std::string(vid).find("shell_car") != std::string::npos)
+        g.scene_hint = "A prototype whose body is a shell of FEM triangle elements (no frame: the body is the structure), trailing arms and "
+                       "coil-overs on its floor. F3: the elements, orange where the steel has yielded. Scene menu: drop it, turn it over, "
+                       "launch it at the wall. R resets it.";
+}
+
+void scene_frame_car(Game& g) { scene_fem_pad(g, "frame_car/frame_car", "Frame Car", false); }
+void scene_buggy(Game& g) { scene_fem_pad(g, "buggy/buggy", "Buggy", true); }
+void scene_shell_car(Game& g) { scene_fem_pad(g, "shell_car/shell_car", "Shell Car", false); }
+
+
+
+// The pad's crash tests as scenes of their own (the reports' videos): the Frame Car's (or the Buggy's) scene with one
+// of its Scene menu tests started on the first frame and the free camera where the report's was; F5 (a reload keeps
+// the camera) or the Scene menu runs it again, the other tests stay in the menu
+void scene_frame_car_test(Game& g, const char* action, vec3 eye, vec3 target, const char* hint, void (*scene)(Game&) = scene_frame_car) {
+    scene(g);
+    std::function<void(Game&)> run;
+    std::string label;
+    for (const SceneAction& a : g.scene_actions)
+        if (a.label.find(action) != std::string::npos) {
+            run = a.run, label = a.label;
+            break;
+        }
+    if (!run) return;
+    auto base = g.scene_update;
+    g.scene_update = [base, run, label, started = false](Game& gg, float dt) mutable {
+        if (!started) started = true, log_info("scene test: %s", label.c_str()), run(gg);
+        if (base) base(gg, dt);
+    };
+    g.scene_actions.insert(g.scene_actions.begin(), {"Run the test again (F5)", run});
+    g.cam.look_free(eye, target);
+    g.scene_hint = std::string(hint) + " F5 runs it again; the Scene menu has the other tests, the " + s_pad.name + " scene is the pad to drive on.";
+}
+
+// ------------------------------------------------------------------------------------------- FEM shells
+// Triangle elements of the FEM frame (phys::FrameTri: a co-rotational thin shell, membrane and Kirchhoff bending, in
+// the frame's implicit step) in three prototypes on a concrete pad: a steel sheet of 3 mm, 2 x 2 m, lying across two
+// supports; a cantilever, 1.5 x 0.5 m of 8 mm steel clamped in a concrete block; a hollow steel cube of 1 m, 2 mm,
+// 5 x 5 cells a face. The Scene menu drops balls and slabs on them, throws the cube about.
+namespace {
+
+MaterialPtr fem_plate_visual(vec3 color) {
+    auto vis = mat_visual(mat_spec("Steel"));
+    vis->color = vec4(color, 1.0f);
+    vis->specular = 0.5f;
+    return vis;
+}
+
+void fem_shells_clear(Game& g) {
+    std::vector<DynamicObject*> gone;
+    for (auto& o : g.objects)
+        if (o->name.rfind("fem ", 0) == 0 || o->name.rfind("weight", 0) == 0) gone.push_back(o.get());
+    for (DynamicObject* o : gone) g.remove_object(o);
+}
+
+void add_fem_sheet(Game& g, float y, vec3 v = vec3(0)) {
+    FemPlateDesc d;
+    d.origin = vec3(-1, y, -1), d.du = vec3(2.0f / 16, 0, 0), d.dv = vec3(0, 0, 2.0f / 16), d.nu = d.nv = 16;
+    d.thickness = 0.003f;
+    d.visual = fem_plate_visual(vec3(0.62f, 0.64f, 0.67f));
+    d.velocity = v;
+    g.add_object(build_fem_plate(g.world, d, "fem sheet"));
+}
+
+const vec3 kCantRoot(6.0f, 1.2f, -0.25f);
+// the cantilever, with a box of `load` kg welded under its tip: a steel box 0.125 x 0.5 x 0.25 m (5 mm) on the last
+// row of cells, open at the top (the tip is its lid), filled with lead (the mass on its nodes)
+void add_fem_cantilever(Game& g, float load = 0) {
+    FemPlateDesc d;
+    d.origin = kCantRoot, d.du = vec3(1.5f / 12, 0, 0), d.dv = vec3(0, 0, 0.5f / 4), d.nu = 12, d.nv = 4;
+    d.thickness = 0.008f;
+    d.damping = 1e-3f; // (bolted at its root: about 1 % of critical in its first mode, not the bare steel's 0.1 %)
+    d.fixed = [](vec3 p) { return p.x < kCantRoot.x + 1e-3f; };
+    d.visual = fem_plate_visual(vec3(0.20f, 0.36f, 0.62f));
+    if (load > 0)
+        d.more = [load](phys::SoftBody& b, phys::ShellMesher& m, uint16_t) {
+            const uint16_t s = b.fem.add_shell_section(phys::make_shell_section("Steel", 0.005f));
+            const vec3 o = kCantRoot + vec3(1.5f - 0.125f, -0.25f, 0), X(0.125f, 0, 0), Y(0, 0.125f, 0), Z(0, 0, 0.125f);
+            std::vector<uint32_t> box;
+            for (const auto& ns : {m.grid(o, Z, X, 4, 1, s), m.grid(o, X, Y, 1, 2, s), m.grid(o + Z * 4.0f, Y, X, 2, 1, s), m.grid(o, Y, Z, 2, 4, s),
+                                   m.grid(o + X, Z, Y, 4, 2, s)})
+                box.insert(box.end(), ns.begin(), ns.end());
+            std::sort(box.begin(), box.end());
+            box.erase(std::unique(box.begin(), box.end()), box.end());
+            for (uint32_t i : box) b.nodes[i].mass += load / (float)box.size();
+        };
+    g.add_object(build_fem_plate(g.world, d, "fem cantilever"));
+}
+
+const vec3 kCubeAt(-6.0f, 0.51f, 0.0f);
+void add_fem_cube(Game& g, vec3 at, const quat& rot = quat(), vec3 v = vec3(0), vec3 spin = vec3(0), float lid_load = 0) {
+    FemBoxDesc d;
+    d.center = at, d.rot = rot, d.velocity = v, d.spin = spin, d.lid_load = lid_load;
+    d.n = 5, d.thickness = 0.002f;
+    d.visual = fem_plate_visual(vec3(0.78f, 0.30f, 0.12f));
+    g.add_object(build_fem_box(g.world, d, "fem cube"));
+}
+
+void remove_named(Game& g, const std::string& name) {
+    std::vector<DynamicObject*> gone;
+    for (auto& o : g.objects)
+        if (o->name == name) gone.push_back(o.get());
+    for (DynamicObject* o : gone) g.remove_object(o);
+}
+
+void add_weight(Game& g, vec3 at, vec3 size, float mass) {
+    SoftBoxDesc d;
+    d.center = at, d.size = size;
+    d.nx = d.ny = d.nz = 2;
+    d.mass = mass;
+    d.beams = {1e9f, 4e4f, 1e12f, 1e12f, 0.0f};
+    d.mat = SharedAssets::get().concrete;
+    g.add_object(build_soft_box(g.world, d, "weight"));
+}
+
+} // namespace
+
+void scene_fem_shells(Game& g) {
+    auto& A = SharedAssets::get();
+    g.create_terrain(81, 81, 1.0f, vec2(-40, -40));
+    auto& hf = g.world.statics.terrain;
+    te::flatten_rect(hf, vec2(0, 0), vec2(34, 34), 0, 0.0f, 4, SURF_CONCRETE);
+    g.finish_terrain();
+    // the sheet's two supports, the cantilever's block, a wall to throw the cube at
+    for (float x : {-0.85f, 0.85f}) g.add_static_box(vec3(x, 0.4f, 0), vec3(0.12f, 0.4f, 1.3f), quat(), SURF_CONCRETE, A.concrete);
+    g.add_static_box(vec3(kCantRoot.x - 0.5f, 0.9f, 0), vec3(0.5f, 0.9f, 0.6f), quat(), SURF_CONCRETE, A.concrete);
+    g.add_static_box(vec3(-12.0f, 1.0f, 0), vec3(0.3f, 1.0f, 3.0f), quat(), SURF_CONCRETE, A.concrete);
+    g.labels.push_back({vec3(0, 1.9f, 0), "SHEET 2 x 2 m, 3 mm"});
+    g.labels.push_back({vec3(6.7f, 2.2f, 0), "CANTILEVER 1.5 m, 8 mm"});
+    g.labels.push_back({vec3(-6, 1.9f, 0), "CUBE 1 m, 2 mm"});
+    g.no_player_vehicle = true;
+    g.set_spawn(vec3(0, 0, -9), 0);
+    auto all = [](Game& gg) { add_fem_sheet(gg, 0.82f), add_fem_cantilever(gg), add_fem_cube(gg, kCubeAt); };
+    all(g);
+    auto test = [&](const char* label, std::function<void(Game&)> f) {
+        g.scene_actions.push_back({label, [all, f](Game& gg) {
+                                       fem_shells_clear(gg);
+                                       all(gg);
+                                       f(gg);
+                                   }});
+    };
+    test("Reset", [](Game&) {});
+    test("Drop a 40 kg steel ball on the sheet from 3 m", [](Game& gg) {
+        gg.projectile_kind = 0;
+        gg.projectile_speed = std::sqrt(2.0f * 9.81f * 3.0f);
+        gg.shoot(vec3(0.3f, 0.82f + 0.25f + 2.0f, 0.2f), vec3(0, -1, 0));
+    });
+    test("Drop a 40 kg steel ball on the sheet from 10 m", [](Game& gg) {
+        gg.projectile_kind = 0;
+        gg.projectile_speed = std::sqrt(2.0f * 9.81f * 10.0f);
+        gg.shoot(vec3(0.0f, 0.82f + 0.25f + 2.0f, 0.0f), vec3(0, -1, 0));
+    });
+    test("Drop a 500 kg block on the sheet from 1 m", [](Game& gg) { add_weight(gg, vec3(0, 0.82f + 1.2f, 0), vec3(0.5f, 0.4f, 0.5f), 500.0f); });
+    test("Weld 100 kg under the cantilever's tip", [](Game& gg) { remove_named(gg, "fem cantilever"), add_fem_cantilever(gg, 100.0f); });
+    test("Weld 250 kg under the cantilever's tip", [](Game& gg) { remove_named(gg, "fem cantilever"), add_fem_cantilever(gg, 250.0f); });
+    test("Drop 1 t on the cantilever's tip from 0.5 m", [](Game& gg) { add_weight(gg, vec3(7.25f, 1.2f + 0.8f, 0), vec3(0.4f, 0.5f, 0.45f), 1000.0f); });
+    test("Drop the cube from 5 m on a face", [](Game& gg) {
+        remove_named(gg, "fem cube");
+        add_fem_cube(gg, kCubeAt + vec3(0, 5, 0));
+    });
+    test("Drop the cube from 5 m on a corner", [](Game& gg) {
+        remove_named(gg, "fem cube");
+        const quat r = quat::axis_angle(normalize(vec3(1, 0, -1)), std::atan(std::sqrt(2.0f)));
+        add_fem_cube(gg, kCubeAt + vec3(0, 5.4f, 0), r);
+    });
+    test("Load the cube's lid with 1 t (spread on it)", [](Game& gg) { remove_named(gg, "fem cube"), add_fem_cube(gg, kCubeAt, quat(), vec3(0), vec3(0), 1000.0f); });
+    test("Drop a 1 t slab on the cube from 1 m", [](Game& gg) { add_weight(gg, kCubeAt + vec3(0, 0.5f + 1.0f + 0.15f, 0), vec3(1.4f, 0.3f, 1.4f), 1000.0f); });
+    test("Throw the cube at the wall at 50 km/h", [](Game& gg) {
+        remove_named(gg, "fem cube");
+        add_fem_cube(gg, kCubeAt + vec3(-1.5f, 0.6f, 0), quat(), vec3(-50 / 3.6f, 1.0f, 0), vec3(0, 0, 2.0f));
+    });
+    g.scene_hint = "Triangle elements of the FEM frame: a thin shell (membrane and Kirchhoff bending, co-rotational) solved implicitly "
+                   "with the members. A steel sheet across two supports, a cantilever clamped in a block, a hollow steel cube. Scene "
+                   "menu: balls, weights, drops. F3: the elements (orange where yielded), F4 stress.";
 }
 
 // ------------------------------------------------------------------------------------------- steel barrels
@@ -2473,6 +2773,47 @@ const std::vector<SceneInfo>& scene_registry() {
         {"barrels", "Steel Barrels", "Physics", "200 l steel drums of triangle elements: drop, roll, stack and crash them", scene_barrels},
         {"frame_car", "Frame Car", "Physics", "A car on a welded space frame of FEM tubes with sheet panels: drive it, drop it, roll it, crash it",
          scene_frame_car},
+        {"fc_headon", "Frame Car: Head-on", "Frame Car tests", "Two Frame Cars head-on at 50 km/h each",
+         [](Game& g) { scene_frame_car_test(g, "Head-on into another", vec3(4.6f, 1.9f, 57.5f), vec3(0, 0.6f, 62.5f), "Two Frame Cars meet head-on at 50 km/h each."); }},
+        {"fc_side", "Frame Car: Side impact", "Frame Car tests", "Another Frame Car into its side at 50 km/h",
+         [](Game& g) {
+             scene_frame_car_test(g, "into its side", vec3(6.5f, 2.8f, 53.5f), vec3(-1.5f, 0.7f, 60), "A second Frame Car hits the standing one in the side at 50 km/h.");
+         }},
+        {"fc_wall", "Frame Car: Wall", "Frame Car tests", "Into a concrete wall at 60 km/h",
+         [](Game& g) { scene_frame_car_test(g, "Launch at the wall", vec3(6.5f, 2.4f, 139.5f), vec3(0, 0.7f, 146), "The Frame Car into a concrete wall at 60 km/h."); }},
+        {"fc_pole", "Frame Car: Pole", "Frame Car tests", "Into a concrete pole at 50 km/h",
+         [](Game& g) { scene_frame_car_test(g, "Launch at the pole", vec3(22, 2.4f, 141), vec3(16, 0.7f, 147), "The Frame Car into a concrete pole at 50 km/h."); }},
+        {"fc_drop", "Frame Car: Drop 10 m", "Frame Car tests", "Dropped on its wheels from 10 m",
+         [](Game& g) { scene_frame_car_test(g, "Drop from 10", vec3(8, 4.5f, 12), vec3(0, 1.8f, 20), "The Frame Car dropped on its wheels from 10 m."); }},
+        {"fc_slab", "Frame Car: Slab", "Frame Car tests", "A 5 t concrete slab dropped on it from 2.5 m",
+         [](Game& g) { scene_frame_car_test(g, "Drop a 5 t concrete slab", vec3(6, 3.6f, 14.5f), vec3(0, 1.2f, 20), "A 5 t concrete slab falls on the roof from 2.5 m."); }},
+        {"fc_axe", "Frame Car: Giant axe", "Frame Car tests", "A 2 t pendulum axe swings down and cuts it in two",
+         [](Game& g) { scene_frame_car_test(g, "The giant axe", vec3(-15.5f, 5.0f, 110.5f), vec3(-25, 3.0f, 120), "A 2 t axe on a pendulum swings down and cuts the car in two."); }},
+        {"fc_roll", "Frame Car: Barrel roll", "Frame Car tests", "Thrown up and spun at 50 km/h: it rolls over",
+         [](Game& g) { scene_frame_car_test(g, "Barrel roll", vec3(9, 4, 18), vec3(0, 1, 32), "Thrown up and spun at 50 km/h: the Frame Car rolls over."); }},
+        {"buggy", "Buggy", "Physics", "A desert racer on a welded tube cage (FEM) with aluminium panels: whoops, a jump, drops, rolls, crashes",
+         scene_buggy},
+        {"bg_headon", "Buggy: Head-on", "Buggy tests", "Two Buggies head-on at 50 km/h each",
+         [](Game& g) { scene_frame_car_test(g, "Head-on into another", vec3(4.6f, 1.9f, 57.5f), vec3(0, 0.6f, 62.5f), "Two Buggies meet head-on at 50 km/h each.", scene_buggy); }},
+        {"bg_side", "Buggy: Side impact", "Buggy tests", "Another Buggy into its side at 50 km/h",
+         [](Game& g) {
+             scene_frame_car_test(g, "into its side", vec3(6.5f, 2.8f, 53.5f), vec3(-1.5f, 0.7f, 60), "A second Buggy hits the standing one in the side at 50 km/h.", scene_buggy);
+         }},
+        {"bg_wall", "Buggy: Wall", "Buggy tests", "Into a concrete wall at 60 km/h",
+         [](Game& g) { scene_frame_car_test(g, "Launch at the wall", vec3(6.5f, 2.4f, 139.5f), vec3(0, 0.7f, 146), "The Buggy into a concrete wall at 60 km/h.", scene_buggy); }},
+        {"bg_drop", "Buggy: Drop 10 m", "Buggy tests", "Dropped on its wheels from 10 m",
+         [](Game& g) { scene_frame_car_test(g, "Drop from 10", vec3(8, 4.5f, 12), vec3(0, 1.8f, 20), "The Buggy dropped on its wheels from 10 m.", scene_buggy); }},
+        {"bg_slab", "Buggy: Slab", "Buggy tests", "A 5 t concrete slab dropped on it from 2.5 m",
+         [](Game& g) { scene_frame_car_test(g, "Drop a 5 t concrete slab", vec3(6, 3.9f, 14.5f), vec3(0, 1.4f, 20), "A 5 t concrete slab falls on the cage from 2.5 m.", scene_buggy); }},
+        {"bg_roll", "Buggy: Barrel roll", "Buggy tests", "Thrown up and spun at 50 km/h: it rolls over",
+         [](Game& g) { scene_frame_car_test(g, "Barrel roll", vec3(9, 4, 18), vec3(0, 1, 32), "Thrown up and spun at 50 km/h: the Buggy rolls over.", scene_buggy); }},
+        {"bg_whoops", "Buggy: Whoops", "Buggy tests", "Through the whoops at 80 km/h",
+         [](Game& g) { scene_frame_car_test(g, "whoops", vec3(88, 2.5f, 30), vec3(80, 0.8f, 45), "Through ten 0.5 m whoops at 80 km/h.", scene_buggy); }},
+        {"bg_jump", "Buggy: Jump", "Buggy tests", "Over the tabletop jump at 90 km/h",
+         [](Game& g) { scene_frame_car_test(g, "jump", vec3(95, 4.0f, 160), vec3(80, 2.2f, 172), "Over the 2.2 m tabletop at 90 km/h.", scene_buggy); }},
+        {"shell_car", "Shell Car", "Physics", "A prototype car whose body is a shell of FEM triangle elements (no frame): drive it, crash it",
+         scene_shell_car},
+        {"fem_shells", "FEM Shells", "Physics", "Triangle elements of the FEM frame: a steel sheet, a cantilever and a hollow cube", scene_fem_shells},
         {"vehicle_crash", "Vehicle vs Vehicle", "Driving", "Configurable crash of two vehicles (Scene menu)", scene_vehicle_crash},
         {"lab", "Physics Lab", "Physics", "Primitive tests: collisions, deformation, breaking, joints", scene_lab},
         {"stress_vehicles", "Stress: 16 vehicles", "Stress", "Many AI vehicles", scene_stress_vehicles},

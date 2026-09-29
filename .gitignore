@@ -10,8 +10,12 @@ assets/vehicles/*
 !assets/vehicles/sheet_car/
 !assets/vehicles/editor/
 !assets/vehicles/yaris_biw/
+!assets/vehicles/buggy/
+!assets/vehicles/shell_car/
 __pycache__/
 # the editor's re-saves of RoR mods (their authors' licences)
 assets/vehicles/editor/1988_audi_quattro.truck
 assets/vehicles/editor/1998_mercedes_benz_clk_200_elegance.truck
 assets/vehicles/editor/seat_ibiza_2_0l_gti.truck
+# the editor's copies saved next to the project's own vehicles
+assets/vehicles/*/*_edited.truck

@@ -1,5 +1,7 @@
 // Dynamic world objects built from nodes/beams (boxes, ropes, bridges, trees ...) and their visuals.
 #pragma once
+
+#include <functional>
 #include "phys/sheet_builder.h"
 
 #include "gfx/renderer.h"
@@ -8,6 +10,10 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+namespace bl::phys {
+class ShellMesher;
+}
 
 namespace bl {
 
@@ -40,17 +46,22 @@ struct SurfaceVisual {
 // radius between its nodes, a little past them so that the tubes meet at a joint. Split members bend along their new
 // nodes; the pieces of torn ones go with them. The vertices follow the nodes every frame, the indices only when the
 // members change.
+// Its triangle elements (FemFrame::tris) are plates of their section's thickness: both faces offset by half of it,
+// shaded smooth across edges that bend less than 35 degrees, in `plate_mat` (a torn-out triangle is gone).
 struct FrameVisual {
     MaterialPtr mat;
-    GpuMesh mesh;
-    std::vector<Vertex> verts;
-    std::vector<uint32_t> idx;
-    size_t built = ~size_t(0);
-    bool rebuilt = false;
+    MaterialPtr plate_mat;
+    GpuMesh mesh, plate_mesh;
+    std::vector<Vertex> verts, plate_verts;
+    std::vector<uint32_t> idx, plate_idx;
+    size_t built = ~size_t(0), plate_built = ~size_t(0);
+    bool rebuilt = false, plate_rebuilt = false;
+    std::vector<vec3> node_normal;   // (scratch: the plates' smooth normals per frame node)
     void update(const phys::SoftBody& b);
     void upload();
     void draw(Renderer& r) const;
 };
+MaterialPtr frame_plate_material(); // (bare steel plate, shared)
 MaterialPtr frame_tube_material(); // (painted steel tube, shared)
 
 struct ShellVisual {
@@ -398,6 +409,33 @@ struct BarrelDesc {
     float lid_dish = 0.02f, imperfection = 0.003f;
 };
 std::unique_ptr<DynamicObject> build_barrel(phys::World& w, const BarrelDesc& d, const std::string& name);
+
+// Shells of FEM triangle elements (phys::FemFrame::tris; phys::ShellMesher): a plate, a closed box. The material is
+// one of the frame members' (Steel, Aluminium, ...); nodes where `fixed` says so are clamped (position and rotation).
+struct FemPlateDesc {
+    vec3 origin, du{1, 0, 0}, dv{0, 0, 1}; // the corner and the cells' edges
+    int nu = 10, nv = 10;
+    std::string material = "Steel";
+    float thickness = 0.002f;
+    float damping = -1;                    // the section's Rayleigh damping (phys::ShellSection), below 0: the default
+    std::function<bool(vec3)> fixed;       // (none: free)
+    MaterialPtr visual;
+    vec3 velocity{0, 0, 0};
+    // more of it before the nodes' masses are set (a box welded on, a load on its nodes): the body, its mesher, the section
+    std::function<void(phys::SoftBody&, phys::ShellMesher&, uint16_t)> more;
+};
+std::unique_ptr<DynamicObject> build_fem_plate(phys::World& w, const FemPlateDesc& d, const std::string& name);
+struct FemBoxDesc {
+    vec3 center, size{1, 1, 1};
+    quat rot;
+    int n = 5;                              // cells along each edge of a face
+    std::string material = "Steel";
+    float thickness = 0.002f;
+    MaterialPtr visual;
+    vec3 velocity{0, 0, 0}, spin{0, 0, 0};
+    float lid_load = 0;                     // kg on the top face's nodes (a load on its lid, as part of it)
+};
+std::unique_ptr<DynamicObject> build_fem_box(phys::World& w, const FemBoxDesc& d, const std::string& name);
 
 // Thin plate (metal / plastic): two node layers + diagonals give it bending stiffness.
 struct PlateDesc {

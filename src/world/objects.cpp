@@ -1,4 +1,5 @@
 #include "world/objects.h"
+#include "phys/fem_shell.h"
 #include "phys/sheet_builder.h"
 #include "core/profiler.h"
 #include "core/util.h"
@@ -649,6 +650,58 @@ void FrameVisual::update(const phys::SoftBody& b) {
             v[k + kSides] = {p1 + n * r, n, vec2((float)k / kSides, L)};
         }
     }
+    // the plates: per triangle its two faces (6 vertices, the back one wound the other way), rebuilt as triangles tear out
+    if (f.tris.empty()) return;
+    size_t live = 0;
+    for (const phys::FrameTri& t : f.tris) live += !t.broken;
+    if (plate_built != f.tris.size() * 1000003 + live) {
+        plate_built = f.tris.size() * 1000003 + live;
+        plate_verts.assign(f.tris.size() * 6, Vertex{});
+        plate_idx.clear();
+        for (size_t i = 0; i < f.tris.size(); i++) {
+            if (f.tris[i].broken) continue;
+            const uint32_t o = (uint32_t)(i * 6);
+            plate_idx.insert(plate_idx.end(), {o, o + 1, o + 2, o + 3, o + 5, o + 4});
+        }
+        plate_rebuilt = true;
+    }
+    node_normal.assign(f.node.size(), vec3(0));
+    std::vector<vec3> fn(f.tris.size(), vec3(0));
+    for (size_t i = 0; i < f.tris.size(); i++) {
+        const phys::FrameTri& t = f.tris[i];
+        if (t.broken) continue;
+        const vec3 a = b.nodes[f.node[t.n[0]]].p, c = b.nodes[f.node[t.n[1]]].p, d = b.nodes[f.node[t.n[2]]].p;
+        const vec3 n = cross(c - a, d - a); // (area-weighted)
+        fn[i] = normalize_or(n, vec3(0, 1, 0));
+        for (uint32_t v : t.n) node_normal[v] += n;
+    }
+    for (vec3& n : node_normal) n = normalize_or(n, vec3(0, 1, 0));
+    const float kCrease = 0.82f; // (cos 35 degrees)
+    for (size_t i = 0; i < f.tris.size(); i++) {
+        const phys::FrameTri& t = f.tris[i];
+        if (t.broken) continue;
+        const float h = 0.5f * f.shell_sections[t.section].t;
+        Vertex* v = &plate_verts[i * 6];
+        for (int k = 0; k < 3; k++) {
+            const vec3 p = b.nodes[f.node[t.n[k]]].p, nn = node_normal[t.n[k]];
+            const vec3 n = dot(nn, fn[i]) > kCrease ? nn : fn[i];
+            const vec2 uv(p.x + p.y * 0.3f, p.z + p.y * 0.7f);
+            v[k] = {p + fn[i] * h, n, uv};
+            v[3 + k] = {p - fn[i] * h, -n, uv};
+        }
+    }
+}
+
+MaterialPtr frame_plate_material() {
+    static MaterialPtr mat = [] {
+        auto m = std::make_shared<Material>();
+        m->name = "frame_plates";
+        m->color = vec4(0.62f, 0.64f, 0.67f, 1.0f);
+        m->specular = 0.5f;
+        m->gloss = 40.0f;
+        return m;
+    }();
+    return mat;
 }
 
 MaterialPtr frame_tube_material() {
@@ -664,14 +717,21 @@ MaterialPtr frame_tube_material() {
 }
 
 void FrameVisual::upload() {
-    if (verts.empty()) return;
-    if (!mesh.valid() || rebuilt) mesh.create(verts, idx, true);
-    else mesh.update_vertices(verts.data(), (int)verts.size());
-    rebuilt = false;
+    if (!verts.empty()) {
+        if (!mesh.valid() || rebuilt) mesh.create(verts, idx, true);
+        else mesh.update_vertices(verts.data(), (int)verts.size());
+        rebuilt = false;
+    }
+    if (!plate_verts.empty() && !plate_idx.empty()) {
+        if (!plate_mesh.valid() || plate_rebuilt) plate_mesh.create(plate_verts, plate_idx, true);
+        else plate_mesh.update_vertices(plate_verts.data(), (int)plate_verts.size());
+        plate_rebuilt = false;
+    }
 }
 
 void FrameVisual::draw(Renderer& r) const {
-    if (mesh.valid() && mat) r.draw_mesh(&mesh, mat.get(), mat4());
+    if (mesh.valid() && mat && !verts.empty()) r.draw_mesh(&mesh, mat.get(), mat4());
+    if (plate_mesh.valid() && !plate_idx.empty()) r.draw_mesh(&plate_mesh, (plate_mat ? plate_mat : frame_plate_material()).get(), mat4());
 }
 
 void ShellVisual::draw(Renderer& r) const {
@@ -829,6 +889,64 @@ std::unique_ptr<DynamicObject> build_soft_box(World& w, const SoftBoxDesc& d, co
     obj->body = w.add_body(std::move(body));
     obj->surfaces.push_back(std::move(sv));
     return obj;
+}
+
+// ====================================================================================== FEM shells
+namespace {
+std::unique_ptr<DynamicObject> fem_shell_object(World& w, std::unique_ptr<SoftBody> body, MaterialPtr visual, const std::string& name) {
+    body->collision_radius = 0.01f;
+    body->fem.finalize(*body);
+    auto obj = std::make_unique<DynamicObject>();
+    obj->name = name;
+    obj->body = w.add_body(std::move(body));
+    obj->frame = std::make_unique<FrameVisual>();
+    obj->frame->mat = frame_tube_material();
+    obj->frame->plate_mat = visual ? visual : frame_plate_material();
+    return obj;
+}
+} // namespace
+
+std::unique_ptr<DynamicObject> build_fem_plate(World& w, const FemPlateDesc& d, const std::string& name) {
+    auto body = std::make_unique<SoftBody>();
+    body->name = name;
+    ShellSection sec = make_shell_section(d.material, d.thickness);
+    if (d.damping >= 0) sec.damping = d.damping;
+    const uint16_t si = body->fem.add_shell_section(sec);
+    ShellMesher m(*body);
+    m.grid(d.origin, d.du, d.dv, d.nu, d.nv, si);
+    if (d.fixed)
+        for (size_t i = 0; i < body->nodes.size(); i++)
+            if (d.fixed(body->nodes[i].p)) body->info[i].flags |= NF_FIXED;
+    if (d.more) d.more(*body, m, si);
+    m.finish();
+    for (Node& x : body->nodes) x.v = d.velocity;
+    return fem_shell_object(w, std::move(body), d.visual, name);
+}
+
+std::unique_ptr<DynamicObject> build_fem_box(World& w, const FemBoxDesc& d, const std::string& name) {
+    auto body = std::make_unique<SoftBody>();
+    body->name = name;
+    const uint16_t si = body->fem.add_shell_section(make_shell_section(d.material, d.thickness));
+    ShellMesher m(*body);
+    // six faces of n x n cells, their normals out (the grid's normal is du x dv), shared edges and corners
+    const vec3 h = d.size * 0.5f, X(d.size.x / d.n, 0, 0), Y(0, d.size.y / d.n, 0), Z(0, 0, d.size.z / d.n);
+    const vec3 o = -h;
+    m.grid(o, Z, X, d.n, d.n, si);                              // bottom
+    const std::vector<uint32_t> lid = m.grid(o + vec3(0, d.size.y, 0), X, Z, d.n, d.n, si); // top
+    m.grid(o, X, Y, d.n, d.n, si);                              // front
+    m.grid(o + vec3(0, 0, d.size.z), Y, X, d.n, d.n, si);      // back
+    m.grid(o, Y, Z, d.n, d.n, si);                              // left
+    m.grid(o + vec3(d.size.x, 0, 0), Z, Y, d.n, d.n, si);      // right
+    for (uint32_t i : lid) body->nodes[i].mass += d.lid_load / (float)lid.size();
+    m.finish();
+    for (Node& x : body->nodes) {
+        const vec3 r = d.rot.rotate(x.p);
+        x.p = d.center + r;
+        x.v = d.velocity + cross(d.spin, r);
+    }
+    body->fem.set_orientation(d.rot);
+    for (vec3& om : body->fem.w) om = d.spin;
+    return fem_shell_object(w, std::move(body), d.visual, name);
 }
 
 // ====================================================================================== axe

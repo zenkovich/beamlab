@@ -8,10 +8,15 @@ materials: glass shatters, rubber holds, the metals punch through, the ball lays
 physics lab: cannonballs through the steel sheet;
 sheet shapes: the car through the 6 x 4 m gate and the dome, cannonballs through each panel, a laser cut across the gate;
 frame car: hung from a crane tilted about both axes, its wheels hang in their travel; standing its welded panels hold,
-it steers past 25 degrees, into the wall its rear wheels stay straight;
+it steers past 25 degrees and the right way, it accelerates, driving round nothing comes off, two of them head-on and
+into the side stay apart (their frames' collision hulls), dropped 5 m its doors, hood and tailgate stay on, head-on the
+bumpers and fenders come loose, the crash test scenes start their tests, into the wall its rear wheels stay straight;
 steel barrels (and with FEM rings): dropped, rolled, thrown and stacked they dent but keep their shape, a 40 kg ball dents
 them without sticking, nothing tears; tipped over or dropped they come to rest where they land; left alone they stay put;
 the pile of 15 with three thrown in within a 30 FPS frame; the editor's drum from a circle lands and rests;
+buggy: the Frame Car's tests on the desert racer, through the whoops and over the jump, the offroad hills;
+FEM shells: the sheet, the cantilever and the hollow cube of triangle elements under their loads yield where they should
+and come to rest; shell car: stands, steers, accelerates, drives round and through the crash tests stable;
 rally: the autopilot finishes in the usual time; all scenes: no numerical instability.
 """
 import os, re, subprocess, sys, csv, tempfile
@@ -182,6 +187,54 @@ toe = [abs(float(t)) for t in re.findall(r"toe ([-\d.]+) camber", out)[-4:]]
 check("frame car: standing, steering", bool(wb and cr and toe) and wb[-1][0] == "0" and int(wb[-1][1]) > 500 and cr[-1] == "0" and min(toe[:2]) > 25 and max(toe[2:]) < 2,
       "%s welds broken of %s, %s cracks, front toe %s, rear toe %s deg" % (wb[-1][0] if wb else "?", wb[-1][1] if wb else "?", cr[-1] if cr else "?",
                                                                          ", ".join("%.1f" % t for t in toe[:2]), ", ".join("%.1f" % t for t in toe[2:])))
+# steering right turns it right (facing +z: x falls; the rack's hydro once turned the wheels against the input), full
+# throttle is quick (the engine's inertia of 0.35 and a slipping clutch crawled to 26 km/h in 5 s), and driving round
+# on the pad nothing comes off (the headlights' welds let go of the frame's own vibration)
+out = run(["--scene", "frame_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--drive", "0.3,0.5",
+           "--screenshot", os.path.join(TMP, "fc4.png")])
+pos = re.findall(r"^t=\s*[\d.]+s\s+speed.*?pos \(([-\d.]+) [-\d.]+ ([-\d.]+)\)", out, re.M)
+check("frame car: steering right turns right", bool(pos) and float(pos[-1][0]) < -1.5, "position %s after 5 s at half right lock" % (pos[-1] if pos else "?",))
+out = run(["--scene", "frame_car", "--size", "640x360", "--frames", "250", "--hidden", "--novsync", "--drive", "1.0,0",
+           "--screenshot", os.path.join(TMP, "fc5.png")])
+spd = re.findall(r"^t=\s*([\d.]+)s\s+speed\s+([-\d.]+) km/h", out, re.M)
+v4 = [float(v) for t, v in spd if abs(float(t) - 4.0) < 0.01]
+check("frame car: 0-60 km/h within 4 s", bool(v4) and v4[0] > 60, "%.1f km/h at 4 s" % v4[0] if v4 else "no speed")
+out = run(["--scene", "frame_car", "--size", "640x360", "--frames", "900", "--hidden", "--novsync", "--drive", "0.6,0.35",
+           "--screenshot", os.path.join(TMP, "fc6.png")])
+wb = re.findall(r"welds: (\d+) of (\d+) broken", out)
+check("frame car: driving round, nothing comes off", bool(wb) and wb[-1][0] == "0" and unstable(out) == 0, "%s of %s welds broken" % wb[-1] if wb else "no weld count")
+# two cars into each other: their frames' collision hulls (one-sided, solid hull triangles on the frame nodes) keep them
+# apart - without them two Frame Cars went through each other (head-on their centres ended 0.3 m apart, ~300 frame
+# nodes of one inside the other); a few nodes of the crushed fronts may stay in a little (the parts' frames count too)
+for action, far, most_deep in (("Head-on into another", 1.8, 0.35), ("into its side", 1.4, 0.35)):
+    out = run(["--scene", "frame_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--action", action,
+               "--screenshot", os.path.join(TMP, "fc_in.png")])
+    m = re.findall(r"frame nodes inside the other car: (\d+), (\d+) cm deep \(most (\d+), (\d+) cm\); centres ([\d.]+) m apart", out)
+    ok = bool(m) and float(m[-1][4]) > far and int(m[-1][3]) < most_deep * 100 and unstable(out) == 0
+    check("frame car: %s, the frames stay apart" % action, ok,
+          "%s nodes inside at the end, %s cm deep (at most %s nodes, %s cm), centres %s m apart" % m[-1] if m else "no measure")
+# the parts on their hinges and bolts (members with a break force; BL_FRAMEDBG names each that lets go and its force):
+# dropped 5 m on its wheels the doors, the hood and the tailgate stay on (their hinges 20 and 15 kN); head-on the
+# bumpers' plastic brackets (2.5 kN) and the fenders' bolts (9 kN) let go
+def let_go(out):
+    return [float(x) for x in re.findall(r"lets go at \d+ N \(breaks at (\d+)\)", out)]
+out = run(["--scene", "frame_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--action", "Drop from 5", "--screenshot",
+           os.path.join(TMP, "fc_d5.png")], {"BL_FRAMEDBG": "1"})
+lg = let_go(out)
+check("frame car: dropped 5 m, the doors, the hood and the tailgate stay on", bool(re.search(r"^t=", out, re.M)) and not [b for b in lg if b >= 15000] and unstable(out) == 0,
+      "%d door hinges, %d lid hinges, %d fender bolts, %d bumper brackets, %d mirror stalks let go" % tuple(sum(1 for b in lg if b == v) for v in (20000, 15000, 9000, 2500, 500)))
+out = run(["--scene", "frame_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--action", "Head-on into another", "--screenshot",
+           os.path.join(TMP, "fc_h.png")], {"BL_FRAMEDBG": "1"})
+lg = let_go(out)
+check("frame car: head-on, the bumpers' brackets and the fenders' bolts let go", 2500 in lg and 9000 in lg and unstable(out) == 0,
+      "%d door hinges, %d lid hinges, %d fender bolts, %d bumper brackets, %d mirror stalks let go" % tuple(sum(1 for b in lg if b == v) for v in (20000, 15000, 9000, 2500, 500)))
+# the crash tests' scenes: each starts its test on the first frame (the second car, the slab, the axe come in) and runs
+for sid, label in (("fc_headon", "Head-on"), ("fc_side", "into its side"), ("fc_wall", "wall"), ("fc_pole", "pole"), ("fc_drop", "Drop from 10"),
+                   ("fc_slab", "slab"), ("fc_axe", "axe"), ("fc_roll", "Barrel roll")):
+    out = run(["--scene", sid, "--size", "640x360", "--frames", "180", "--hidden", "--novsync", "--screenshot", os.path.join(TMP, sid + ".png")])
+    started = re.findall(r"scene test: (.*)", out)
+    check("scene %s: the test starts" % sid, bool(started) and label in started[0] and unstable(out) == 0 and os.path.exists(os.path.join(TMP, sid + ".png")),
+          started[0].strip() if started else "not started")
 out = run(["--scene", "frame_car", "--size", "640x360", "--frames", "400", "--hidden", "--novsync", "--drive", "0,0.0001", "--action", "Launch at the wall",
            "--screenshot", os.path.join(TMP, "fc3.png")], {"BL_WHEELDBG": "1", "BL_SHELLDBG": "395"})
 toe = [abs(float(t)) for t in re.findall(r"toe ([-\d.]+) camber", out)[-4:]]
@@ -189,6 +242,175 @@ fr = re.findall(r"frame: (\d+) members, (\d+) splits, (\d+) torn, (\d+) failed s
 check("frame car: into the wall at 60 km/h", bool(toe and fr) and max(toe[2:]) < 20 and fr[-1][3] == "0" and unstable(out) == 0,
       "rear toe %s deg, %s splits, %s torn, %s failed solves, %d warnings" % (", ".join("%.1f" % t for t in toe[2:]), fr[-1][1] if fr else "?", fr[-1][2] if fr else "?",
                                                                           fr[-1][3] if fr else "?", unstable(out)))
+
+# ---- the Buggy (a desert racer's cage, long-travel wishbones and trailing arms, anti-roll bars of FEM tubes): the Frame
+# Car's tests on it, and its own - the whoops and the jump on the gravel lane, a drive over the offroad scene's hills
+def frame_line(out):
+    m = re.findall(r"frame: (\d+) members, (\d+) splits, (\d+) torn, (\d+) failed solves, (\d+) clamps \| welds: (\d+) of (\d+) broken", out)
+    return tuple(int(x) for x in m[-1]) if m else None
+
+
+def speeds_at(out):
+    return {round(float(t), 2): (float(v), float(x), float(y), float(z)) for t, v, x, y, z in
+            re.findall(r"^t=\s*([\d.]+)s\s+speed\s+([-\d.]+) km/h.*?pos \(([-\d.]+) ([-\d.]+) ([-\d.]+)\)", out, re.M)}
+
+
+# standing, then hung from the crane tilted: the wheels hang to full droop (18-23 cm, the springs still pushing at it),
+# camber and toe within a few degrees, nothing torn
+bstand = wheels(run(["--scene", "buggy", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--screenshot", os.path.join(TMP, "bs.png")],
+                    {"BL_SHOCKDBG": "290"}))
+for roll, pitch in ((8, 6), (-12, -9)):
+    out = run(["--scene", "buggy", "--size", "640x360", "--frames", "600", "--hidden", "--novsync", "--crane", "1.0,-1,%d,%d" % (roll, pitch),
+               "--screenshot", os.path.join(TMP, "bh.png")], {"BL_SHOCKDBG": "590"})
+    hang, fl = wheels(out), frame_line(out)
+    ok = len(bstand) == 4 and len(hang) == 4
+    drops = [s_[1] - h[1] for s_, h in zip(bstand, hang)] if ok else [0]
+    ang = max(max(abs(h[3]), abs(h[4])) for h in hang) if ok else 99
+    check("buggy: hung tilted %+d/%+d deg, the wheels hang to full droop" % (roll, pitch),
+          ok and min(drops) > 0.12 and max(drops) < 0.30 and ang < 6 and fl and fl[2] == 0 and fl[5] == 0 and unstable(out) == 0,
+          "wheels %s cm lower, camber/toe up to %.1f deg, %s torn, %s welds broken" % (", ".join("%.0f" % (d * 100) for d in drops), ang, fl[2] if fl else "?",
+                                                                                     fl[5] if fl else "?"))
+# standing 4 s nothing tears, full lock turns the front wheels past 25 degrees, the rear stay straight
+out = run(["--scene", "buggy", "--size", "640x360", "--frames", "240", "--hidden", "--novsync", "--drive", "0,1.0", "--screenshot", os.path.join(TMP, "b2.png")],
+          {"BL_SHELLDBG": "235", "BL_WHEELDBG": "1"})
+fl = frame_line(out)
+cr = re.findall(r"Desert Buggy\s+shells.*?cracks\s+(\d+)", out)
+toe = [abs(float(t)) for t in re.findall(r"toe ([-\d.]+) camber", out)[-4:]]
+check("buggy: standing, steering", bool(fl and cr and toe) and fl[5] == 0 and fl[6] > 200 and cr[-1] == "0" and min(toe[0], toe[2]) > 25 and max(toe[1], toe[3]) < 2,
+      "%s welds broken of %s, %s cracks, toe %s deg" % (fl[5] if fl else "?", fl[6] if fl else "?", cr[-1] if cr else "?", ", ".join("%.1f" % t for t in toe)))
+out = run(["--scene", "buggy", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--drive", "0.3,0.5", "--screenshot", os.path.join(TMP, "b4.png")])
+pos = re.findall(r"^t=\s*[\d.]+s\s+speed.*?pos \(([-\d.]+) [-\d.]+ ([-\d.]+)\)", out, re.M)
+check("buggy: steering right turns right", bool(pos) and float(pos[-1][0]) < -1.5, "position %s after 5 s at half right lock" % (pos[-1] if pos else "?",))
+# full throttle: 0-100 km/h in about 7 s (850 N m, 1460 kg, 39 inch tyres on asphalt: the grip holds it to ~0.45 g)
+out = run(["--scene", "buggy", "--size", "640x360", "--frames", "480", "--hidden", "--novsync", "--drive", "1.0,0", "--screenshot", os.path.join(TMP, "b5.png")])
+sp = speeds_at(out)
+t100 = min([t for t, v in sp.items() if v[0] >= 100] or [99])
+check("buggy: 0-60 km/h within 4 s, 0-100 within 8 s", sp.get(4.0, (0,))[0] > 60 and t100 < 8, "%.1f km/h at 4 s, 100 km/h at %.1f s" % (sp.get(4.0, (0,))[0], t100))
+# the Frame Car's circle (0.6 throttle, 0.35 lock): the rear steps out at 0.8 g and it spins; it lands back on its
+# wheels (up on two, anti-roll bars and 20-ray tyres; without them it rolled) and nothing more than a weld or two lets go
+out = run(["--scene", "buggy", "--size", "640x360", "--frames", "900", "--hidden", "--novsync", "--drive", "0.6,0.35", "--screenshot", os.path.join(TMP, "b6.png")])
+fl, sp = frame_line(out), speeds_at(out)
+last = sp[max(sp)] if sp else (0, 0, 9, 0)
+check("buggy: driving round, back on its wheels", bool(fl) and fl[2] == 0 and fl[5] <= 3 and last[2] < 0.8 and unstable(out) == 0,
+      "%s welds broken, %s torn, it ends at %.1f km/h, %.2f m up" % (fl[5] if fl else "?", fl[2] if fl else "?", last[0], last[2]))
+# two of them head-on and into the side: the frames stay apart (the front clip triangulated: its box of rails folded
+# up and two cars went into each other); head-on the nose's bolts let go
+for action, far, most_deep in (("Head-on into another", 1.8, 0.35), ("into its side", 1.4, 0.35)):
+    out = run(["--scene", "buggy", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--action", action, "--screenshot", os.path.join(TMP, "b_in.png")],
+              {"BL_FRAMEDBG": "1"})
+    m = re.findall(r"frame nodes inside the other car: (\d+), (\d+) cm deep \(most (\d+), (\d+) cm\); centres ([\d.]+) m apart", out)
+    lg = let_go(out)
+    ok = bool(m) and float(m[-1][4]) > far and int(m[-1][3]) < most_deep * 100 and unstable(out) == 0 and (action[0] != "H" or 5000 in lg)
+    check("buggy: %s, the frames stay apart" % action, ok, ("%s nodes inside at the end, %s cm deep (at most %s nodes, %s cm), centres %s m apart" % m[-1] if m else "no measure") +
+          ", %d nose bolts let go, %d warnings" % (sum(1 for b in lg if b == 5000), unstable(out)))
+# dropped 5 m and 10 m on its wheels: the panels' bolts hold (the cage flexing between them tore stiff ones)
+for h, fr in ((5, 300), (10, 300)):
+    out = run(["--scene", "buggy", "--size", "640x360", "--frames", str(fr), "--hidden", "--novsync", "--action", "Drop from %d" % h,
+               "--screenshot", os.path.join(TMP, "bd.png")], {"BL_FRAMEDBG": "1"})
+    lg, fl = let_go(out), frame_line(out)
+    check("buggy: dropped %d m, the panels stay on" % h, not lg and bool(fl) and fl[2] == 0 and unstable(out) == 0,
+          "%d bolts let go, %s torn, %s welds broken" % (len(lg), fl[2] if fl else "?", fl[5] if fl else "?"))
+# the whoops (0.5 m every 8 m) at 80 km/h and the tabletop jump (a 2.2 m kicker, 12 degrees at the lip) at 90: through
+# and on at speed, nothing breaks (before the rear was raised and its hoop moved the tail struck the kicker and the rear
+# clip yielded; a yield of a milliradian or two in the frame's joints at the peaks stays)
+for action, z_min, v_min in (("whoops", 100, 55), ("jump", 205, 60)):
+    out = run(["--scene", "buggy", "--size", "640x360", "--frames", "400", "--hidden", "--novsync", "--drive", "0.8,0", "--action", action,
+               "--screenshot", os.path.join(TMP, "bw.png")], {"BL_FRAMEDBG": "1"})
+    fl, sp, lg = frame_line(out), speeds_at(out), let_go(out)
+    last = sp[max(sp)] if sp else (0, 0, 0, 0)
+    hinge = max([float(x) for pair in re.findall(r"splits: .*?\(([\d.]+) ([\d.]+)\)", out) for x in pair] or [0])
+    check("buggy: %s, through at speed and nothing breaks" % action,
+          bool(fl) and fl[2] == 0 and fl[5] == 0 and not lg and last[3] > z_min and last[0] > v_min and hinge < 0.005 and unstable(out) == 0,
+          "at z %.0f m, %.0f km/h; %s welds broken, %s torn, %d bolts let go, the largest plastic rotation %.4f rad" % (last[3], last[0], fl[5] if fl else "?",
+                                                                                                              fl[2] if fl else "?", len(lg), hinge))
+# dropped on its roof from 1.5 m, rolled at 50 km/h: the cage holds (no member torn)
+for action in ("Drop on the roof", "Barrel roll"):
+    out = run(["--scene", "buggy", "--size", "640x360", "--frames", "400", "--hidden", "--novsync", "--action", action, "--screenshot", os.path.join(TMP, "br.png")])
+    fl = frame_line(out)
+    check("buggy: %s, the cage holds" % action.lower(), bool(fl) and fl[2] == 0 and unstable(out) == 0,
+          "%s splits, %s torn, %s welds broken" % (fl[1] if fl else "?", fl[2] if fl else "?", fl[5] if fl else "?"))
+# into the wall at 60 km/h: no failed solve, stable
+out = run(["--scene", "buggy", "--size", "640x360", "--frames", "400", "--hidden", "--novsync", "--drive", "0,0.0001", "--action", "Launch at the wall",
+           "--screenshot", os.path.join(TMP, "bwl.png")])
+fl = frame_line(out)
+check("buggy: into the wall at 60 km/h", bool(fl) and fl[3] == 0 and unstable(out) == 0,
+      "%s splits, %s torn, %s failed solves, %d warnings" % (fl[1] if fl else "?", fl[2] if fl else "?", fl[3] if fl else "?", unstable(out)))
+# the offroad scene's hills at half throttle: 6 s over the rough ground at 30 km/h, upright, nothing torn
+out = run(["--scene", "offroad", "--vehicle", "buggy/buggy", "--size", "640x360", "--frames", "360", "--hidden", "--novsync", "--drive", "0.5,0",
+           "--screenshot", os.path.join(TMP, "bo.png")])
+fl, sp = frame_line(out), speeds_at(out)
+last = sp[max(sp)] if sp else (0, 0, 0, 0)
+check("buggy: offroad hills", bool(fl) and fl[2] == 0 and fl[5] < 10 and last[0] > 20 and unstable(out) == 0,
+      "%.0f km/h at %.1f s, %s welds broken, %s torn" % (last[0], max(sp) if sp else 0, fl[5] if fl else "?", fl[2] if fl else "?"))
+# the crash tests' scenes start their tests
+for sid, label in (("bg_headon", "Head-on"), ("bg_side", "into its side"), ("bg_wall", "wall"), ("bg_drop", "Drop from 10"), ("bg_slab", "slab"),
+                   ("bg_roll", "Barrel roll"), ("bg_whoops", "whoops"), ("bg_jump", "jump")):
+    out = run(["--scene", sid, "--size", "640x360", "--frames", "180", "--hidden", "--novsync", "--screenshot", os.path.join(TMP, sid + ".png")])
+    started = re.findall(r"scene test: (.*)", out)
+    check("scene %s: the test starts" % sid, bool(started) and label in started[0] and unstable(out) == 0 and os.path.exists(os.path.join(TMP, sid + ".png")),
+          started[0].strip() if started else "not started")
+
+# ---- FEM shells (triangle elements of the frame): the steel sheet on its supports, the cantilever and the hollow cube
+# under their loads yield where they should (the cantilever with 250 kg welded under its tip folds at its root, with 100
+# kg it springs back up), nothing tears, no solve fails, and what rests comes to rest where it lies (a slab on the cube
+# walked it off at the shells' old damping; it still creeps a few mm a second: the contacts are explicit)
+def fem_objs(out):
+    return {m.group(1).strip(): dict(tris=int(m.group(2)), torn=int(m.group(3)), dented=int(m.group(4)), peak=float(m.group(5)), failed=int(m.group(6)),
+                                     sleep=int(m.group(7)), fast=float(m.group(8)), c=(float(m.group(9)), float(m.group(10)), float(m.group(11))),
+                                     low=float(m.group(12)))
+            for m in re.finditer(r"^fem f\d+ (.+?)\s+tris\s+(\d+) torn\s+(\d+) dented\s+(\d+) peak ([\d.]+) failed (\d+) sleep (\d) fastest ([\d.]+) "
+                                 r"centre \(([-\d.]+) ([-\d.]+) ([-\d.]+)\) lowest ([-\d.]+)", out, re.M)}
+fem_cases = [
+    ("Reset", "all three rest, nothing yields", lambda o: all(x["dented"] == 0 and x["fast"] < 0.05 for x in o.values()) and o["fem cantilever"]["low"] > 1.1),
+    ("ball on the sheet from 10 m", "the sheet dents", lambda o: o["fem sheet"]["dented"] > 20 and o["fem sheet"]["fast"] < 0.5),
+    ("500 kg block on the sheet", "the sheet folds under it", lambda o: o["fem sheet"]["dented"] > 100 and o["fem sheet"]["low"] < 0.1),
+    ("Weld 100 kg", "the cantilever springs", lambda o: o["fem cantilever"]["low"] > 0.6 and o["fem cantilever"]["dented"] < 20),
+    ("Weld 250 kg", "the cantilever folds at its root", lambda o: o["fem cantilever"]["low"] < 0.1 and o["fem cantilever"]["dented"] > 5 and
+     o["fem cantilever"]["fast"] < 0.1),
+    ("Drop 1 t on the cantilever", "the cantilever folds", lambda o: o["fem cantilever"]["dented"] > 10),
+    ("cube from 5 m on a face", "it dents a little and rests", lambda o: 0 < o["fem cube"]["dented"] < 60 and o["fem cube"]["fast"] < 0.05 and
+     abs(o["fem cube"]["c"][1] - 0.5) < 0.03),
+    ("cube from 5 m on a corner", "it dents a little and rests", lambda o: 0 < o["fem cube"]["dented"] < 60 and o["fem cube"]["fast"] < 0.05),
+    ("Load the cube's lid", "it holds, elastic", lambda o: o["fem cube"]["dented"] == 0 and o["fem cube"]["fast"] < 0.05),
+    ("1 t slab on the cube", "it dents and holds it", lambda o: o["fem cube"]["dented"] > 0 and abs(o["fem cube"]["c"][0] + 6) < 0.15 and
+     abs(o["fem cube"]["c"][2]) < 0.15 and o["fem cube"]["c"][1] > 0.45),
+    ("cube at the wall", "it crumples at the front", lambda o: o["fem cube"]["dented"] > 20 and o["fem cube"]["fast"] < 0.1),
+]
+for action, what, ok in fem_cases:
+    out = run(["--scene", "fem_shells", "--size", "640x360", "--frames", "600", "--hidden", "--novsync", "--action", action,
+               "--screenshot", os.path.join(TMP, "fs.png")], {"BL_FEMDBG": "599"})
+    o = {k: v for k, v in fem_objs(out).items()}
+    good = len(o) == 3 and all(x["torn"] == 0 and x["failed"] == 0 for x in o.values()) and unstable(out) == 0
+    try:
+        good = good and ok(o)
+    except KeyError:
+        good = False
+    check("fem shells: %s: %s" % (action.lower(), what), good,
+          "; ".join("%s %d dented, %d torn, fastest %.2f m/s, lowest %.2f m" % (k[4:], x["dented"], x["torn"], x["fast"], x["low"]) for k, x in o.items()) +
+          ", %d warnings" % unstable(out))
+
+# ---- shell car (its body of FEM triangles, no frame): it stands, steers the right way, accelerates, drives round and
+# through the crash tests stable, no solve failing; standing and driving nothing yields
+def shell_line(out):
+    m = re.findall(r"(\d+) failed solves, \d+ clamps \| tris (\d+), (\d+) torn, (\d+) dented", out)
+    return tuple(int(x) for x in m[-1]) if m else None
+out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "420", "--hidden", "--novsync", "--drive", "1.0,0", "--screenshot", os.path.join(TMP, "sc1.png")])
+sl, sp = shell_line(out), speeds_at(out)
+check("shell car: accelerates, nothing yields", bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[3] == 0 and sp.get(6.0, (0,))[0] > 50 and unstable(out) == 0,
+      "%.1f km/h at 6 s, %s" % (sp.get(6.0, (0,))[0], "%d failed, %d torn, %d dented" % (sl[0], sl[2], sl[3]) if sl else "no line"))
+out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--drive", "0.3,0.5", "--screenshot", os.path.join(TMP, "sc2.png")])
+pos = re.findall(r"pos \(([-\d.]+) ([-\d.]+) ([-\d.]+)\)", out)
+check("shell car: steering right turns right", bool(pos) and float(pos[-1][0]) < -1.5, "position %s after 5 s at half right lock" % (pos[-1] if pos else "?",))
+out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "900", "--hidden", "--novsync", "--drive", "0.6,0.35", "--screenshot", os.path.join(TMP, "sc3.png")])
+sl = shell_line(out)
+check("shell car: driving round, next to nothing yields", bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[3] < 5 and unstable(out) == 0,
+      "%d failed, %d torn, %d dented" % (sl[0], sl[2], sl[3]) if sl else "no line")
+for action, frames in (("Head-on into another", 300), ("into its side", 300), ("Drop from 5", 300), ("Launch at the wall", 400), ("slab", 400), ("Barrel roll", 400)):
+    out = run(["--scene", "shell_car", "--size", "640x360", "--frames", str(frames), "--hidden", "--novsync", "--action", action,
+               "--screenshot", os.path.join(TMP, "sc4.png")])
+    sl = shell_line(out)
+    check("shell car: %s, stable" % action.lower(), bool(sl) and sl[0] == 0 and sl[2] < 150 and unstable(out) == 0,
+          "%d failed, %d torn, %d dented, %d warnings" % (sl[0], sl[2], sl[3], unstable(out)) if sl else "no line")
 
 # ---- steel barrels (a closed sheet: its volume in the BL_SHELLDBG block, 100% = 0.2232 m3): dropped on its bottom, side and
 # rim, rolled down the ramp, thrown at another and stacked it dents but keeps its shape (a few percent); the 40 kg ball
