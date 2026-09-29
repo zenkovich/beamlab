@@ -9,6 +9,7 @@
 #include "core/profiler.h"
 #include "core/util.h"
 #include "phys/cache_sim.h"
+#include "phys/fem_shell.h"
 #include "phys/sheet_builder.h"
 #include "phys/world.h"
 #include "reference_shell.h"
@@ -1427,6 +1428,310 @@ double frame_energy(const SoftBody& b) {
 
 } // namespace
 
+// The membrane's damping (SoftBody::membrane_damp) takes the edges' rates of stretch down and keeps the momentum, the
+// angular momentum and a rigid turn
+static void test_membrane_damp() {
+    printf("membrane damping\n");
+    ShellMaterial m = mat_steel();
+    m.membrane = 1.0e5f, m.yield = 0.0015f;
+    auto rate = [](const SoftBody& b) {
+        double s2 = 0;
+        int n = 0;
+        for (const Shell& sh : b.shells)
+            for (int e = 0; e < 3; e++) {
+                const Node& A = b.nodes[sh.n[e]];
+                const Node& B = b.nodes[sh.n[(e + 1) % 3]];
+                const vec3 u = normalize(B.p - A.p);
+                const double r = dot(B.v - A.v, u);
+                s2 += r * r, n++;
+            }
+        return std::sqrt(s2 / std::max(1, n));
+    };
+    auto momenta = [](const SoftBody& b, vec3& P, vec3& L) {
+        P = L = vec3(0);
+        for (const Node& x : b.nodes) P += x.v * x.mass, L += cross(x.p, x.v * x.mass);
+    };
+    for (int jit = 0; jit < 2; jit++) {
+        auto s = make_sheet(vec3(0.2f, 1.0f, 0.1f), normalize(vec3(1, 0.1f, 0)), normalize(vec3(0, 0.2f, 1)), 1.2f, 1.0f, 9, 8, 20.0f, 0, m, 5);
+        TRng r(9);
+        const vec3 om(0.3f, 2.0f, -0.7f), c(0.2f, 1.0f, 0.1f);
+        // (the damping takes the edges that left their band lately: stretched 1% and projected back once, then the sheet
+        // as it was)
+        std::vector<vec3> p0;
+        for (Node& x : s->nodes) p0.push_back(x.p), x.p = c + (x.p - c) * 1.01f;
+        s->allow_deform = false;
+        s->membrane_damp = 0.3f;
+        s->project_membrane(kDefaultDt);
+        for (size_t i = 0; i < s->nodes.size(); i++) s->nodes[i].p = p0[i];
+        for (Node& x : s->nodes) {
+            x.v = vec3(0.5f, -0.2f, 0.1f) + cross(om, x.p - c);
+            if (jit) x.v += vec3(r.range(-1, 1), r.range(-1, 1), r.range(-1, 1)) * 0.3f;
+        }
+        std::vector<vec3> v0;
+        for (const Node& x : s->nodes) v0.push_back(x.v);
+        vec3 P0, L0, P1, L1;
+        momenta(*s, P0, L0);
+        const double r0 = rate(*s);
+        s->membrane_damp = 0.3f;
+        s->project_membrane(kDefaultDt);
+        momenta(*s, P1, L1);
+        const double r1 = rate(*s);
+        float dv = 0;
+        for (size_t i = 0; i < s->nodes.size(); i++) dv = std::max(dv, length(s->nodes[i].v - v0[i]));
+        printf("    %s: stretch rate %.4f -> %.4f m/s rms, momentum off by %.2g, angular by %.2g, speeds changed by %.2g m/s at most\n",
+               jit ? "a turning sheet shaken" : "a turning sheet", r0, r1, length(P1 - P0), length(L1 - L0), dv);
+        CHECK(length(P1 - P0) < 1e-4f * (1 + length(P0)) && length(L1 - L0) < 1e-3f * (1 + length(L0)), "momentum %.3g, angular momentum %.3g changed", length(P1 - P0),
+              length(L1 - L0));
+        if (jit) CHECK(r1 < 0.85 * r0, "the stretch rate %.4f -> %.4f", r0, r1);
+        else CHECK(dv < 1e-4f, "a rigid turn was damped (%.3g m/s)", dv);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ triangle elements
+// The shell of FEM triangles against the plate and beam results it has to reproduce: a cantilever strip's tip under a
+// load across it and along it, a clamped square plate under pressure (Timoshenko's table), a free plate spun about
+// three axes keeps its shape and energy, a rigid turn of an element makes no force; past its yield a strip keeps a
+// set and holds about its plastic moment, pulled far it tears; a hollow steel cube dropped on the ground stays sound.
+namespace {
+
+// a strip or plate of nu x nv cells in the x-z plane at height y, the corners' nodes on the x = 0 edge clamped
+std::unique_ptr<SoftBody> tri_plate(float L, float W, int nu, int nv, const ShellSection& s, bool clamp_root, float y = 1.0f) {
+    auto b = std::make_unique<SoftBody>();
+    b->name = "tri plate";
+    b->can_sleep = false;
+    const uint16_t si = b->fem.add_shell_section(s);
+    ShellMesher m(*b, NF_NONE);
+    m.grid(vec3(0, y, 0), vec3(L / nu, 0, 0), vec3(0, 0, W / nv), nu, nv, si, false);
+    if (clamp_root)
+        for (size_t i = 0; i < b->nodes.size(); i++)
+            if (b->nodes[i].p.x < 1e-4f) b->info[i].flags |= NF_FIXED;
+    m.finish();
+    b->fem.finalize(*b);
+    return b;
+}
+
+} // namespace
+
+static void test_fem_tris() {
+    printf("triangle elements (FEM shells)\n");
+    auto world = [](bool settle) {
+        auto w = std::make_unique<World>();
+        w->settings.gravity = vec3(0);
+        if (settle) w->settings.frame_theta = 1.0f, w->settings.frame_dissipation = 1.0f;
+        return w;
+    };
+    ShellSection steel = make_shell_section("Steel", 0.005f);
+    ShellSection elastic = steel;
+    elastic.yield = 0;
+    printf("    steel 5 mm: %.1f kg/m2, D %.0f N m, nu %.3f\n", steel.mass_per_m2(), steel.D(), steel.nu);
+    // one element turned and moved as a whole (its nodes' orientations with it): no force, no moment
+    {
+        auto b = tri_plate(0.5f, 0.3f, 1, 1, elastic, false);
+        const quat r = normalize(quat::axis_angle(normalize(vec3(0.3f, 0.8f, -0.5f)), 1.1f));
+        for (Node& n : b->nodes) n.p = r.rotate(n.p - vec3(0.2f, 1, 0.1f)) + vec3(3, 2, -1);
+        b->fem.rotate(r);
+        b->fem.compute_forces(*b);
+        float fmax = 0, tmax = 0;
+        for (size_t i = 0; i < b->nodes.size(); i++) fmax = std::max(fmax, length(b->force[i]));
+        for (const vec3& t : b->fem.torque) tmax = std::max(tmax, length(t));
+        // (against what a micrometre's stretch or a microradian's bend makes: the float positions' rounding is about that)
+        // (the moments through the drilling spring, G t A / 20 per corner: its microradian's)
+        const float fu = elastic.E * elastic.t * 1e-6f, tu = elastic.drill * elastic.E / (2 * (1 + elastic.nu)) * elastic.t * 0.075f * 1e-6f;
+        printf("    a rigid turn of 63 degrees: largest force %.2e N (a micrometre's %.2e), moment %.2e N m (a microradian's %.2e)\n", fmax, fu, tmax, tu);
+        CHECK(fmax < fu && tmax < tu, "rigid motion made forces: %g N, %g N m", fmax, tmax);
+    }
+    // a cantilever strip, 1 m x 0.2 m of 5 mm steel in 10 x 2 cells: the tip under a load across (beam theory, E I
+    // between the beam's and the plate's E / (1 - nu^2)), then along it (E t b)
+    {
+        const float L = 1.0f, W = 0.2f, P = 20.0f;
+        const double EI = (double)elastic.E * W * elastic.t * elastic.t * elastic.t / 12.0;
+        for (int load = 0; load < 2; load++) {
+            auto w = world(true);
+            SoftBody* b = w->add_body(tri_plate(L, W, 10, 2, elastic, true));
+            std::vector<uint32_t> tip;
+            for (uint32_t i = 0; i < b->nodes.size(); i++)
+                if (b->nodes[i].p.x > L - 1e-4f) tip.push_back(i);
+            vec3 p0(0);
+            for (uint32_t i : tip) p0 += b->nodes[i].p / (float)tip.size();
+            const vec3 F = load == 0 ? vec3(0, -P, 0) : vec3(2e5f, 0, 0);
+            b->pre_substep = [&](SoftBody& x, float) {
+                for (uint32_t i : tip) x.force[i] += F * ((x.nodes[i].p.z < 1e-4f || x.nodes[i].p.z > W - 1e-4f ? 0.5f : 1.0f) / (float)(tip.size() - 1));
+                for (size_t i = 0; i < x.nodes.size(); i++) x.force[i] -= x.nodes[i].v * (x.nodes[i].mass * 40.0f); // (settles: its 4 Hz mode rang)
+            };
+            for (int i = 0; i < 4000; i++) w->step_substeps(1);
+            vec3 p1(0);
+            for (uint32_t i : tip) p1 += b->nodes[i].p / (float)tip.size();
+            if (load == 0) {
+                const double want = P * L * L * L / (3 * EI), got = p0.y - p1.y, plate = want * (1 - elastic.nu * elastic.nu);
+                printf("    cantilever strip, across: tip %.3f mm (beam %.3f, plate %.3f)\n", got * 1e3, want * 1e3, plate * 1e3);
+                CHECK(got > plate * 0.97 && got < want * 1.03, "strip tip %.5g, beam %.5g, plate %.5g", got, want, plate);
+            } else {
+                const double want = F.x * L / ((double)elastic.E * elastic.t * W), got = p1.x - p0.x;
+                printf("    cantilever strip, along: stretch %.4f mm (theory %.4f)\n", got * 1e3, want * 1e3);
+                CHECK(std::fabs(got / want - 1) < 0.03, "strip stretch %.5g vs %.5g", got, want);
+            }
+            CHECK(b->fem.solve_failures == 0, "strip: %d failed solves", b->fem.solve_failures);
+        }
+    }
+    // a clamped square plate, 1 m of 10 mm steel in 10 x 10 cells, 1 kPa: the middle w = 0.00126 q a^4 / D
+    {
+        ShellSection s10 = make_shell_section("Steel", 0.01f);
+        s10.yield = 0;
+        auto w = world(true);
+        auto body = tri_plate(1.0f, 1.0f, 10, 10, s10, false);
+        for (size_t i = 0; i < body->nodes.size(); i++) {
+            const vec3 p = body->nodes[i].p;
+            if (p.x < 1e-4f || p.x > 1 - 1e-4f || p.z < 1e-4f || p.z > 1 - 1e-4f) body->info[i].flags |= NF_FIXED, body->nodes[i].inv_mass = 0;
+        }
+        SoftBody* b = w->add_body(std::move(body));
+        std::vector<vec3> load(b->nodes.size(), vec3(0));
+        const float q = 1000.0f;
+        for (const FrameTri& t : b->fem.tris)
+            for (uint32_t v : t.n) load[b->fem.node[v]] += vec3(0, -q * t.area0 / 3.0f, 0);
+        uint32_t mid = 0;
+        for (uint32_t i = 0; i < b->nodes.size(); i++)
+            if (length(b->nodes[i].p - vec3(0.5f, 1, 0.5f)) < 1e-3f) mid = i;
+        const float y0 = b->nodes[mid].p.y;
+        b->pre_substep = [&](SoftBody& x, float) {
+            for (size_t i = 0; i < x.nodes.size(); i++) x.force[i] += load[i];
+        };
+        for (int i = 0; i < 4000; i++) w->step_substeps(1);
+        const double want = 0.00126 * q / s10.D(), got = y0 - b->nodes[mid].p.y;
+        printf("    clamped square plate: middle %.4f mm (Timoshenko %.4f)\n", got * 1e3, want * 1e3);
+        CHECK(std::fabs(got / want - 1) < 0.05, "clamped plate %.5g vs %.5g", got, want);
+    }
+    // a free plate spun about three axes: after a second it keeps its shape (little strain energy) and its energy
+    {
+        ShellSection s2 = make_shell_section("Steel", 0.002f);
+        s2.yield = 0;
+        auto w = world(false);
+        auto body = tri_plate(1.0f, 1.0f, 6, 6, s2, false);
+        const vec3 om(1.5f, 5.0f, 1.0f), c(0.5f, 1, 0.5f);
+        for (Node& x : body->nodes) x.v = cross(om, x.p - c);
+        for (vec3& x : body->fem.w) x = om;
+        SoftBody* b = w->add_body(std::move(body));
+        auto kinetic = [&]() {
+            double ke = 0;
+            for (const Node& x : b->nodes) ke += 0.5 * x.mass * length2(x.v);
+            for (size_t i = 0; i < b->fem.node.size(); i++) ke += 0.5 * b->fem.inertia[i] * length2(b->fem.w[i]);
+            return ke;
+        };
+        const double ke0 = kinetic();
+        double umax = 0;
+        for (int i = 0; i < 2000; i++) {
+            w->step_substeps(1);
+            umax = std::max(umax, b->fem.tri_energy());
+        }
+        const double ke1 = kinetic();
+        printf("    free plate spun: energy %.3f -> %.3f J, strain energy at most %.2e J\n", ke0, ke1, umax);
+        CHECK(std::fabs(ke1 / ke0 - 1) < 0.02 && umax < 1e-3 * ke0, "spun plate: energy %.4g -> %.4g, strain %.3g", ke0, ke1, umax);
+        CHECK(b->fem.solve_failures == 0 && b->fem.clamps == 0, "spun plate: %d failures, %d clamps", b->fem.solve_failures, b->fem.clamps);
+    }
+    // plastic: a strip 0.5 m x 0.2 m of 10 mm steel. Loaded to half its first yield it springs back; to 0.9 of its
+    // plastic collapse load (the root's plastic moment sigma_y t^2 b / 4) it keeps a set when unloaded
+    {
+        ShellSection s10 = make_shell_section("Steel", 0.01f);
+        const float L = 0.5f, W = 0.2f;
+        const double Pe = s10.yield * s10.t * s10.t * W / 6.0 / L, Pp = s10.yield * s10.t * s10.t * W / 4.0 / L;
+        for (int k = 0; k < 2; k++) {
+            auto w = world(true);
+            SoftBody* b = w->add_body(tri_plate(L, W, 10, 4, s10, true));
+            std::vector<uint32_t> tip;
+            for (uint32_t i = 0; i < b->nodes.size(); i++)
+                if (b->nodes[i].p.x > L - 1e-4f) tip.push_back(i);
+            const float P = (float)(k == 0 ? 0.5 * Pe : 0.9 * Pp);
+            bool on = true;
+            b->pre_substep = [&](SoftBody& x, float) {
+                if (on)
+                    for (uint32_t i : tip) x.force[i] += vec3(0, -P / (float)tip.size(), 0);
+                for (size_t i = 0; i < x.nodes.size(); i++) x.force[i] -= x.nodes[i].v * (x.nodes[i].mass * 40.0f);
+            };
+            const float y0 = b->nodes[tip[tip.size() / 2]].p.y;
+            for (int i = 0; i < 4000; i++) w->step_substeps(1);
+            const float loaded = y0 - b->nodes[tip[tip.size() / 2]].p.y;
+            on = false;
+            for (int i = 0; i < 4000; i++) w->step_substeps(1);
+            const float set = y0 - b->nodes[tip[tip.size() / 2]].p.y;
+            printf("    plastic strip at %s: tip %.2f mm loaded, %.2f mm set\n", k == 0 ? "half its first yield" : "0.9 of its collapse load", loaded * 1e3, set * 1e3);
+            if (k == 0) CHECK(set < 0.02f * loaded, "elastic strip kept a set: %.4g of %.4g", set, loaded);
+            else CHECK(set > 0.2f * loaded && b->fem.tris_torn == 0, "plastic strip: set %.4g of %.4g, %d torn", set, loaded, b->fem.tris_torn);
+        }
+        // beyond the collapse load it folds at the root (keeps going)
+        auto w = world(true);
+        SoftBody* b = w->add_body(tri_plate(L, W, 10, 4, s10, true));
+        std::vector<uint32_t> tip;
+        for (uint32_t i = 0; i < b->nodes.size(); i++)
+            if (b->nodes[i].p.x > L - 1e-4f) tip.push_back(i);
+        b->pre_substep = [&](SoftBody& x, float) {
+            for (uint32_t i : tip) x.force[i] += vec3(0, (float)(-1.3 * Pp) / (float)tip.size(), 0);
+        };
+        const float y0 = b->nodes[tip[0]].p.y;
+        for (int i = 0; i < 2000; i++) w->step_substeps(1);
+        const float d = y0 - b->nodes[tip[0]].p.y;
+        printf("    plastic strip at 1.3 its collapse load: tip %.0f mm down after a second\n", d * 1e3);
+        CHECK(d > 0.1f && b->fem.solve_failures == 0, "collapsing strip: %.4g m, %d failures", d, b->fem.solve_failures);
+    }
+    // pulled far past its yield a strip stretches and tears
+    {
+        ShellSection s2 = make_shell_section("Steel", 0.002f);
+        auto w = world(false);
+        SoftBody* b = w->add_body(tri_plate(0.5f, 0.1f, 10, 2, s2, true));
+        std::vector<uint32_t> tip;
+        for (uint32_t i = 0; i < b->nodes.size(); i++)
+            if (b->nodes[i].p.x > 0.5f - 1e-4f) tip.push_back(i);
+        const float P = 2.0f * s2.yield * s2.t * 0.1f;
+        b->pre_substep = [&](SoftBody& x, float) {
+            for (uint32_t i : tip) x.force[i] += vec3(P / (float)tip.size(), 0, 0);
+        };
+        for (int i = 0; i < 2000 && b->fem.tris_torn == 0; i++) w->step_substeps(1);
+        bool finite = true;
+        for (const Node& x : b->nodes) finite &= std::isfinite(x.p.x + x.p.y + x.p.z);
+        printf("    strip pulled at twice its yield: %d triangles torn out\n", b->fem.tris_torn);
+        CHECK(b->fem.tris_torn > 0 && finite, "pulled strip: %d torn, finite %d", b->fem.tris_torn, (int)finite);
+    }
+    // a hollow steel cube (1 m, 2 mm, 5 x 5 cells a face) dropped 1 m on its face: it lands and rests, sound
+    {
+        World w;
+        w.statics.terrain.create(21, 21, 1.0f, vec2(-10, -10));
+        w.statics.has_terrain = true;
+        w.statics.terrain.update_bounds();
+        auto body = std::make_unique<SoftBody>();
+        body->name = "tri cube";
+        const uint16_t si = body->fem.add_shell_section(make_shell_section("Steel", 0.002f));
+        ShellMesher m(*body);
+        const float a = 1.0f, y0 = 1.0f;
+        const vec3 o(-0.5f, y0, -0.5f);
+        const vec3 X(a / 5, 0, 0), Y(0, a / 5, 0), Z(0, 0, a / 5);
+        m.grid(o, Z, X, 5, 5, si);                          // bottom (normals out: down)
+        m.grid(o + vec3(0, a, 0), X, Z, 5, 5, si);         // top
+        m.grid(o, X, Y, 5, 5, si);                          // front z = 0
+        m.grid(o + vec3(0, 0, a), Y, X, 5, 5, si);         // back
+        m.grid(o, Y, Z, 5, 5, si);                          // left
+        m.grid(o + vec3(a, 0, 0), Z, Y, 5, 5, si);         // right
+        m.finish();
+        body->fem.finalize(*body);
+        SoftBody* b = w.add_body(std::move(body));
+        float mass = 0;
+        for (const Node& x : b->nodes) mass += x.mass;
+        double ke_max = 0;
+        for (int i = 0; i < 8000; i++) {
+            w.step_substeps(1);
+            double ke = 0;
+            for (const Node& x : b->nodes) ke += 0.5 * x.mass * length2(x.v);
+            ke_max = std::max(ke_max, ke);
+        }
+        double ke = 0;
+        for (const Node& x : b->nodes) ke += 0.5 * x.mass * length2(x.v);
+        const vec3 c = b->center_of_mass();
+        float vmax = 0;
+        for (const Node& x : b->nodes) vmax = std::max(vmax, length(x.v));
+        printf("    hollow cube dropped 1 m: %zu nodes, %zu triangles, %.1f kg; rests at %.3f m; after 4 s its walls ring with %.3f J of the %.0f J it "
+               "landed with (fastest node %.3f m/s), %d failed solves\n", b->nodes.size(), b->fem.tris.size(), mass, c.y, ke, ke_max, vmax, b->fem.solve_failures);
+        CHECK(std::fabs(c.y - 0.5f) < 0.03f && ke < 1e-3 * ke_max && b->fem.solve_failures == 0 && b->fem.tris_torn == 0, "cube: centre %.3f, %.3g J of %.3g, %d failures, %d torn",
+              c.y, ke, ke_max, b->fem.solve_failures, b->fem.tris_torn);
+    }
+}
+
 static void test_frame() {
     printf("frame elements (FEM)\n");
     const FrameSection tube = frame_tube(2e-4f);
@@ -1846,11 +2151,342 @@ static void test_frame() {
         CHECK(b->fem.elems.size() == members0 - 2 && b->fem.solve_failures == 0, "the box has %zu members (want %zu), %d failed solves", b->fem.elems.size(), members0 - 2,
               b->fem.solve_failures);
         CHECK(piece && ymin > -0.05f && vmax < 0.3f, "the piece is not resting on the ground (lowest %.3f, speed %.3f)", ymin, vmax);
+    }    // a mount (a section with a break force) lets go when its force has stood over it for FemFrame::kOverloadTime, not
+    // on a short peak: a cantilever whose first member is the mount, a load at its tip
+    {
+        struct Case {
+            const char* name;
+            float P;
+            int steps_on; // (substeps the load stays on)
+            bool tears;
+        };
+        const Case cases[] = {{"at 0.8 of its force", 400, 800, false}, {"a peak of 4 times it for 1 ms", 2000, 2, false}, {"at twice it", 1000, 800, true}};
+        for (const Case& c : cases) {
+            auto w = world(true);
+            auto body = std::make_unique<SoftBody>();
+            body->name = "mount";
+            body->can_sleep = false;
+            FrameSection ms = tube;
+            ms.break_force = 500;
+            const uint16_t sm = body->fem.add_section(ms), st = body->fem.add_section(tube);
+            const float m = tube.mass_per_m() * 0.1f;
+            for (int i = 0; i <= 4; i++) body->add_node(vec3(0.1f * i, 1, 0), i == 0 || i == 4 ? m * 0.5f : m, i == 0 ? NF_FIXED : NF_NONE);
+            for (int i = 0; i < 4; i++) body->fem.add_element(i, i + 1, i == 0 ? sm : st);
+            body->fem.finalize(*body);
+            SoftBody* b = w->add_body(std::move(body));
+            int step = 0, torn_at = -1;
+            b->pre_substep = [&](SoftBody& x, float) {
+                if (step < c.steps_on && torn_at < 0) x.force[4] += vec3(0, -c.P, 0); // (off once it let go)
+            };
+            for (; step < 1000; step++) {
+                w->step_substeps(1);
+                if (torn_at < 0 && (b->fem.elems[0].torn & 1)) torn_at = step;
+            }
+            const float dt_ms = w->settings.dt * 1000.0f;
+            printf("    mount (breaks at 500 N) %s: %s\n", c.name, torn_at >= 0 ? "let go" : "held");
+            if (torn_at >= 0) printf("      after %.1f ms\n", torn_at * dt_ms);
+            CHECK((torn_at >= 0) == c.tears, "mount %s: %s", c.name, torn_at >= 0 ? "let go" : "held");
+            if (c.tears) CHECK(torn_at * dt_ms >= 1000.0f * FemFrame::kOverloadTime, "let go after %.1f ms, before the overload time", torn_at * dt_ms);
+        }
+    }
+    // a released joint's damping (FrameSection::joint_damp) is implicit: an arm on a ball joint (its node held by a
+    // welded stub) swings on under gravity undamped, comes to rest hanging with a little damping, and with a huge one
+    // hardly moves and stays sound (explicit, 2 N m s/rad on a lid's light node tore its hinges off)
+    {
+        const float damps[] = {0.0f, 0.5f, 1.0e5f};
+        for (float c : damps) {
+            auto w = world(false);
+            w->settings.gravity = vec3(0, -9.81f, 0);
+            auto body = std::make_unique<SoftBody>();
+            body->name = "damped arm";
+            body->can_sleep = false;
+            FrameSection s = tube;
+            s.joint_damp = c;
+            const uint16_t si = body->fem.add_section(s);
+            const float m = tube.mass_per_m() * 0.25f;
+            const uint32_t a = body->add_node(vec3(0, 1, 0), 0.0f, NF_FIXED), pv = body->add_node(vec3(0.1f, 1, 0), m * 0.5f, NF_NONE);
+            const uint32_t mid = body->add_node(vec3(0.35f, 1, 0), m, NF_NONE), tip = body->add_node(vec3(0.6f, 1, 0), m * 0.5f, NF_NONE);
+            body->fem.add_element(a, pv, si);
+            body->fem.add_element(pv, mid, si, FJ_BALL, FJ_RIGID); // (the joint: released at the pivot)
+            body->fem.add_element(mid, tip, si);
+            fix_inv_mass(*body);
+            body->fem.finalize(*body);
+            SoftBody* b = w->add_body(std::move(body));
+            float vlast = 0, ymin = 1e9f;
+            bool finite = true;
+            for (int step = 0; step < 6000; step++) {
+                w->step_substeps(1);
+                const Node& t = b->nodes[tip];
+                finite &= std::isfinite(t.p.x + t.p.y + t.v.x + t.v.y);
+                ymin = std::min(ymin, t.p.y);
+                if (step >= 5000) vlast = std::max(vlast, length(t.v));
+            }
+            printf("    arm on a ball joint damped %g N m s/rad: the tip went down to %.3f m, its speed in the last 0.5 s %.3f m/s\n", c, ymin, vlast);
+            CHECK(finite && b->fem.solve_failures == 0, "damping %g: not finite or %d failed solves", c, b->fem.solve_failures);
+            if (c == 0) CHECK(vlast > 1.0f, "undamped arm stopped (%.3f m/s)", vlast);
+            else if (c < 100) CHECK(vlast < 0.05f && b->nodes[tip].p.y < 0.6f, "damped arm still moving at %.3f m/s, tip at %.3f", vlast, b->nodes[tip].p.y);
+            else CHECK(ymin > 0.98f && vlast < 0.01f, "the heavily damped arm moved: down to %.3f m, %.3f m/s", ymin, vlast);
+        }
+    }    // mounts (FrameMount): a part on a fixed frame at a distance, no member between them - a component of its own; it
+    // hangs there, lets go when its load stands past the break force for kOverloadTime; on two mounts on a line it swings
+    // as on a hinge, their turning damping stills it, a huge one stays sound
+    {
+        auto make = [&](float brk, float damp, bool hinge) {
+            auto body = std::make_unique<SoftBody>();
+            body->name = "mounted";
+            body->can_sleep = false;
+            const uint16_t si = body->fem.add_section(tube);
+            // the fixed frame: a tetrahedron of members
+            const vec3 fp[4] = {vec3(0, 1, 0), vec3(0.5f, 1, 0), vec3(0, 1, 0.5f), vec3(0.2f, 1.5f, 0.2f)};
+            uint32_t f[4];
+            for (int i = 0; i < 4; i++) f[i] = body->add_node(fp[i], 0.0f, i < 3 ? NF_FIXED : NF_NONE);
+            for (int i = 0; i < 4; i++)
+                for (int j = i + 1; j < 4; j++) frame_chain(*body, f[i], f[j], 2, si);
+            // the part: a square with a diagonal, 4 cm under the frame (or hanging from its x edge: a hinge)
+            const float y = 0.96f;
+            const vec3 qp[4] = {vec3(0.05f, y, 0.05f), vec3(0.45f, y, 0.05f), vec3(0.45f, y, 0.45f), vec3(0.05f, y, 0.45f)};
+            uint32_t q[4];
+            for (int i = 0; i < 4; i++) q[i] = body->add_node(qp[i], 0.5f, NF_NONE);
+            for (int i = 0; i < 4; i++) frame_chain(*body, q[i], q[(i + 1) % 4], 2, si);
+            frame_chain(*body, q[0], q[2], 2, si);
+            fix_inv_mass(*body);
+            if (hinge) {
+                body->fem.add_mount(f[0], q[0], brk, 2.0e6f, damp);
+                body->fem.add_mount(f[1], q[1], brk, 2.0e6f, damp);
+            } else {
+                body->fem.add_mount(f[0], q[0], brk, 2.0e6f, damp);
+                body->fem.add_mount(f[1], q[1], brk, 2.0e6f, damp);
+                body->fem.add_mount(f[2], q[3], brk, 2.0e6f, damp);
+            }
+            body->fem.finalize(*body);
+            return std::make_pair(std::move(body), q[2]);
+        };
+        {
+            auto w = world(false);
+            w->settings.gravity = vec3(0, -9.81f, 0);
+            auto [body, far] = make(0.0f, 0.0f, false);
+            SoftBody* b = w->add_body(std::move(body));
+            const vec3 p0 = b->nodes[far].p;
+            float vlast = 0;
+            for (int step = 0; step < 4000; step++) {
+                w->step_substeps(1);
+                if (step >= 3000) vlast = std::max(vlast, length(b->nodes[far].v));
+            }
+            const float sag = p0.y - b->nodes[far].p.y;
+            printf("    a part on three mounts 4 cm under a frame: %d components, the far corner sank %.2f mm, %.4f m/s at the end\n", b->fem.components(), sag * 1e3f, vlast);
+            CHECK(b->fem.components() == 2, "%d components (want the frame and the part)", b->fem.components());
+            CHECK(sag > 0 && sag < 0.003f && vlast < 0.01f && b->fem.solve_failures == 0, "the mounted part: sank %.4f m, %.4f m/s, %d failed solves", sag, vlast, b->fem.solve_failures);
+        }
+        {
+            struct Case {
+                const char* name;
+                float P;      // N down on each mounted node of the part
+                int steps_on;
+                bool lets_go;
+            };
+            const Case cases[] = {{"at 0.6 of its force", 0.6f * 200, 800, false}, {"a peak of 4 times it for 1 ms", 4 * 200.0f, 2, false}, {"at twice it", 2 * 200.0f, 800, true}};
+            for (const Case& c : cases) {
+                auto w = world(true);
+                auto [body, far] = make(200.0f, 0.0f, false);
+                SoftBody* b = w->add_body(std::move(body));
+                int step = 0;
+                b->pre_substep = [&](SoftBody& x, float) {
+                    if (step < c.steps_on && x.fem.mounts_broken == 0)
+                        for (const FrameMount& m : x.fem.mounts) x.force[m.b] += vec3(0, -c.P, 0);
+                };
+                for (; step < 1000; step++) w->step_substeps(1);
+                printf("    mounted part (3 x 200 N) loaded on its mounts %s: %d of 3 let go\n", c.name, b->fem.mounts_broken);
+                CHECK((b->fem.mounts_broken > 0) == c.lets_go, "mounts %s: %d let go", c.name, b->fem.mounts_broken);
+            }
+        }
+        {
+            const float damps[] = {0.0f, 1.0f, 1.0e5f};
+            for (float dmp : damps) {
+                auto w = world(false);
+                w->settings.gravity = vec3(0, -9.81f, 0);
+                auto [body, far] = make(0.0f, dmp, true);
+                SoftBody* b = w->add_body(std::move(body));
+                float ymin = 1e9f, vlast = 0;
+                bool finite = true;
+                for (int step = 0; step < 6000; step++) {
+                    w->step_substeps(1);
+                    const Node& t = b->nodes[far];
+                    finite &= std::isfinite(t.p.x + t.p.y + t.p.z + t.v.x + t.v.y + t.v.z);
+                    ymin = std::min(ymin, t.p.y);
+                    if (step >= 5000) vlast = std::max(vlast, length(t.v));
+                }
+                printf("    a square on two mounts (a hinge) damped %g N m s/rad: its far corner down to %.3f m, %.3f m/s in the last 0.5 s\n", dmp, ymin, vlast);
+                CHECK(finite && b->fem.solve_failures == 0, "hinged on mounts, damping %g: not finite or %d failed solves", dmp, b->fem.solve_failures);
+                if (dmp == 0) CHECK(ymin < 0.7f && vlast > 0.5f, "the undamped hinge: down to %.3f, %.3f m/s", ymin, vlast);
+                else if (dmp < 100) CHECK(ymin < 0.7f && vlast < 0.05f, "the damped hinge: down to %.3f, still %.3f m/s", ymin, vlast);
+                else CHECK(ymin > 0.9f, "the heavily damped hinge fell to %.3f", ymin);
+            }
+        }
     }
 }
 
+// A collision hull's triangle (Triangle::two_sided false: one-sided, solid behind to the body's hull_depth): a ball
+// pushed 15 cm behind it comes back out in front, no faster than the push-out speed (2 m/s: RoR's contact, held for
+// many steps, pumped it out at 6.5 m/s). Behind an ordinary two-sided triangle the same ball stays where it is (out of
+// the thin surface's reach: a node that gets past its middle is pushed on through).
+struct HullRun {
+    float centre = 0, speed = 0; // (the ball's centre from the plane after 1 s, its fastest speed)
+};
+static HullRun run_hull(bool hull) {
+    World W;
+    W.settings.gravity = vec3(0);
+    auto plate = std::make_unique<SoftBody>();
+    plate->name = "hull plate";
+    const vec3 o(0, 5, 0);
+    const uint32_t a = plate->add_node(o + vec3(-2, 0, -2), 50), b = plate->add_node(o + vec3(2, 0, -2), 50), c = plate->add_node(o + vec3(0, 0, 3), 50);
+    plate->add_beam(a, b, 1e6f, 100, 1e12f, 1e12f), plate->add_beam(b, c, 1e6f, 100, 1e12f, 1e12f), plate->add_beam(c, a, 1e6f, 100, 1e12f, 1e12f);
+    plate->add_triangle(a, c, b); // (facing +y)
+    plate->finalize();
+    plate->tris[0].two_sided = !hull;
+    for (Node& n : plate->nodes) n.inv_mass = 0;
+    W.add_body(std::move(plate));
+    SoftBody* ball = W.add_body(make_ball(o + vec3(0, -0.15f, 0), 0.08f, 4.0f, vec3(0)));
+    if (getenv("BL_HULLDBG"))
+        for (int k = 0; k < 12; k++) {
+            W.step_substeps(1);
+            float vmax = 0, vmin = 1e9f;
+            for (const Node& n : ball->nodes) vmax = std::max(vmax, n.v.y), vmin = std::min(vmin, n.v.y);
+            printf("    substep %2d: node vy %.2f .. %.2f\n", k, vmin, vmax);
+        }
+    HullRun r;
+    for (int f = 0; f < 60; f++) {
+        W.step_substeps(33);
+        vec3 v(0);
+        float m = 0;
+        for (const Node& n : ball->nodes) v += n.v * n.mass, m += n.mass;
+        r.speed = std::max(r.speed, length(v / m));
+        if (getenv("BL_HULLDBG") && (f < 6 || f % 10 == 0)) printf("    frame %2d: centre %.3f m, velocity %.2f m/s\n", f, ball->center_of_mass().y - o.y, v.y / m);
+    }
+    r.centre = ball->center_of_mass().y - o.y;
+    return r;
+}
+
+static void test_hull() {
+    printf("collision hull: a ball pushed behind a hull triangle comes back out\n");
+    const HullRun out = run_hull(true), stays = run_hull(false);
+    CHECK(out.centre > 0.05f, "behind a hull triangle the ball stayed at %.3f m", out.centre);
+    CHECK(out.speed < 2.1f, "the ball left the hull at %.2f m/s (pumped out)", out.speed);
+    CHECK(stays.centre < -0.1f, "behind a two-sided triangle the ball moved to %.3f m", stays.centre);
+    printf("    the ball's centre from the plane: %.3f m (hull, left at %.2f m/s), %.3f m (two-sided)\n", out.centre, out.speed, stays.centre);
+}
+
+// ---- FEM frame benchmark (`test_physics fembench [steps]`): the frame's cost per substep against its members, for
+// three kinds of structure and one split into parts: a planar truss (a ladder with diagonals: little fill), a car-like
+// cage (square rings of four tubes, longitudinals, the faces' diagonals), a cubic lattice (the most fill), and the cage
+// cut into 1-8 components (parts on mounts). Free in space, no gravity, a spin to keep the members working; one line of
+// CSV per case: kind, members, nodes, components, factor blocks, block updates, ms per substep (all threads, one thread),
+// ms for the members' forces and the solve (one thread)
+namespace {
+std::unique_ptr<SoftBody> fem_structure(int kind, int n, int parts) {
+    auto b = std::make_unique<SoftBody>();
+    b->name = "fembench";
+    b->can_sleep = false;
+    const uint16_t si = b->fem.add_section(frame_tube(2e-4f));
+    auto node = [&](vec3 p) { return b->add_node(p, 1.0f, NF_NONE); };
+    auto mem = [&](uint32_t a, uint32_t c) { b->fem.add_element(a, c, si); };
+    if (kind == 0) { // ladder: n bays of 0.25 m, 0.5 m wide
+        std::vector<uint32_t> l, r;
+        for (int i = 0; i <= n; i++) l.push_back(node(vec3(0.25f * i, 1, 0))), r.push_back(node(vec3(0.25f * i, 1, 0.5f)));
+        for (int i = 0; i <= n; i++) {
+            mem(l[i], r[i]);
+            if (i < n) mem(l[i], l[i + 1]), mem(r[i], r[i + 1]), mem(l[i], r[i + 1]);
+        }
+    } else if (kind == 1) { // cage: n bays of 0.3 m, rings of 4 (0.6 x 0.6), the faces' diagonals; `parts` pieces along it
+        const int per = std::max(1, n / parts);
+        std::vector<std::array<uint32_t, 4>> ring;
+        for (int i = 0; i <= n + parts; i++) {
+            std::array<uint32_t, 4> rr;
+            for (int c = 0; c < 4; c++) rr[c] = node(vec3(0.3f * i, 1 + 0.6f * (c == 1 || c == 2), 0.6f * (c >= 2)));
+            ring.push_back(rr);
+        }
+        for (int p = 0, i0 = 0; p < parts; p++) {
+            const int i1 = p == parts - 1 ? n + parts : i0 + per;
+            for (int i = i0; i <= i1; i++)
+                for (int c = 0; c < 4; c++) {
+                    mem(ring[i][c], ring[i][(c + 1) % 4]);
+                    if (i < i1) mem(ring[i][c], ring[i + 1][c]), mem(ring[i][c], ring[i + 1][(c + 1) % 4]);
+                }
+            i0 = i1 + 1;
+        }
+    } else { // cubic lattice n x n x n, 0.3 m
+        std::vector<uint32_t> id(n * n * n);
+        for (int x = 0; x < n; x++)
+            for (int y = 0; y < n; y++)
+                for (int z = 0; z < n; z++) id[(x * n + y) * n + z] = node(vec3(0.3f * x, 1 + 0.3f * y, 0.3f * z));
+        for (int x = 0; x < n; x++)
+            for (int y = 0; y < n; y++)
+                for (int z = 0; z < n; z++) {
+                    const uint32_t a = id[(x * n + y) * n + z];
+                    if (x + 1 < n) mem(a, id[((x + 1) * n + y) * n + z]);
+                    if (y + 1 < n) mem(a, id[(x * n + y + 1) * n + z]);
+                    if (z + 1 < n) mem(a, id[(x * n + y) * n + z + 1]);
+                }
+    }
+    fix_inv_mass(*b);
+    b->fem.finalize(*b);
+    for (Node& x : b->nodes) x.v = cross(vec3(0.3f, 1.0f, 0.2f), x.p - vec3(0, 1, 0)); // (a spin)
+    return b;
+}
+
+void fem_bench(int steps) {
+    printf("kind,members,nodes,components,blocks,updates,ms_mt,ms_st,ms_forces_st,ms_solve_st\n");
+    struct Case {
+        const char* name;
+        int kind, n, parts;
+    };
+    std::vector<Case> cases;
+    for (int p : {1, 2, 4, 8, 13}) cases.push_back({"cage_parts", 1, 128, p});   // (first: the lattice's long runs heat the machine)
+    for (int n : {10, 25, 50, 100, 200, 400, 800}) cases.push_back({"ladder", 0, n, 1});
+    for (int n : {4, 8, 16, 32, 64, 128, 250}) cases.push_back({"cage", 1, n, 1});
+    for (int n : {3, 4, 5, 6, 7, 8, 9, 10}) cases.push_back({"lattice", 2, n, 1});
+    for (const Case& c : cases) {
+        double ms[2] = {0, 0}, fst = 0, sst = 0;
+        size_t members = 0, nodes = 0, blocks = 0, updates = 0;
+        int comps = 0;
+        for (int mt = 1; mt >= 0; mt--) {
+            World w;
+            w.settings.gravity = vec3(0);
+            w.settings.multithreaded = mt != 0;
+            SoftBody* b = w.add_body(fem_structure(c.kind, c.n, c.parts));
+            for (int i = 0; i < 20; i++) w.step_substeps(1);
+            ms[mt] = 1e9;
+            for (int rep = 0; rep < 3; rep++) { // (the least of three: the machine's other work off it)
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < steps; i++) w.step_substeps(1);
+                ms[mt] = std::min(ms[mt], std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / steps);
+            }
+            members = b->fem.elems.size(), nodes = b->fem.node.size(), blocks = b->fem.factor_blocks(), updates = b->fem.factor_updates(), comps = b->fem.components();
+            if (!mt) { // (the frame's own calls, one thread)
+                fst = sst = 1e9;
+                for (int rep = 0; rep < 3; rep++) {
+                    const auto t1 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < steps; i++) b->clear_forces(vec3(0)), b->fem.compute_forces(*b);
+                    const auto t2 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < steps; i++) b->fem.solve(*b, kDefaultDt, kDefaultDt, w.settings.frame_theta, w.settings.frame_dissipation);
+                    const auto t3 = std::chrono::steady_clock::now();
+                    fst = std::min(fst, std::chrono::duration<double, std::milli>(t2 - t1).count() / steps);
+                    sst = std::min(sst, std::chrono::duration<double, std::milli>(t3 - t2).count() / steps);
+                }
+            }
+        }
+        printf("%s,%zu,%zu,%d,%zu,%zu,%.4f,%.4f,%.4f,%.4f\n", c.name, members, nodes, comps, blocks, updates, ms[1], ms[0], fst, sst);
+    }
+}
+} // namespace
+
 int main(int argc, char** argv) {
     JobSystem::get().init(std::max(1, JobSystem::performance_cores() - 1)); // (as the application: performance cores only)
+    if (argc > 1 && std::strcmp(argv[1], "fembench") == 0) {
+        setvbuf(stdout, nullptr, _IOLBF, 0);
+        fem_bench(argc > 2 ? atoi(argv[2]) : 300);
+        JobSystem::get().shutdown();
+        return 0;
+    }
     if (argc > 1 && std::strcmp(argv[1], "team") == 0) {
         team_bench();
         JobSystem::get().shutdown();
@@ -1864,7 +2500,7 @@ int main(int argc, char** argv) {
     const bool do_bench = argc > 1 && std::strcmp(argv[1], "bench") == 0;
     setvbuf(stdout, nullptr, _IOLBF, 0); // (lines in order with the warnings on stderr)
     // `only <name>`: one section (kernel, momentum, topology, reorder, repeat, shapes, shape_impacts, patterns, laser,
-    // stability, world, frame)
+    // stability, world, membrane, frame, hull)
     const char* only = argc > 2 && std::strcmp(argv[1], "only") == 0 ? argv[2] : nullptr;
     auto run = [&](const char* name, void (*f)()) {
         if (!only || std::strcmp(only, name) == 0) f();
@@ -1882,7 +2518,10 @@ int main(int argc, char** argv) {
     run("laser", test_laser);
     run("stability", test_stability);
     run("world", test_world);
+    run("membrane", test_membrane_damp);
     run("frame", test_frame);
+    run("fem_tri", test_fem_tris);
+    run("hull", test_hull);
     if (do_bench) bench();
     printf("\n%d checks passed, %d failed\n", g_pass, g_fail);
     JobSystem::get().shutdown();

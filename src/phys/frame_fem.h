@@ -40,11 +40,24 @@
 // curve; once a hinge's plastic strain reaches the material's elongation the member is torn off that joint (its end
 // gets a copy of the node: the rest of the joint keeps the original), and axial or torsional failure splits it and
 // tears it at the middle. The pieces go on as members of their own.
+//
+// Triangle elements (FrameTri): a flat shell between three frame nodes - a car's body panel, a plate, a box's wall -
+// in the same implicit system as the members. The element is co-rotational as the members are: its frame follows
+// the triangle (the normal, and the in-plane turning that best fits its rest shape onto the current one), and in that
+// frame the small deformations meet the linear stiffness of a thin shell: the membrane (a constant strain triangle),
+// the bending (the Discrete Kirchhoff Triangle of Batoz: exact for constant curvature, no shear locking) and a weak
+// drilling stiffness tying each corner's turning about the normal to the element's own in-plane turning (the corners
+// have six degrees of freedom; without it that one is free). Past the yield the membrane flows (its rest shape
+// follows the stretch, radially back to the yield stress) and the bending forms a plastic fold (its corners' rest
+// rotations follow, back to the plastic moment, baked into their rest frames past a few hundredths of a radian as
+// the members' hinges are); a triangle whose plastic strain reaches the material's elongation tears out of the
+// shell (eroded: its corners stay, with their mass). Its mass is lumped on the corners.
 #pragma once
 
 #include "core/math.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -87,12 +100,50 @@ struct FrameSection {
     float damping = 2e-5f;          // stiffness-proportional damping (s)
     float axial = 1.0f;             // a factor on the axial stiffness (a ring on a projected membrane: see build_barrel)
     float joint_k = 2.0e4f;         // FJ_ELASTIC joints: rotational stiffness (N m/rad)
+    float break_force = 0;          // the force at its ends (axial and shear) past which the member tears off its end a
+                                    // (N; 0: never): a bolted mount, a hinge letting a door go - weaker than the frame
+    float joint_damp = 0;           // a released end (ball, hinge, swivel) resists turning against its node at this
+                                    // (N m s/rad): a joint's friction, a bushing's (without it a broken-off wheel swung free)
     int max_level = 1;              // a yielding member is split once (its halves are not split again)
     float min_len() const { return std::max(0.15f, 8.0f * half); } // (nor into pieces shorter than this)
     float mass_per_m() const { return rho * A; }
 };
 // A section of `shape` with the outer size `outer` (diameter or side, m) and the wall `wall` (m; tubes and boxes).
 FrameSection make_frame_section(const std::string& material, FrameShape shape, float outer, float wall);
+
+// The section of triangle elements: a sheet of a material and thickness (isotropic, elastic-perfectly plastic).
+struct ShellSection {
+    float E = 2.1e11f, nu = 0.3f, rho = 7850.0f;
+    float t = 0.001f;               // thickness (m)
+    float yield = 0;                // yield stress (Pa; 0: stays elastic)
+    float elongation = 0.2f;        // equivalent plastic strain at which a triangle tears out
+    float damping = 3e-4f;          // stiffness-proportional damping (s: 1% of critical at 10 Hz, 9% at 100; a thin plate rang
+                                    // for seconds at 0.3%: a sheet's free edges flapped, a slab rocked a box off)
+    float drill = 0.05f;            // the corners' turning about the normal against the element's in-plane turning: a
+                                    // spring of this share of G t A per corner (weak: only so the rotation is not free)
+    float mass_per_m2() const { return rho * t; }
+    float D() const { return E * t * t * t / (12.0f * (1.0f - nu * nu)); } // bending stiffness (N m)
+};
+// A shell section of `material` (the members' materials) and thickness (m).
+ShellSection make_shell_section(const std::string& material, float thickness);
+
+struct FrameTri {
+    uint32_t n[3] = {0, 0, 0};      // frame nodes (FemFrame::node), counter-clockwise about the rest normal
+    uint16_t section = 0;
+    bool broken = false;            // torn out (or degenerate)
+    int32_t tag = -1;               // the definition's triangle (vehicles), or the caller's own
+    int32_t coll = -1;              // its collision triangle in the body (SoftBody::tris; torn with it), -1: none
+    float X[3][2] = {{0, 0}, {0, 0}, {0, 0}}; // rest shape: the corners in the element's plane, from the centroid
+    float X0[3][2] = {{0, 0}, {0, 0}, {0, 0}}; // the authored one (the plastic stretch is the rest shape's against it)
+    float area0 = 0;                // the authored area (m2)
+    float mass = 0;                 // mass it put on its corners, a third on each
+    quat r0[3];                     // the element's rest frame in each corner node's frame
+    vec3 th0[3] = {vec3(0), vec3(0), vec3(0)}; // plastic rest rotations of the corners (element axes, not yet baked)
+    float dmg = 0;                  // plastic stretch reached (the rest shape's largest principal stretch against the
+                                    // authored one, less one: the state, not the path - an element shaking at its yield
+                                    // after an impact does not wear through)
+    float util = 0;                 // stress against the yield (membrane or bending, the larger), for display
+};
 
 // How a member's end is joined to its node. The member's local axes: x along it, y in the vertical plane through it
 // (towards the world's up; a vertical member: towards x), z across (horizontal).
@@ -130,12 +181,43 @@ struct FrameElement {
     float bt = 0;
     float damage = 0;               // accumulated axial and torsional plastic strain
     float dmg_a = 0, dmg_b = 0;     // accumulated plastic strain of the hinges at a and b
+    float overload = 0;             // a mount's overload so far: the time integral of its force over the break force, less
+                                    // one (s); it lets go at FemFrame::kOverloadTime
     float util = 0;                 // load against the yield or buckling limit (1: yielding), for display
     float N = 0;                    // axial force (tension > 0), for display
 };
 
+// A part held on the frame at a distance (FemFrame::mounts): the point of node a's frame where node b stood when it was
+// made (a's frame turns it) holds b there on a spring with damping (explicit), b free to turn about it: a ball joint -
+// two on a line are a hinge, three or more a bolted part. It lets go when its force stands past the break force for
+// FemFrame::kOverloadTime. The two nodes' turning against each other can be damped (a hinge's friction; implicit on each
+// side against the other's turning at the step's start). A mount is no member: a part held by mounts alone is a
+// component of the frame's own, solved apart from the rest (and beside it, in parallel).
+struct FrameMount {
+    uint32_t a = 0, b = 0;          // body nodes (a: the anchor's side)
+    // the point b is held at: carried by a and three frame nodes near it (their positions' affine combination, a point
+    // of the body's where b stood when it was made, however far off: no turning of a node carries it - a bumper's
+    // bracket 16 cm off a light node's frame spun the node and tore off at 14 kN as the car stood); a with no three
+    // around it off one plane: the point of a's frame (off)
+    uint32_t an[4] = {0, 0, 0, 0};
+    float aw[4] = {1, 0, 0, 0};
+    int na = 0;
+    uint8_t members[5] = {0, 0, 0, 0, 0};   // (the members at the anchor's nodes and at b when made: a member torn off one of
+                                            // them tore the mount's seat - the spring on a node left dangling flung it)
+    vec3 off{0};                    // (in a's frame: from a to where b is held, when na is 0)
+    float k = 0, c = 0;             // spring (N/m; 0 at the start: from the nodes' masses), damping (N s/m)
+    float brk = 0;                  // break force (N; 0: never)
+    float damp = 0;                 // the turning's damping (N m s/rad)
+    float overload = 0;             // (the force over the break force, less one, over time)
+    float f = 0;                    // its force at the last step (N), for display
+    bool made = false, broken = false;
+};
+
 class FemFrame {
 public:
+    // a mount lets go when its force has stood this long over its break force (s: at twice it for 5 ms, at 1.5 times
+    // for 10), not on a peak
+    static constexpr float kOverloadTime = 0.005f;
     // frame nodes
     std::vector<uint32_t> node;     // the body's node of each frame node
     std::vector<quat> q;            // orientation (node -> world); identity at rest in the definition's space
@@ -158,26 +240,51 @@ public:
     std::vector<vec3> contact_f;    // those contacts' forces (in b.force too): not carried over the short steps
     std::vector<FrameSection> sections;
     std::vector<FrameElement> elems;
+    std::vector<FrameMount> mounts;
+    std::vector<ShellSection> shell_sections;
+    std::vector<FrameTri> tris;
+    int tris_torn = 0;              // triangles torn out so far
     int broken = 0;                 // tears so far (ends torn off their joints)
     int splits = 0;                 // members split so far
     int solve_failures = 0;         // steps whose factorization failed (the members' forces then act explicitly)
     int clamps = 0;                 // velocity changes cut to the safety limits (see solve)
     long long passes_ = 0;          // (statistics: assembled and factored systems)
 
-    bool empty() const { return elems.empty(); }
+    bool empty() const { return elems.empty() && tris.empty(); }
     int slot(uint32_t body_node) const { return body_node < slot_.size() ? slot_[body_node] : -1; }
     uint32_t add_node(uint32_t body_node);
     uint16_t add_section(const FrameSection& s);
+    uint16_t add_shell_section(const ShellSection& s);
+    // A triangle element between three body nodes (frame nodes made as needed; the mass is the caller's to put on the
+    // nodes: tri_mass), `coll` its collision triangle in the body if any.
+    uint32_t add_tri(uint32_t body_a, uint32_t body_b, uint32_t body_c, uint16_t section, int32_t tag = -1, int32_t coll = -1);
+    float tri_mass(const FrameTri& t) const { return shell_sections[t.section].mass_per_m2() * t.area0; }
     // A member between two body nodes (their frame nodes are made as needed), with the joints at its ends.
     uint32_t add_element(uint32_t body_a, uint32_t body_b, uint16_t section, uint8_t end_a = FJ_RIGID, uint8_t end_b = FJ_RIGID, int32_t tag = -1);
+    // A mount (see FrameMount) of body node b on body node a, where b is now; k 0: the most the nodes' masses take at
+    // the step (a quarter of the explicit limit); damp: the turning's damping.
+    uint32_t add_mount(uint32_t body_a, uint32_t body_b, float brk, float k = 0, float damp = 0);
+    int mounts_broken = 0;          // mounts let go so far
+    // components: parts of the frame joined by members (and the body's springs between their nodes), each solved on
+    // its own (solve_component); mounts and springs between two of them act explicitly
+    int components() const { return (int)comp_range_.size(); }
+    int component_nodes(int c) const { return comp_range_[c].second - comp_range_[c].first; }
+    int component_members(int c) const { return (int)comp_elems_[c].size(); }
+    int component_tris(int c) const { return (int)comp_tris_[c].size(); }
     float element_mass(const FrameElement& e) const { return sections[e.section].mass_per_m() * e.L0; }
     // With the body at rest: the members' rest lengths and frames, the nodes' rotational inertia (from the members'
     // masses) and the solver's ordering. Called by the first step if the caller does not (after adding members).
     void finalize(const SoftBody& b);
     bool ready() const { return ready_; }
     // The members' forces at the current state: added to b.force, their torques to `torque`. Plastic yield and
-    // breaking happen here.
+    // breaking happen here. In parts, for a team: begin_forces (returns the chunks of members), eval_forces for each
+    // chunk (any order, in parallel: each member's own state and results), end_forces (onto the nodes, in order).
     void compute_forces(SoftBody& b);
+    int begin_forces(SoftBody& b);
+    void eval_forces(SoftBody& b, int chunk);
+    void end_forces(SoftBody& b);
+    static constexpr int kElemChunk = 64;
+    static constexpr int kTriChunk = 32;
     // The implicit step of length h (after every other force on the nodes is in b.force), plus the impulses held since
     // the last one: the frame nodes' force is replaced by m dv / step, `step` being the body integrator's (theta,
     // dissipation: see above). A body stepping its sheets in short steps solves its frame once per substep (h the
@@ -188,6 +295,11 @@ public:
     // for those steps alone, one step late, they pushed on the sheets out of phase: a crashed car kept ringing, and
     // counted for h as well as held, twice over); contacts act for `step`, the later ones held.
     void solve(SoftBody& b, float h, float step, float theta, float dissipation);
+    // The same in parts, for a team: solve_begin (returns the components), solve_component for each (any order, in
+    // parallel), solve_end.
+    int solve_begin(SoftBody& b, float h, float step, float theta, float dissipation);
+    void solve_component(SoftBody& b, int c);
+    void solve_end(SoftBody& b);
     void hold(SoftBody& b, float step);
     std::vector<vec3> impulse;      // per frame node: the forces held over the short steps less what solve took them
                                     // to be (N s)
@@ -235,16 +347,37 @@ public:
     int repair();
     // Elastic energy stored in the members (J), for checks; parts: axial, torsion, bending.
     double strain_energy(const SoftBody& b, double* parts = nullptr) const;
+    // ... and in the triangles (J); parts: membrane, bending, drilling.
+    double tri_energy(double* parts = nullptr) const;
+    // a triangle's local stiffness (18 x 18: per corner u, v, w along the element's axes, then its rotations about them)
+    // and its deformation at the current state (the same order) with the element's axes, for checks
+    void tri_stiffness(uint32_t ti, double K[18][18]) const;
+    bool tri_state(uint32_t ti, float d[18], vec3 axes[3]) const;
 
 private:
     std::vector<int32_t> slot_;
+    std::vector<char> welded_;      // (compute_forces: the frame nodes some member is welded to, for the joints' damping)
+    float last_h_ = 0;              // (the last step's length: a mount's overload accumulates over time)
+    // (the members' forces in parallel, begin_forces / eval_forces / end_forces: each member's end force and the two
+    // torques on its nodes, and each chunk's events, then gathered onto the nodes in the members' order)
+    struct ElemOut {
+        vec3 fa, ta, tb;
+        bool on = false;
+    };
+    std::vector<ElemOut> out_;
+    struct TriOut {
+        vec3 f[3], t[3];
+        bool on = false;
+    };
+    std::vector<TriOut> tri_out_;
     bool ready_ = false;
     struct Event {
         uint32_t elem;
-        uint8_t kind;   // 0 split at t, 1 tear end a, 2 tear end b, 3 split at t and tear there
+        uint8_t kind;   // 0 split at t, 1 tear end a, 2 tear end b, 3 split at t and tear there, 4 a triangle torn out
         float t;
     };
     std::vector<Event> events_;
+    std::vector<std::vector<Event>> chunk_events_;
     void node_inertia(uint32_t fn, const SoftBody& b);
     // The body's own springs on frame nodes (beams, shocks, hydros, the wheels' and cinecam's beams): their stiffness
     // and damping join the implicit step on the frame's side (a bump stop of 9e6 N/m on a light frame node is far past
@@ -279,6 +412,24 @@ private:
     };
     Tangent effective(const Tangent& t) const;
     std::vector<Tangent> tan_;
+    // the triangles: their local stiffness (18 x 18, packed upper triangle; rebuilt when the rest shape flowed) and the
+    // tangent of the last evaluation (the element's axes, its membrane tension for the geometric stiffness)
+    static constexpr int kTriK = 171, kTriB = 54;
+    std::vector<float> tri_k_;
+    std::vector<float> tri_b_;                    // per triangle: the bending's curvatures from the corners' rotations at the
+                                                  // three points (3 x 3 x 6), with the stiffness
+    std::vector<uint8_t> tri_k_ok_;
+    struct TriTan {
+        vec3 e1, e2, e3;
+        float g[3][3];              // geometric stiffness of the membrane's tension between the corners' translations
+        bool on = false;
+    };
+    std::vector<TriTan> tri_tan_;
+    void tri_build_k(uint32_t ti);
+    std::vector<std::array<int, 3>> tri_block_;   // per triangle: the off-diagonal blocks of its corner pairs (01, 12, 20)
+    std::vector<std::array<uint8_t, 3>> tri_swap_;
+    std::vector<std::vector<uint32_t>> comp_tris_;
+    void eval_tris(SoftBody& b, int chunk, std::vector<Event>& evs);
     // the sparse factorization: permuted order of the nodes, the lower block pattern of L column by column
     std::vector<int> perm_, iperm_;
     std::vector<int> col_ptr_, row_;             // off-diagonal blocks of column k: rows row_[col_ptr_[k] .. col_ptr_[k+1])
@@ -298,7 +449,29 @@ private:
         uint32_t elem;
         uint8_t unload;                           // its unload bits as assembled
     };
-    std::vector<Changed> changed_;
+    // the components (analyse): their range of the permuted order, members, the body's springs on their nodes (and
+    // not across), the damped mounts' ends in them (frame node, the other end's, damping); per component in the
+    // solve: members to assemble again, statistics
+    std::vector<std::pair<int, int>> comp_range_;
+    std::vector<std::vector<uint32_t>> comp_elems_, comp_links_;
+    struct MountDamp {
+        int32_t self, other;
+        float damp;
+        uint32_t mount;
+    };
+    std::vector<std::vector<MountDamp>> comp_mdamp_;
+    std::vector<std::vector<Changed>> comp_changed_;
+    struct CompStats {
+        int failures = 0, clamps = 0;
+        long long passes = 0;
+    };
+    std::vector<CompStats> comp_stats_;
+    struct SolveArgs {
+        float h = 0, step = 0, theta = 0, dissipation = 0;
+        const vec3* ext = nullptr;
+    } sv_;
+    std::vector<vec3> w0_;                        // (the angular velocities at the solve's start: the mounts' damping)
+    void mount_forces(SoftBody& b);
     void analyse();
     void element_matrix(const Tangent& t, double K[12][12]) const;
 };

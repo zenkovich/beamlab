@@ -24,42 +24,6 @@ inline uint32_t cell_hash(int x, int y, int z) {
     return (uint32_t)(x * 73856093) ^ (uint32_t)(y * 19349663) ^ (uint32_t)(z * 83492791);
 }
 
-// Closest point on triangle abc to p (Ericson, Real-Time Collision Detection 5.1.5).
-// Returns barycentric weights (for a, b, c).
-inline vec3 closest_on_triangle(vec3 p, vec3 a, vec3 b, vec3 c, vec3& bary) {
-    vec3 ab = b - a, ac = c - a, ap = p - a;
-    float d1 = dot(ab, ap), d2 = dot(ac, ap);
-    if (d1 <= 0 && d2 <= 0) { bary = {1, 0, 0}; return a; }
-    vec3 bp = p - b;
-    float d3 = dot(ab, bp), d4 = dot(ac, bp);
-    if (d3 >= 0 && d4 <= d3) { bary = {0, 1, 0}; return b; }
-    float vc = d1 * d4 - d3 * d2;
-    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
-        float v = d1 / (d1 - d3);
-        bary = {1 - v, v, 0};
-        return a + ab * v;
-    }
-    vec3 cp = p - c;
-    float d5 = dot(ab, cp), d6 = dot(ac, cp);
-    if (d6 >= 0 && d5 <= d6) { bary = {0, 0, 1}; return c; }
-    float vb = d5 * d2 - d1 * d6;
-    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
-        float w = d2 / (d2 - d6);
-        bary = {1 - w, 0, w};
-        return a + ac * w;
-    }
-    float va = d3 * d6 - d5 * d4;
-    if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
-        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        bary = {0, 1 - w, w};
-        return b + (c - b) * w;
-    }
-    float denom = 1.0f / (va + vb + vc);
-    float v = vb * denom, w = vc * denom;
-    bary = {1 - v - w, v, w};
-    return a + ab * v + ac * w;
-}
-
 inline float closest_on_segment(vec3 p, vec3 a, vec3 b) {
     vec3 ab = b - a;
     float l2 = dot(ab, ab);
@@ -121,6 +85,35 @@ inline bool contact_force(Node* const* A, vec3* const* FA, const float* wa, Node
     }
     vec3 f = primitive_collision(f_rel, va - vb, m, n, dt, gm, pen, fric);
     for (int i = 0; i < NA; i++) *FA[i] += f * wa[i];
+    if (b_movable)
+        for (int i = 0; i < NB; i++) *FB[i] -= f * wb[i];
+    return true;
+}
+
+// A node behind a hull triangle's face (Triangle::two_sided false, deeper than the contact radius): the force along the
+// face's normal that makes its velocity relative to the face after the step the push-out speed (a fifth of the depth a
+// step, at most 2 m/s), counting the forces on both sides so far (the car behind the node pushes it in), and only when
+// it would come out slower: no friction, nothing cancelled beyond that. (RoR's contact cancels every inward force on a
+// node in contact; a node held deep in a hull for many steps was pumped out by its own springs: a ball started 15 cm
+// behind a face left at 6.5 m/s.) SA / SB: see contact_force.
+template <int NB>
+inline bool hull_push_out(Node* A, vec3* FA, Node* const* B, vec3* const* FB, const float* wb, bool a_movable, bool b_movable, vec3 n, float pen, float dt,
+                          const vec3* SA = nullptr, const vec3* const* SB = nullptr) {
+    float W = a_movable ? A->inv_mass : 0.0f;
+    if (b_movable)
+        for (int i = 0; i < NB; i++) W += wb[i] * wb[i] * B[i]->inv_mass;
+    if (W <= 1e-12f) return false;
+    vec3 vb(0), acc(0);
+    if (a_movable) acc += (SA ? *FA - *SA : *FA) * A->inv_mass;
+    for (int i = 0; i < NB; i++) {
+        vb += B[i]->v * wb[i];
+        if (b_movable) acc -= (SB ? *FB[i] - *SB[i] : *FB[i]) * (wb[i] * B[i]->inv_mass);
+    }
+    const float m = 1.0f / W, vr = dot(A->v - vb, n), target = std::min(0.2f * pen / dt, 2.0f);
+    const float fn = (target - vr) * m / dt - dot(acc, n) * m; // (the normal force it needs besides what it has)
+    if (fn <= 0) return true;
+    const vec3 f = n * fn;
+    if (a_movable) *FA += f;
     if (b_movable)
         for (int i = 0; i < NB; i++) *FB[i] -= f * wb[i];
     return true;
@@ -192,10 +185,14 @@ struct World::Island {
     // merged in item order, so the outcome does not depend on the threads
     struct Work {
         uint32_t body;
-        uint32_t kind;  // 0: internal forces of the body (beams, shocks, wheels ...), 1: chunk `a` of its triangles, 2: nodes [a, b)
+        uint32_t kind;  // 0: internal forces of the body (beams, shocks, wheels ...), 1: chunk `a` of its triangles, 2: nodes [a, b),
+                        // 3: a rigid body's step, 4: chunk `a` of its frame's members
         uint32_t a, b;
     };
     std::vector<Work> work;
+    std::vector<char> fem_parts;    // (bodies whose frame members are evaluated in chunks of their own this short step)
+    std::vector<char> fem_defer;    // (integration items whose frame solves this short step, apart: then they integrate)
+    std::vector<std::pair<uint32_t, int>> fem_work;   // (those frames' components: the item, the component)
     struct NodePart {
         vec3 mn, mx;
         float max_v2;
@@ -325,12 +322,16 @@ void World::step_substeps(int n) {
         const int nthreads = JobSystem::get().num_threads();
         for (int i : order) {
             Island& isl = *m_islands[i];
-            bool sheets = false;
-            for (const SoftBody* b : isl.bodies) sheets |= !b->shells.empty();
+            bool sheets = false, frames = false;
+            for (const SoftBody* b : isl.bodies) {
+                sheets |= !b->shells.empty();
+                // (a frame of some size: its members' chunks and its components' solves go to the team)
+                frames |= !b->fem.empty() && (b->fem.components() > 1 || b->fem.elems.size() + 3 * b->fem.tris.size() >= 200);
+            }
             // (a sheet about to be hit refines and cracks within the frame: its island is worth a team long before its cost
             // says so; phases of a single work item run inline, a team costs next to nothing when it is not needed)
             isl.teamed = settings.multithreaded && nthreads > 1 &&
-                         ((sheets && isl.team_cost > settings.team_cost * 0.2) || (isl.bodies.size() >= 16 && isl.team_cost > settings.team_cost));
+                         ((sheets && isl.team_cost > settings.team_cost * 0.2) || frames || (isl.bodies.size() >= 16 && isl.team_cost > settings.team_cost));
         }
         auto run = [&](int i, int) { simulate_island(*m_islands[order[i]], n); };
         if (settings.multithreaded) JobSystem::get().parallel_items((int)order.size(), run);
@@ -536,7 +537,7 @@ void World::build_islands(float frame_time) {
         if (windy && b.sleeping && !b.wind_area.empty() && in_wind(b)) b.wake();
         AABB a = b.aabb;
         float m = b.sleeping ? 0.05f : std::min(b.max_speed, 200.0f) * frame_time * 2.0f + 0.3f;
-        a.expand(m);
+        a.expand(m + b.hull_reach());
         boxes[i] = a;
     }
     if (settings.inter_body_collisions) {
@@ -616,7 +617,7 @@ void World::build_islands(float frame_time) {
             m_stats.active_nodes += b->node_count();
             m_stats.active_beams += (int)b->beams.size();
             // (a refined sheet takes 2^dt_shift short steps per substep)
-            const double c = (double)(b->nodes.size() * 2 + b->beams.size() + b->joints.size() * 3 + b->fem.elems.size() * 40 + b->shells.size() * 4) * (1 << b->dt_shift());
+            const double c = (double)(b->nodes.size() * 2 + b->beams.size() + b->joints.size() * 3 + b->fem.elems.size() * 40 + b->fem.tris.size() * 150 + b->shells.size() * 4) * (1 << b->dt_shift());
             isl.cost += c;
             isl.team_cost += c;
             isl.max_body_cost = std::max(isl.max_body_cost, c);
@@ -766,6 +767,17 @@ void World::collide_static(SoftBody& b, size_t n0, size_t n1, const std::vector<
     }
 }
 
+// A candidate pair of a node and a collision triangle (the broadphase): within r of it; a hull triangle (one-sided,
+// see Triangle::two_sided) also takes a node up to `depth` behind it over its face. tu: the triangle's unit normal.
+static inline bool near_triangle(vec3 p, vec3 a, vec3 b, vec3 c, vec3 tu, float r, bool two_sided, float depth) {
+    const float s = dot(p - a, tu);
+    vec3 bary;
+    if (two_sided) return std::fabs(s) <= r && length2(closest_on_triangle(p, a, b, c, bary) - p) <= r * r;
+    if (s > r || s < -r - depth) return false;
+    const vec3 q = p - tu * s; // (over the face, within r of it)
+    return length2(closest_on_triangle(q, a, b, c, bary) - q) <= r * r;
+}
+
 void World::rebuild_pairs(Island& isl) {
     PROFILE_ACCUM("Broadphase");
     m_rebuilds.fetch_add(1, std::memory_order_relaxed);
@@ -860,7 +872,7 @@ void World::rebuild_pairs(Island& isl) {
     isl.partners.resize(nb);
     for (int bi = 0; bi < nb; bi++) {
         isl.boxes[bi] = isl.bodies[bi]->aabb;
-        isl.boxes[bi].expand(reach + isl.extra[bi]);
+        isl.boxes[bi].expand(reach + isl.extra[bi] + isl.bodies[bi]->hull_reach());
         isl.partners[bi].clear();
     }
     for (int a = 0; a < nb; a++)
@@ -952,10 +964,11 @@ void World::rebuild_pairs(Island& isl) {
             out_nc.clear();
             const int bt = q.body;
             SoftBody& o = *isl.bodies[bt];
-            const float rq = rmax + margin + isl.extra[bt];
+            const float rq0 = rmax + margin + isl.extra[bt];
             for (uint32_t t = q.t0; t < q.t1; t++) {
                 const Triangle& tr = o.tris[t];
                 if (tr.torn) continue;
+                const float depth = tr.two_sided ? 0.0f : o.hull_depth, rq = rq0 + depth; // (a hull triangle: its depth behind too)
                 vec3 a = o.nodes[tr.a].p, bb = o.nodes[tr.b].p, c = o.nodes[tr.c].p;
                 vec3 tmn = vmin(a, vmin(bb, c)), tmx = vmax(a, vmax(bb, c));
                 if (!near_partner(bt, tmn - vec3(rq), tmx + vec3(rq))) continue;
@@ -985,10 +998,9 @@ void World::rebuild_pairs(Island& isl) {
                                 if (b.sleeping && o.sleeping) continue;
                                 vec3 p = b.nodes[pt.node].p;
                                 float r = b.collision_radius + margin + isl.extra[bt];
-                                if (p.x < tmn.x - r || p.y < tmn.y - r || p.z < tmn.z - r || p.x > tmx.x + r || p.y > tmx.y + r || p.z > tmx.z + r) continue;
-                                if (std::fabs(dot(p - a, tu)) > r) continue; // (off the triangle's plane)
-                                vec3 bary;
-                                if (length2(closest_on_triangle(p, a, bb, c, bary) - p) > r * r) continue;
+                                const float rb = r + depth;
+                                if (p.x < tmn.x - rb || p.y < tmn.y - rb || p.z < tmn.z - rb || p.x > tmx.x + rb || p.y > tmx.y + rb || p.z > tmx.z + rb) continue;
+                                if (!near_triangle(p, a, bb, c, tu, r, tr.two_sided, depth)) continue;
                                 out_nt.push_back({(uint16_t)bn, (uint16_t)bt, pt.node, t});
                             }
                         }
@@ -1273,20 +1285,19 @@ void World::fast_pairs(Island& isl) {
             if (dbg) c_tris.fetch_add(1, std::memory_order_relaxed);
             const float rt = o_fast ? r00 + travel * std::sqrt(std::max(length2(o.nodes[tr.a].v), std::max(length2(o.nodes[tr.b].v), length2(o.nodes[tr.c].v))))
                                     : r00;
+            const float depth = tr.two_sided ? 0.0f : o.hull_depth;
             const vec3 tn = cross(bb - a, c - a);
             const float tn2 = dot(tn, tn);
             const vec3 tu = tn2 > 1e-20f ? tn * (1.0f / std::sqrt(tn2)) : vec3(0);
             auto test = [&](uint32_t ni) {
                 const Node& x = F.nodes[ni];
                 const vec3 p = x.p;
-                const float rn = rt + length(x.v) * travel;
-                if (p.x < tmn.x - rn || p.y < tmn.y - rn || p.z < tmn.z - rn || p.x > tmx.x + rn || p.y > tmx.y + rn || p.z > tmx.z + rn) return false;
-                if (std::fabs(dot(p - a, tu)) > rn) return false; // (off the triangle's plane)
-                vec3 bary;
-                return length2(closest_on_triangle(p, a, bb, c, bary) - p) <= rn * rn;
+                const float rn = rt + length(x.v) * travel, rb = rn + depth;
+                if (p.x < tmn.x - rb || p.y < tmn.y - rb || p.z < tmn.z - rb || p.x > tmx.x + rb || p.y > tmx.y + rb || p.z > tmx.z + rb) return false;
+                return near_triangle(p, a, bb, c, tu, rn, tr.two_sided, depth);
             };
             int n;
-            if (!scan(tmn - vec3(rt), tmx + vec3(rt), test, n)) {
+            if (!scan(tmn - vec3(rt + depth), tmx + vec3(rt + depth), test, n)) {
                 n = 0; // (more than 512 nodes near one triangle: all of them, in order)
                 for (uint32_t ni = 0; ni < F.nodes.size(); ni++)
                     if ((F.info[ni].flags & NF_CONTACTER) && test(ni)) out_nt.push_back({(uint16_t)bf, (uint16_t)bo, ni, t});
@@ -1462,14 +1473,31 @@ void World::collide_pairs(Island& isl) {
                     if (bn.sleeping && bt.sleeping) continue;
                     const Node& n = bn.nodes[pr.node];
                     const Triangle& t = bt.tris[pr.tri];
+                    if (t.torn) continue; // (torn since the pairs were found: a cut, a stretch)
+                    static const bool no_hull = getenv("BL_HULL") && atoi(getenv("BL_HULL")) == 0; // (diagnostics: hulls measured, not colliding)
+                    if (no_hull && !t.two_sided) continue;
                     const Node& a = bt.nodes[t.a];
                     const Node& b = bt.nodes[t.b];
                     const Node& cc = bt.nodes[t.c];
                     vec3 bary;
+                    const float r = bn.collision_radius;
+                    if (!t.two_sided) {
+                        // a hull triangle: over its face the node is pushed out along the face's normal, from as deep
+                        // as the hull's depth behind it; off the face, outside, the ordinary contact with its edges
+                        const vec3 fn = normalize(cross(b.p - a.p, cc.p - a.p));
+                        const float s = dot(n.p - a.p, fn);
+                        if (s >= r || s < -bt.hull_depth) continue;
+                        const vec3 q = n.p - fn * s;
+                        const vec3 cq = closest_on_triangle(q, a.p, b.p, cc.p, bary);
+                        if (length2(cq - q) <= 1e-6f) {
+                            out.push_back({(uint32_t)i, 0.0f, bary, fn, r - s});
+                            continue;
+                        }
+                        if (s < 0) continue; // (behind, not over this face: another face's)
+                    }
                     vec3 cp = closest_on_triangle(n.p, a.p, b.p, cc.p, bary);
                     vec3 d = n.p - cp;
                     float dist2 = dot(d, d);
-                    const float r = bn.collision_radius;
                     if (dist2 >= r * r) continue;
                     float dist = std::sqrt(dist2);
                     vec3 nrm;
@@ -1615,6 +1643,10 @@ void World::collide_pairs(Island& isl) {
                 float fric = (bn.info[pr.node].flags & NF_TYRE) ? bn.info[pr.node].friction : 0.8f;
                 const vec3* SA[1] = {snap(bn, pr.node)};
                 const vec3* SB[3] = {snap(bt, t.a), snap(bt, t.b), snap(bt, t.c)};
+                if (!t.two_sided && h.pen > bn.collision_radius) { // (behind a hull's face)
+                    if (hull_push_out<3>(A[0], FA[0], B, FB, wb, ma, mb, h.nrm, h.pen, dt, SA[0], SB[0] ? SB : nullptr)) contacts++, bn.touch(bt), bt.touch(bn);
+                    continue;
+                }
                 if (contact_force<1, 3>(A, FA, wa, B, FB, wb, ma, mb, h.nrm, h.pen, dt, gm, fric, SA[0] ? SA : nullptr, SB[0] ? SB : nullptr)) {
                     contacts++, bn.touch(bt), bt.touch(bn);
                     // a fast contact on a sheet with a fracture pattern: where it lays one (the approach speed)
@@ -1704,20 +1736,23 @@ void World::simulate_island(Island& isl, int substeps) {
     isl.subs.assign(nb, 0);
     constexpr uint32_t kNodeChunk = 1024;
     // internal forces of one body other than its triangles (a sub-cycled body recomputes them for every short step)
-    auto base_forces = [&](SoftBody& b, float bdt, bool controller) {
+    auto base_forces = [&](SoftBody& b, float bdt, bool controller, bool fem_parts) {
         PROFILE_ACCUM("Beam forces"); // (gravity, drag, wind, controllers, beams, shocks, joints, wheels)
         b.clear_forces(g);
         if (!b.wind_area.empty()) apply_wind(b);
-        if (controller && b.pre_substep) b.pre_substep(b, bdt);
+        // (the controllers once a substep, for the whole of it: given the short step's length, a refined sheet's car
+        // ran its engine, gearbox and steering 2-4 times slower than the clock)
+        if (controller && b.pre_substep) b.pre_substep(b, isl.dt);
         b.compute_beam_forces();
         if (!b.shocks.empty()) b.compute_shock_forces();
         if (!b.joints.empty()) b.compute_joint_forces();
-        if (!b.welds.empty()) b.compute_weld_forces();
-        if (!b.fem.empty() && (controller || b.fem_every_step) && !b.rigid) { // (once per substep: the frame's step, FemFrame::solve)
+        const bool fem_step = !b.fem.empty() && (controller || b.fem_every_step) && !b.rigid;
+        if (!b.welds.empty()) b.compute_weld_forces(fem_step);
+        if (fem_step && !fem_parts) { // (once per substep: the frame's step, FemFrame::solve; fem_parts: in chunks of their own)
             PROFILE_ACCUM("Frame elements");
             b.fem.compute_forces(b);
         }
-        if (!b.wheels.empty()) b.compute_wheel_forces(bdt);
+        if (!b.wheels.empty()) b.compute_wheel_forces(bdt, controller);
         if (!b.slides.empty()) b.compute_slide_forces();
     };
     // node ranges of the bodies stepping at short step j (a body with wheels stays whole: its tyre patches share grip)
@@ -1763,12 +1798,19 @@ void World::simulate_island(Island& isl, int substeps) {
             isl.beam_steps += (long long)b.beams.size() * isl.subs[k];
         }
         for (int j = 0; j < maxsub; j++) {
-            // 1) internal forces
+            // 1) internal forces (a frame's members in chunks beside the body's other forces and its sheet: one after
+            // another they were the longest item of the step)
             isl.work.clear();
+            isl.fem_parts.assign(nb, 0);
             for (int k = 0; k < nb; k++) {
                 if (isl.subs[k] <= j) continue;
                 SoftBody& b = *isl.bodies[k];
                 isl.work.push_back({(uint32_t)k, 0, 0, 0});
+                if (!b.fem.empty() && (j == 0 || b.fem_every_step) && !b.rigid) {
+                    const int fc = b.fem.begin_forces(b);
+                    for (int c = 0; c < fc; c++) isl.work.push_back({(uint32_t)k, 4, (uint32_t)c, 0});
+                    isl.fem_parts[k] = 1;
+                }
                 if (!b.shells.empty() && !b.rigid) {
                     const int ch = b.shell_begin(dt / (float)isl.subs[k], j, isl.subs[k]);
                     for (int c = 0; c < ch; c++) isl.work.push_back({(uint32_t)k, 1, (uint32_t)c, 0});
@@ -1780,13 +1822,18 @@ void World::simulate_island(Island& isl, int substeps) {
                     const Island::Work& w = isl.work[i];
                     SoftBody& b = *isl.bodies[w.body];
                     if (w.kind == 0) {
-                        base_forces(b, dt / (float)isl.subs[w.body], j == 0);
+                        base_forces(b, dt / (float)isl.subs[w.body], j == 0, isl.fem_parts[w.body] != 0);
+                    } else if (w.kind == 4) {
+                        PROFILE_ACCUM("Frame elements");
+                        b.fem.eval_forces(b, (int)w.a);
                     } else {
                         PROFILE_ACCUM("Sheet elements");
                         b.shell_eval((int)w.a);
                     }
                 });
                 lap(0);
+                for (int k = 0; k < nb; k++)
+                    if (isl.fem_parts[k]) isl.bodies[k]->fem.end_forces(*isl.bodies[k]);
                 for (int k = 0; k < nb; k++)
                     if (isl.subs[k] > j && isl.bodies[k]->shk.pass.chunks > 0) isl.bodies[k]->shell_end();
                 lap(4);
@@ -1834,6 +1881,7 @@ void World::simulate_island(Island& isl, int substeps) {
             }
             // 4) static contacts + integration (the sheets' forces of the later short steps are gathered here)
             node_work(j, false);
+            isl.fem_defer.assign(isl.work.size(), 0);
             {
                 PROFILE_ACCUM("Integration");
                 team.run((int)isl.work.size(), [&](int i) {
@@ -1866,20 +1914,51 @@ void World::simulate_island(Island& isl, int substeps) {
                     out.mn = vec3(1e30f);
                     out.mx = vec3(-1e30f);
                     out.max_v2 = 0;
+                    isl.fem_defer[i] = 0;
                     if (w.kind == 3) {
                         b.rigid_step(bdt, out.contacts > 0, out.mn, out.mx, out.max_v2);
                     } else {
                         if (!b.fem.empty()) {
                             // every force on the frame nodes is in: their implicit step (the new velocities as forces),
-                            // once per substep; the short steps of a sub-cycled body hold them at those velocities
-                            PROFILE_ACCUM("Frame solve");
-                            if (b.fem_every_step) b.fem.solve(b, bdt, bdt, settings.frame_theta, b.fem_dissipation >= 0 ? b.fem_dissipation : settings.frame_dissipation);
-                            else if (j == 0) b.fem.solve(b, dt, bdt, settings.frame_theta, b.fem_dissipation >= 0 ? b.fem_dissipation : settings.frame_dissipation);
-                            else b.fem.hold(b, bdt);
+                            // once per substep, next, a component each; the short steps of a sub-cycled body hold them
+                            // at those velocities
+                            if (b.fem_every_step || j == 0) {
+                                isl.fem_defer[i] = 1;
+                                return;
+                            }
+                            b.fem.hold(b, bdt);
                         }
                         b.integrate_nodes(w.a, w.b, bdt, out.mn, out.mx, out.max_v2);
                     }
                 });
+                // the frames' implicit steps: each frame's components (parts held by mounts, solved apart) beside each
+                // other and the other frames'; then those bodies' integration
+                isl.fem_work.clear();
+                for (int i = 0; i < (int)isl.work.size(); i++) {
+                    if (!isl.fem_defer[i]) continue;
+                    SoftBody& b = *isl.bodies[isl.work[i].body];
+                    const float bdt = dt / (float)isl.subs[isl.work[i].body];
+                    const int nc = b.fem.solve_begin(b, b.fem_every_step ? bdt : dt, bdt, settings.frame_theta,
+                                                     b.fem_dissipation >= 0 ? b.fem_dissipation : settings.frame_dissipation);
+                    for (int c = 0; c < nc; c++) isl.fem_work.push_back({(uint32_t)i, c});
+                }
+                if (!isl.fem_work.empty()) {
+                    team.run((int)isl.fem_work.size(), [&](int q) {
+                        PROFILE_ACCUM("Frame solve");
+                        SoftBody& b = *isl.bodies[isl.work[isl.fem_work[q].first].body];
+                        b.fem.solve_component(b, isl.fem_work[q].second);
+                    });
+                    for (int i = 0; i < (int)isl.work.size(); i++)
+                        if (isl.fem_defer[i]) isl.bodies[isl.work[i].body]->fem.solve_end(*isl.bodies[isl.work[i].body]);
+                    team.run((int)isl.work.size(), [&](int i) {
+                        if (!isl.fem_defer[i]) return;
+                        PROFILE_ACCUM("Integrate");
+                        const Island::Work& w = isl.work[i];
+                        SoftBody& b = *isl.bodies[w.body];
+                        Island::NodePart& out = isl.parts[i];
+                        b.integrate_nodes(w.a, w.b, dt / (float)isl.subs[w.body], out.mn, out.mx, out.max_v2);
+                    });
+                }
             }
             lap(3);
             // 4b) the sheets' sphere contacts (between them, and each deformed one with itself), after the integration
@@ -2188,8 +2267,10 @@ int World::destroy_at(vec3 p, float radius, float impulse) {
             broken += n;
         }
         if (!b.shells.empty()) broken += b.shatter_shells(p, radius);
-        for (Triangle& t : b.tris) {
-            if (t.torn || !b.shells.empty()) continue;
+        const std::vector<char> of_shell = b.shell_tri_mask(); // (the sheet's own triangles go with its shells)
+        for (size_t ti = 0; ti < b.tris.size(); ti++) {
+            Triangle& t = b.tris[ti];
+            if (t.torn || of_shell[ti]) continue;
             vec3 bary;
             if (length2(closest_on_triangle(p, b.nodes[t.a].p, b.nodes[t.b].p, b.nodes[t.c].p, bary) - p) > r2) continue;
             t.torn = true;
@@ -2282,17 +2363,17 @@ int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip
             cut += tears;
             if (getenv("BL_FRAMEDBG")) printf("laser: %s: %zu members crossed, %d torn\n", b.name.c_str(), hits.size(), tears);
         }
-        if (!b.shells.empty()) {
-            cut += b.cut_shells(o, d0, d1, range);
-        } else {
-            for (Triangle& t : b.tris) {
-                if (t.torn) continue;
-                const vec3 pa = b.nodes[t.a].p, pb = b.nodes[t.b].p, pc = b.nodes[t.c].p;
-                if (!crosses(pa, pb) && !crosses(pb, pc) && !crosses(pc, pa)) continue;
-                t.torn = true;
-                cut++;
-            }
+        // the collision triangles across the cut: the sheet's go with its shells, the others (a frame's hull) are torn
+        const std::vector<char> of_shell = b.shell_tri_mask();
+        for (size_t ti = 0; ti < b.tris.size(); ti++) {
+            Triangle& t = b.tris[ti];
+            if (t.torn || of_shell[ti]) continue;
+            const vec3 pa = b.nodes[t.a].p, pb = b.nodes[t.b].p, pc = b.nodes[t.c].p;
+            if (!crosses(pa, pb) && !crosses(pb, pc) && !crosses(pc, pa)) continue;
+            t.torn = true;
+            cut++;
         }
+        if (!b.shells.empty()) cut += b.cut_shells(o, d0, d1, range);
         if (cut != before) b.wake();
     }
     return cut;

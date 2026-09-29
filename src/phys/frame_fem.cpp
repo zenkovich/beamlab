@@ -20,6 +20,7 @@ static const FrameMaterial kMaterials[] = {
     {"Titanium", 1.14e11f, 4.4e10f, 4430.0f, 8.8e8f, 0.10f},   // Ti-6Al-4V
     {"Carbon", 1.2e11f, 2.5e10f, 1600.0f, 6.0e8f, 0.015f},     // CFRP tube: strong, light and brittle
     {"Wood", 1.1e10f, 7.0e8f, 500.0f, 4.0e7f, 0.02f},          // pine along the grain
+    {"Plastic", 1.6e9f, 5.8e8f, 950.0f, 3.0e7f, 0.08f},        // polypropylene: a bumper's absorber and brackets, a mirror's arm
 };
 
 const FrameMaterial* frame_materials(int& count) {
@@ -114,6 +115,16 @@ FrameSection make_frame_section(const std::string& material, FrameShape shape, f
     return s;
 }
 
+ShellSection make_shell_section(const std::string& material, float thickness) {
+    const FrameMaterial& m = frame_material(material);
+    ShellSection s;
+    s.E = m.E, s.nu = std::clamp(m.E / (2.0f * m.G) - 1.0f, 0.0f, 0.49f), s.rho = m.rho;
+    s.t = std::max(1e-4f, thickness);
+    s.yield = m.yield, s.elongation = m.elongation;
+    if (const char* d = getenv("BL_SHELL_DAMP")) s.damping = (float)atof(d); // (diagnostics: the shells' damping)
+    return s;
+}
+
 // ------------------------------------------------------------------------------------------------ building
 uint32_t FemFrame::add_node(uint32_t body_node) {
     if (body_node >= slot_.size()) slot_.resize(body_node + 1, -1);
@@ -132,9 +143,34 @@ uint32_t FemFrame::add_node(uint32_t body_node) {
     return (uint32_t)node.size() - 1;
 }
 
+uint32_t FemFrame::add_mount(uint32_t body_a, uint32_t body_b, float brk, float k, float damp) {
+    FrameMount m;
+    add_node(body_a), add_node(body_b);
+    m.a = body_a, m.b = body_b;
+    m.brk = brk, m.k = k, m.damp = damp;
+    mounts.push_back(m);
+    ready_ = false;
+    return (uint32_t)mounts.size() - 1;
+}
+
 uint16_t FemFrame::add_section(const FrameSection& s) {
     sections.push_back(s);
     return (uint16_t)(sections.size() - 1);
+}
+
+uint16_t FemFrame::add_shell_section(const ShellSection& s) {
+    shell_sections.push_back(s);
+    return (uint16_t)(shell_sections.size() - 1);
+}
+
+uint32_t FemFrame::add_tri(uint32_t body_a, uint32_t body_b, uint32_t body_c, uint16_t section, int32_t tag, int32_t coll) {
+    FrameTri t;
+    t.n[0] = add_node(body_a), t.n[1] = add_node(body_b), t.n[2] = add_node(body_c);
+    t.section = section;
+    t.tag = tag, t.coll = coll;
+    tris.push_back(t);
+    ready_ = false;
+    return (uint32_t)tris.size() - 1;
 }
 
 uint32_t FemFrame::add_element(uint32_t body_a, uint32_t body_b, uint16_t section, uint8_t end_a, uint8_t end_b, int32_t tag) {
@@ -183,15 +219,176 @@ void FemFrame::finalize(const SoftBody& b) {
         // (the mass it put on its nodes: the caller's, else its section's, assumed on the nodes already)
         if (e.mass <= 0) e.mass = element_mass(e);
     }
+    // the triangles' rest shape (once: a later pattern change keeps it): the corners in the plane of the element, from
+    // its centroid, x along its first edge; the element's rest frame in each corner's frame
+    for (FrameTri& t : tris) {
+        if (t.area0 > 0 || t.broken) continue;
+        const vec3 x0 = b.nodes[node[t.n[0]]].p, x1 = b.nodes[node[t.n[1]]].p, x2 = b.nodes[node[t.n[2]]].p;
+        const vec3 nn = cross(x1 - x0, x2 - x0);
+        const float a2 = length(nn);
+        if (!(a2 > 1e-8f) || t.n[0] == t.n[1] || t.n[1] == t.n[2] || t.n[0] == t.n[2]) {
+            t.broken = true;
+            continue;
+        }
+        const vec3 e3 = nn / a2, e1 = normalize(x1 - x0), e2 = cross(e3, e1);
+        const vec3 c = (x0 + x1 + x2) / 3.0f;
+        const vec3 xs[3] = {x0, x1, x2};
+        for (int i = 0; i < 3; i++) t.X[i][0] = t.X0[i][0] = dot(xs[i] - c, e1), t.X[i][1] = t.X0[i][1] = dot(xs[i] - c, e2);
+        t.area0 = 0.5f * a2;
+        const quat E0 = from_mat3(mat3(e1, e2, e3));
+        for (int i = 0; i < 3; i++) t.r0[i] = normalize(conj(q[t.n[i]]) * E0), t.th0[i] = vec3(0);
+        if (t.mass <= 0) t.mass = tri_mass(t);
+    }
+    tri_k_.assign(tris.size() * kTriK, 0.0f);
+    tri_b_.assign(tris.size() * kTriB, 0.0f);
+    tri_k_ok_.assign(tris.size(), 0);
     for (size_t i = 0; i < n; i++) node_inertia((uint32_t)i, b);
+    // the mounts made once, where their nodes stand now: b's point in a's frame, the spring the nodes' masses take at
+    // the step unless given (a quarter of the explicit limit), the damping near a third of critical
+    std::vector<std::vector<uint32_t>> nbr;
+    for (FrameMount& m : mounts) {
+        if (m.made) continue;
+        const int sa = slot(m.a), sb = slot(m.b);
+        if (sa < 0 || sb < 0) continue;
+        m.off = conj(q[sa]).rotate(b.nodes[m.b].p - b.nodes[m.a].p);
+        m.na = 0;
+        // the anchor's nodes: a and, of the frame nodes a few members round it (within 0.9 m), the farthest from a, from
+        // their line and from their plane
+        if (nbr.empty()) {
+            nbr.assign(n, {});
+            for (const FrameElement& e : elems)
+                if (!e.broken) nbr[e.a].push_back(e.b), nbr[e.b].push_back(e.a);
+        }
+        const vec3 x0 = b.nodes[m.a].p;
+        std::vector<uint32_t> cand{(uint32_t)sa};
+        for (size_t r0 = 0, ring = 0; ring < 6 && r0 < cand.size(); ring++) {
+            const size_t r1 = cand.size();
+            for (size_t i = r0; i < r1; i++)
+                for (uint32_t u : nbr[cand[i]])
+                    if (std::find(cand.begin(), cand.end(), u) == cand.end() && length(b.nodes[node[u]].p - x0) < 0.9f) cand.push_back(u);
+            r0 = r1;
+        }
+        int i1 = -1, i2 = -1, i3 = -1;
+        float best = 0;
+        for (uint32_t u : cand)
+            if (u != (uint32_t)sa && length(b.nodes[node[u]].p - x0) > best) best = length(b.nodes[node[u]].p - x0), i1 = (int)u;
+        if (i1 >= 0) {
+            const vec3 d1 = normalize(b.nodes[node[i1]].p - x0);
+            best = 0;
+            for (uint32_t u : cand) {
+                const vec3 r = b.nodes[node[u]].p - x0;
+                const float l = length(r - d1 * dot(r, d1));
+                if (u != (uint32_t)sa && l > best) best = l, i2 = (int)u;
+            }
+        }
+        if (i2 >= 0) {
+            const vec3 nrm = normalize(cross(b.nodes[node[i1]].p - x0, b.nodes[node[i2]].p - x0));
+            best = 0;
+            for (uint32_t u : cand) {
+                const float l = std::fabs(dot(b.nodes[node[u]].p - x0, nrm));
+                if (u != (uint32_t)sa && l > best) best = l, i3 = (int)u;
+            }
+            if (best < 0.02f) i3 = -1;
+        }
+        if (i3 >= 0) {
+            const vec3 e1 = b.nodes[node[i1]].p - x0, e2 = b.nodes[node[i2]].p - x0, e3 = b.nodes[node[i3]].p - x0, r = b.nodes[m.b].p - x0;
+            const float det = dot(e1, cross(e2, e3));
+            if (std::fabs(det) > 1e-9f) {
+                const float l1 = dot(r, cross(e2, e3)) / det, l2 = dot(e1, cross(r, e3)) / det, l3 = dot(e1, cross(e2, r)) / det;
+                m.an[0] = m.a, m.an[1] = node[i1], m.an[2] = node[i2], m.an[3] = node[i3];
+                m.aw[0] = 1.0f - l1 - l2 - l3, m.aw[1] = l1, m.aw[2] = l2, m.aw[3] = l3;
+                m.na = 4;
+            }
+        }
+        float ia = 0;
+        if (m.na > 0)
+            for (int i = 0; i < m.na; i++) ia += m.aw[i] * m.aw[i] * b.nodes[m.an[i]].inv_mass;
+        else
+            ia = b.nodes[m.a].inv_mass;
+        const float ib = b.nodes[m.b].inv_mass;
+        const float m_eff = ia + ib > 0 ? 1.0f / (ia + ib) : 1.0f;
+        const float h = kDefaultDt;
+        if (!(m.k > 0)) m.k = 0.25f * m_eff / (h * h);
+        m.c = 2.0f * 0.3f * std::sqrt(m.k * m_eff);
+        m.made = true;
+        {
+            const int na = std::max(1, m.na);
+            for (int j = 0; j < na; j++) m.members[j] = (uint8_t)std::min(255, members_at((uint32_t)slot(m.na > 0 ? m.an[j] : m.a)));
+            m.members[4] = (uint8_t)std::min(255, members_at((uint32_t)sb));
+        }
+        static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
+        if (dbg)
+            printf("frame: mount %u-%u: %.0f mm off, anchor of %d nodes (%.2f %.2f %.2f %.2f), k %.3g N/m, c %.3g N s/m, masses %.2f %.2f kg\n", m.a, m.b,
+                   length(m.off) * 1000.0f, m.na, m.aw[0], m.aw[1], m.aw[2], m.aw[3], m.k, m.c, b.nodes[m.a].mass, b.nodes[m.b].mass);
+    }
     analyse();
     tan_.assign(elems.size(), Tangent());
+    tri_tan_.assign(tris.size(), TriTan());
     ready_ = true;
+}
+
+// The mounts' springs: b held at a's point (explicit; acting for the frame's step, as the members); past the break force
+// for kOverloadTime a mount lets go
+void FemFrame::mount_forces(SoftBody& b) {
+    vec3* F = b.force.data();
+    static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
+    const float h = last_h_ > 0 ? last_h_ : kDefaultDt;
+    for (size_t i = 0; i < mounts.size(); i++) {
+        FrameMount& m = mounts[i];
+        if (m.broken || !m.made) continue;
+        const int sa = slot(m.a), sb = slot(m.b);
+        if (sa < 0 || sb < 0) continue;
+        const Node& A = b.nodes[m.a];
+        const Node& B = b.nodes[m.b];
+        vec3 P(0), Pv(0), r(0);
+        if (m.na > 0) {
+            for (int j = 0; j < m.na; j++) P += b.nodes[m.an[j]].p * m.aw[j], Pv += b.nodes[m.an[j]].v * m.aw[j];
+        } else {
+            r = q[sa].rotate(m.off);
+            P = A.p + r, Pv = A.v + cross(w[sa], r);
+        }
+        const vec3 d = P - B.p, dv = Pv - B.v;
+        const vec3 f = d * m.k + dv * m.c; // (on b; the anchor's nodes take it back)
+        m.f = length(f);
+        if (m.brk > 0 && b.allow_break) {
+            m.overload = std::max(0.0f, m.overload + (length(d * m.k) / m.brk - 1.0f) * h);
+            if (m.overload > kOverloadTime) {
+                if (dbg) printf("frame: mount %zu (%u-%u) lets go at %.0f N (breaks at %.0f)\n", i, m.a, m.b, m.f, m.brk);
+                m.broken = true;
+                mounts_broken++;
+                b.stats.broken_beams++;
+                debris_check = true;
+                continue;
+            }
+        }
+        F[m.b] += f;
+        member_f[sb] += f;
+        if (m.na > 0) {
+            for (int j = 0; j < m.na; j++) {
+                F[m.an[j]] -= f * m.aw[j];
+                if (const int sj = slot(m.an[j]); sj >= 0) member_f[sj] -= f * m.aw[j];
+            }
+        } else {
+            F[m.a] -= f;
+            member_f[sa] -= f;
+            torque[sa] += cross(r, -f);
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ the sparse pattern
 void FemFrame::analyse() {
     const int n = (int)node.size();
+    // the components: frame nodes joined by members (a part on mounts is one of its own)
+    std::vector<int> up(n);
+    for (int i = 0; i < n; i++) up[i] = i;
+    auto find = [&](int x) {
+        while (up[x] != x) x = up[x] = up[up[x]];
+        return x;
+    };
+    for (const FrameElement& e : elems) up[find((int)e.a)] = find((int)e.b);
+    for (const FrameTri& t : tris)
+        if (!t.broken) up[find((int)t.n[0])] = find((int)t.n[1]), up[find((int)t.n[1])] = find((int)t.n[2]);
     std::vector<std::vector<int>> adj(n);
     auto link = [&](int a, int b) {
         if (a == b) return;
@@ -199,7 +396,10 @@ void FemFrame::analyse() {
         if (std::find(adj[b].begin(), adj[b].end(), a) == adj[b].end()) adj[b].push_back(a);
     };
     for (const FrameElement& e : elems) link((int)e.a, (int)e.b);
-    // the body's springs on frame nodes
+    for (const FrameTri& t : tris)
+        if (!t.broken) link((int)t.n[0], (int)t.n[1]), link((int)t.n[1], (int)t.n[2]), link((int)t.n[2], (int)t.n[0]);
+    // the body's springs on frame nodes: in their component's system (both ends in one: a block of its pattern); one
+    // between two components acts explicitly, as the mounts do
     links_.clear();
     if (body_) {
         const SoftBody& b = *body_;
@@ -210,36 +410,53 @@ void FemFrame::analyse() {
             const Beam& bm = b.beams[k];
             const int fa = slot(bm.a), fb = slot(bm.b);
             if (fa < 0 && fb < 0) continue;
+            if (fa >= 0 && fb >= 0 && find(fa) != find(fb)) continue;
             links_.push_back({(uint32_t)k, fa, fb, shock_of[k], -1, 0});
             if (fa >= 0 && fb >= 0) link(fa, fb);
         }
     }
-    // minimum degree ordering on the elimination graph; a column's rows are the node's neighbours when it goes
+    // components in the order of their first node; minimum degree ordering on each one's elimination graph, the
+    // components one after another (no block joins two: each factors on its own)
+    std::vector<int> comp_of(n, -1), roots;
+    for (int i = 0; i < n; i++) {
+        const int r = find(i);
+        if (comp_of[r] < 0) comp_of[r] = (int)roots.size(), roots.push_back(r);
+        comp_of[i] = comp_of[r];
+    }
+    const int nc = (int)roots.size();
+    std::vector<std::vector<int>> comp_nodes(nc);
+    for (int i = 0; i < n; i++) comp_nodes[comp_of[i]].push_back(i);
     perm_.assign(n, 0);
     iperm_.assign(n, 0);
+    comp_range_.assign(nc, {0, 0});
     std::vector<char> done(n, 0);
     std::vector<std::vector<int>> cols(n);
-    for (int k = 0; k < n; k++) {
-        int v = -1;
-        for (int i = 0; i < n; i++)
-            if (!done[i] && (v < 0 || adj[i].size() < adj[v].size())) v = i;
-        perm_[k] = v;
-        iperm_[v] = k;
-        done[v] = 1;
-        cols[k] = adj[v];
-        for (size_t x = 0; x < adj[v].size(); x++)
-            for (size_t y = x + 1; y < adj[v].size(); y++) link(adj[v][x], adj[v][y]);
-        for (int u : adj[v]) adj[u].erase(std::find(adj[u].begin(), adj[u].end(), v));
-        adj[v].clear();
+    int k = 0;
+    for (int c = 0; c < nc; c++) {
+        comp_range_[c].first = k;
+        for (size_t step = 0; step < comp_nodes[c].size(); step++, k++) {
+            int v = -1;
+            for (int i : comp_nodes[c])
+                if (!done[i] && (v < 0 || adj[i].size() < adj[v].size())) v = i;
+            perm_[k] = v;
+            iperm_[v] = k;
+            done[v] = 1;
+            cols[k] = adj[v];
+            for (size_t x = 0; x < adj[v].size(); x++)
+                for (size_t y = x + 1; y < adj[v].size(); y++) link(adj[v][x], adj[v][y]);
+            for (int u : adj[v]) adj[u].erase(std::find(adj[u].begin(), adj[u].end(), v));
+            adj[v].clear();
+        }
+        comp_range_[c].second = k;
     }
     col_ptr_.assign(n + 1, 0);
     row_.clear();
-    for (int k = 0; k < n; k++) {
+    for (int kk = 0; kk < n; kk++) {
         std::vector<int> r;
-        for (int u : cols[k]) r.push_back(iperm_[u]);
+        for (int u : cols[kk]) r.push_back(iperm_[u]);
         std::sort(r.begin(), r.end());
         row_.insert(row_.end(), r.begin(), r.end());
-        col_ptr_[k + 1] = (int)row_.size();
+        col_ptr_[kk + 1] = (int)row_.size();
     }
     auto find_block = [&](int col, int row) {
         for (int p = col_ptr_[col]; p < col_ptr_[col + 1]; p++)
@@ -248,35 +465,69 @@ void FemFrame::analyse() {
     };
     upd_ptr_.assign(n + 1, 0);
     upd_.clear();
-    for (int k = 0; k < n; k++) {
-        for (int pi = col_ptr_[k]; pi < col_ptr_[k + 1]; pi++)
-            for (int pj = pi; pj < col_ptr_[k + 1]; pj++) {
+    for (int kk = 0; kk < n; kk++) {
+        for (int pi = col_ptr_[kk]; pi < col_ptr_[kk + 1]; pi++)
+            for (int pj = pi; pj < col_ptr_[kk + 1]; pj++) {
                 Update u;
                 u.pi = pi, u.pj = pj;
                 u.target = pi == pj ? -(row_[pi] + 1) : find_block(row_[pi], row_[pj]);
                 upd_.push_back(u);
             }
-        upd_ptr_[k + 1] = (int)upd_.size();
+        upd_ptr_[kk + 1] = (int)upd_.size();
     }
     elem_block_.assign(elems.size(), -1);
     elem_swap_.assign(elems.size(), 0);
+    comp_elems_.assign(nc, {});
     for (size_t i = 0; i < elems.size(); i++) {
+        comp_elems_[comp_of[elems[i].a]].push_back((uint32_t)i);
         const int ka = iperm_[elems[i].a], kb = iperm_[elems[i].b];
         if (ka == kb) continue;
         elem_block_[i] = find_block(std::min(ka, kb), std::max(ka, kb));
         elem_swap_[i] = ka > kb;
     }
-    for (Link& l : links_) {
+    // the triangles: the blocks of their corner pairs (01, 12, 20; the row node the later one in the order)
+    tri_block_.assign(tris.size(), {-1, -1, -1});
+    tri_swap_.assign(tris.size(), {0, 0, 0});
+    comp_tris_.assign(nc, {});
+    for (size_t ti = 0; ti < tris.size(); ti++) {
+        const FrameTri& t = tris[ti];
+        if (t.broken) continue;
+        comp_tris_[comp_of[t.n[0]]].push_back((uint32_t)ti);
+        for (int e = 0; e < 3; e++) {
+            const int ki = iperm_[t.n[e]], kj = iperm_[t.n[(e + 1) % 3]];
+            if (ki == kj) continue;
+            tri_block_[ti][e] = find_block(std::min(ki, kj), std::max(ki, kj));
+            tri_swap_[ti][e] = ki > kj;
+        }
+    }
+    comp_links_.assign(nc, {});
+    for (size_t li = 0; li < links_.size(); li++) {
+        Link& l = links_[li];
+        comp_links_[comp_of[l.fa >= 0 ? l.fa : l.fb]].push_back((uint32_t)li);
         if (l.fa < 0 || l.fb < 0 || l.fa == l.fb) continue;
         const int ka = iperm_[l.fa], kb = iperm_[l.fb];
         l.block = find_block(std::min(ka, kb), std::max(ka, kb));
         l.swap = ka > kb;
     }
+    // the damped mounts' ends, in the component of each
+    comp_mdamp_.assign(nc, {});
+    for (size_t mi = 0; mi < mounts.size(); mi++) {
+        const FrameMount& m = mounts[mi];
+        const int sa = slot(m.a), sb = slot(m.b);
+        if (m.broken || !(m.damp > 0) || sa < 0 || sb < 0 || sa >= n || sb >= n) continue;
+        comp_mdamp_[comp_of[sa]].push_back({sa, sb, m.damp, (uint32_t)mi});
+        comp_mdamp_[comp_of[sb]].push_back({sb, sa, m.damp, (uint32_t)mi});
+    }
+    comp_changed_.assign(nc, {});
+    comp_stats_.assign(nc, CompStats());
+    if (getenv("BL_FACTORDBG")) // (diagnostics: the factor's size)
+        printf("frame pattern: %d nodes, %zu members, %zu triangles, %d components, %zu off-diagonal blocks, %zu block updates\n", n, elems.size(), tris.size(), nc, row_.size(),
+               upd_.size());
     diag_.assign((size_t)n * 36, 0.0);
     off_.assign(row_.size() * 36, 0.0);
     rhs_.assign((size_t)n * 6, 0.0);
     dinv_.assign((size_t)n * 6, 0.0);
-    diagA_.clear(), offA_.clear(), rhsA_.clear();
+    diagA_.assign(diag_.size(), 0.0), offA_.assign(off_.size(), 0.0), rhsA_.assign(rhs_.size(), 0.0);
 }
 
 // ------------------------------------------------------------------------------------------------ element mechanics
@@ -389,9 +640,328 @@ Stiff stiffness(const FrameSection& s, const FrameElement& e) {
     return k;
 }
 
+// ------------------------------------------------------------------------------------------------ triangle elements
+// The Discrete Kirchhoff Triangle's curvatures (Batoz, Bathe, Ho 1980): kappa = B U at (xi, eta) of the triangle's
+// area coordinates, U = [w, theta_x, theta_y] at its corners (theta_x = w_y, theta_y = -w_x: the rotations about the
+// element's x and y axes), kappa = [beta_x,x, beta_y,y, beta_x,y + beta_y,x]; A2 twice the area
+void dkt_b(const double x[3], const double y[3], double xi, double eta, double B[3][9]) {
+    const double x23 = x[1] - x[2], x31 = x[2] - x[0], x12 = x[0] - x[1];
+    const double y23 = y[1] - y[2], y31 = y[2] - y[0], y12 = y[0] - y[1];
+    double P[7], q[7], r[7], t[7];
+    const double xs[3] = {x23, x31, x12}, ys[3] = {y23, y31, y12};
+    for (int k = 4; k <= 6; k++) {
+        const double xij = xs[k - 4], yij = ys[k - 4], l2 = xij * xij + yij * yij;
+        P[k] = -6 * xij / l2, q[k] = 3 * xij * yij / l2, t[k] = -6 * yij / l2, r[k] = 3 * yij * yij / l2;
+    }
+    const double a = 1 - 2 * xi, bb = 1 - 2 * eta;
+    const double Hx_xi[9] = {P[6] * a + (P[5] - P[6]) * eta, q[6] * a - (q[5] + q[6]) * eta, -4 + 6 * (xi + eta) + r[6] * a - eta * (r[5] + r[6]),
+                             -P[6] * a + eta * (P[4] + P[6]), q[6] * a - eta * (q[6] - q[4]), -2 + 6 * xi + r[6] * a + eta * (r[4] - r[6]),
+                             -eta * (P[5] + P[4]), eta * (q[4] - q[5]), -eta * (r[5] - r[4])};
+    const double Hy_xi[9] = {t[6] * a + eta * (t[5] - t[6]), 1 + r[6] * a - eta * (r[5] + r[6]), -q[6] * a + eta * (q[5] + q[6]),
+                             -t[6] * a + eta * (t[4] + t[6]), -1 + r[6] * a + eta * (r[4] - r[6]), -q[6] * a - eta * (q[4] - q[6]),
+                             -eta * (t[4] + t[5]), eta * (r[4] - r[5]), -eta * (q[4] - q[5])};
+    const double Hx_eta[9] = {-P[5] * bb - xi * (P[6] - P[5]), q[5] * bb - xi * (q[5] + q[6]), -4 + 6 * (xi + eta) + r[5] * bb - xi * (r[5] + r[6]),
+                              xi * (P[4] + P[6]), xi * (q[4] - q[6]), -xi * (r[6] - r[4]),
+                              P[5] * bb - xi * (P[4] + P[5]), q[5] * bb + xi * (q[4] - q[5]), -2 + 6 * eta + r[5] * bb + xi * (r[4] - r[5])};
+    const double Hy_eta[9] = {-t[5] * bb - xi * (t[6] - t[5]), 1 + r[5] * bb - xi * (r[5] + r[6]), -q[5] * bb + xi * (q[5] + q[6]),
+                              xi * (t[4] + t[6]), xi * (r[4] - r[6]), -xi * (q[4] - q[6]),
+                              t[5] * bb - xi * (t[4] + t[5]), -1 + r[5] * bb + xi * (r[4] - r[5]), -q[5] * bb - xi * (q[4] - q[5])};
+    const double A2 = x31 * y12 - x12 * y31, iA = 1.0 / A2;
+    for (int j = 0; j < 9; j++) {
+        B[0][j] = (y31 * Hx_xi[j] + y12 * Hx_eta[j]) * iA;
+        B[1][j] = (-x31 * Hy_xi[j] - x12 * Hy_eta[j]) * iA;
+        B[2][j] = (-x31 * Hx_xi[j] - x12 * Hx_eta[j] + y31 * Hy_xi[j] + y12 * Hy_eta[j]) * iA;
+    }
+}
+constexpr double kGauss[3][2] = {{1.0 / 6, 1.0 / 6}, {2.0 / 3, 1.0 / 6}, {1.0 / 6, 2.0 / 3}}; // (weights 1/6: the area's 1/2)
+
+// The membrane's shape gradients: dN_i/dx = b_i / A2, dN_i/dy = c_i / A2
+void tri_grad(const float X[3][2], double b[3], double c[3], double& A2) {
+    for (int i = 0; i < 3; i++) {
+        const int j = (i + 1) % 3, k = (i + 2) % 3;
+        b[i] = (double)X[j][1] - X[k][1];
+        c[i] = (double)X[k][0] - X[j][0];
+    }
+    A2 = ((double)X[1][0] - X[0][0]) * ((double)X[2][1] - X[0][1]) - ((double)X[2][0] - X[0][0]) * ((double)X[1][1] - X[0][1]);
+}
+
+// The element's stiffness in its own frame: 18 dofs, per corner [u, v, w, theta_x, theta_y, theta_z]
+void tri_local_k(const float X[3][2], const ShellSection& s, double K[18][18]) {
+    for (int i = 0; i < 18; i++)
+        for (int j = 0; j < 18; j++) K[i][j] = 0;
+    double b[3], c[3], A2;
+    tri_grad(X, b, c, A2);
+    if (!(A2 > 0)) return;
+    const double A = 0.5 * A2, nu = s.nu;
+    // the membrane (constant strain): A B^T D B, D the plane stress elasticity times the thickness
+    const double Dm = (double)s.E * s.t / (1 - nu * nu);
+    double Bm[3][6];
+    for (int i = 0; i < 3; i++) {
+        Bm[0][2 * i] = b[i] / A2, Bm[1][2 * i] = 0, Bm[2][2 * i] = c[i] / A2;
+        Bm[0][2 * i + 1] = 0, Bm[1][2 * i + 1] = c[i] / A2, Bm[2][2 * i + 1] = b[i] / A2;
+    }
+    const double D3[3][3] = {{1, nu, 0}, {nu, 1, 0}, {0, 0, 0.5 * (1 - nu)}};
+    for (int p = 0; p < 6; p++)
+        for (int q = 0; q < 6; q++) {
+            double v = 0;
+            for (int r = 0; r < 3; r++)
+                for (int t = 0; t < 3; t++) v += Bm[r][p] * D3[r][t] * Bm[t][q];
+            K[6 * (p / 2) + p % 2][6 * (q / 2) + q % 2] += A * Dm * v;
+        }
+    // the bending (DKT, three points)
+    const double x[3] = {X[0][0], X[1][0], X[2][0]}, y[3] = {X[0][1], X[1][1], X[2][1]};
+    const double Db = s.D();
+    for (const auto& g : kGauss) {
+        double B[3][9];
+        dkt_b(x, y, g[0], g[1], B);
+        for (int p = 0; p < 9; p++)
+            for (int q = 0; q < 9; q++) {
+                double v = 0;
+                for (int r = 0; r < 3; r++)
+                    for (int t = 0; t < 3; t++) v += B[r][p] * D3[r][t] * B[t][q];
+                K[6 * (p / 3) + 2 + p % 3][6 * (q / 3) + 2 + q % 3] += A2 / 6.0 * Db * v;
+            }
+    }
+    // the drilling: each corner's theta_z against the element's in-plane turning omega = (v_x - u_y) / 2, a spring of
+    // kd each (its energy sum kd (theta_z - omega)^2 / 2: no stiffness in a rigid turn, forces in balance)
+    const double G = (double)s.E / (2 * (1 + nu)), kd = (double)s.drill * G * s.t * A;
+    double gu[3], gv[3];
+    for (int i = 0; i < 3; i++) gu[i] = -c[i] / (2 * A2), gv[i] = b[i] / (2 * A2);
+    for (int i = 0; i < 3; i++) {
+        K[6 * i + 5][6 * i + 5] += kd;
+        for (int j = 0; j < 3; j++) {
+            K[6 * i + 5][6 * j] -= kd * gu[j], K[6 * j][6 * i + 5] -= kd * gu[j];
+            K[6 * i + 5][6 * j + 1] -= kd * gv[j], K[6 * j + 1][6 * i + 5] -= kd * gv[j];
+            K[6 * i][6 * j] += 3 * kd * gu[i] * gu[j], K[6 * i][6 * j + 1] += 3 * kd * gu[i] * gv[j];
+            K[6 * i + 1][6 * j] += 3 * kd * gv[i] * gu[j], K[6 * i + 1][6 * j + 1] += 3 * kd * gv[i] * gv[j];
+        }
+    }
+}
+
+// The co-rotated frame and the deformation: the normal of the current triangle, and in its plane the turning that
+// best fits the rest shape onto the current one (least squares: the displacements carry no turn); the corners'
+// displacements (w = 0: the plane goes through them) and their rotations against that frame, the plastic rest ones off
+struct TriKin {
+    vec3 e1, e2, e3;
+    double d[18];
+};
+
+bool tri_kinematics(const FemFrame& f, const FrameTri& t, TriKin& k) {
+    double x[3][3];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) x[i][j] = f.xd[t.n[i] * 3 + j];
+    const double a[3] = {x[1][0] - x[0][0], x[1][1] - x[0][1], x[1][2] - x[0][2]}, c[3] = {x[2][0] - x[0][0], x[2][1] - x[0][1], x[2][2] - x[0][2]};
+    double n[3] = {a[1] * c[2] - a[2] * c[1], a[2] * c[0] - a[0] * c[2], a[0] * c[1] - a[1] * c[0]};
+    const double nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]), al = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+    if (!(nl > 1e-12) || !(al > 1e-9) || !std::isfinite(nl)) return false;
+    for (double& v : n) v /= nl;
+    const double t1[3] = {a[0] / al, a[1] / al, a[2] / al};
+    const double t2[3] = {n[1] * t1[2] - n[2] * t1[1], n[2] * t1[0] - n[0] * t1[2], n[0] * t1[1] - n[1] * t1[0]};
+    double cen[3];
+    for (int j = 0; j < 3; j++) cen[j] = (x[0][j] + x[1][j] + x[2][j]) / 3.0;
+    double p[3][2];
+    for (int i = 0; i < 3; i++) {
+        const double r[3] = {x[i][0] - cen[0], x[i][1] - cen[1], x[i][2] - cen[2]};
+        p[i][0] = r[0] * t1[0] + r[1] * t1[1] + r[2] * t1[2];
+        p[i][1] = r[0] * t2[0] + r[1] * t2[1] + r[2] * t2[2];
+    }
+    double sn = 0, cs = 0;
+    for (int i = 0; i < 3; i++) sn += t.X[i][0] * p[i][1] - t.X[i][1] * p[i][0], cs += t.X[i][0] * p[i][0] + t.X[i][1] * p[i][1];
+    const double phi = std::atan2(sn, cs), cp = std::cos(phi), sp = std::sin(phi);
+    double e1[3], e2[3];
+    for (int j = 0; j < 3; j++) e1[j] = cp * t1[j] + sp * t2[j], e2[j] = -sp * t1[j] + cp * t2[j];
+    k.e1 = vec3((float)e1[0], (float)e1[1], (float)e1[2]);
+    k.e2 = vec3((float)e2[0], (float)e2[1], (float)e2[2]);
+    k.e3 = vec3((float)n[0], (float)n[1], (float)n[2]);
+    const quat Ec = conj(from_mat3(mat3(k.e1, k.e2, k.e3)));
+    for (int i = 0; i < 3; i++) {
+        // (in the element's axes: the fit turned the rest shape by phi)
+        k.d[6 * i] = cp * p[i][0] + sp * p[i][1] - t.X[i][0];
+        k.d[6 * i + 1] = -sp * p[i][0] + cp * p[i][1] - t.X[i][1];
+        k.d[6 * i + 2] = 0;
+        const vec3 th = quat_log(Ec * normalize(f.q[t.n[i]] * t.r0[i])) - t.th0[i];
+        k.d[6 * i + 3] = th.x, k.d[6 * i + 4] = th.y, k.d[6 * i + 5] = th.z;
+    }
+    return true;
+}
+
+// packed upper triangle of a symmetric 18 x 18 (and a table of it: the lookups sit in the inner loops)
+constexpr int kidx(int i, int j) { return i > j ? kidx(j, i) : i * 18 - i * (i - 1) / 2 + (j - i); }
+struct KMap {
+    uint8_t m[18][18];
+    constexpr KMap() : m() {
+        for (int i = 0; i < 18; i++)
+            for (int j = 0; j < 18; j++) m[i][j] = (uint8_t)kidx(i, j);
+    }
+};
+constexpr KMap kKMap;
+// the packed stiffness unpacked (double: the world's blocks are summed from it)
+inline void unpack_k(const float* P, double K[18][18]) {
+    for (int i = 0; i < 18; i++)
+        for (int j = 0; j < 18; j++) K[i][j] = P[kKMap.m[i][j]];
+}
+
 } // namespace
 
+void FemFrame::tri_build_k(uint32_t ti) {
+    double K[18][18];
+    const FrameTri& t = tris[ti];
+    tri_local_k(t.X, shell_sections[t.section], K);
+    float* P = &tri_k_[(size_t)ti * kTriK];
+    for (int i = 0; i < 18; i++)
+        for (int j = i; j < 18; j++) P[kidx(i, j)] = (float)K[i][j];
+    // (the bending's curvatures at the three points from the corners' rotations alone: the plastic check's)
+    const double x[3] = {t.X[0][0], t.X[1][0], t.X[2][0]}, y[3] = {t.X[0][1], t.X[1][1], t.X[2][1]};
+    float* Bc = &tri_b_[(size_t)ti * kTriB];
+    for (int g = 0; g < 3; g++) {
+        double B[3][9];
+        dkt_b(x, y, kGauss[g][0], kGauss[g][1], B);
+        for (int r = 0; r < 3; r++)
+            for (int i = 0; i < 3; i++) Bc[g * 18 + r * 6 + 2 * i] = (float)B[r][3 * i + 1], Bc[g * 18 + r * 6 + 2 * i + 1] = (float)B[r][3 * i + 2];
+    }
+    tri_k_ok_[ti] = 1;
+}
+
+void FemFrame::tri_stiffness(uint32_t ti, double K[18][18]) const {
+    tri_local_k(tris[ti].X, shell_sections[tris[ti].section], K);
+}
+
+bool FemFrame::tri_state(uint32_t ti, float d[18], vec3 axes[3]) const {
+    TriKin k;
+    if (ti >= tris.size() || !tri_kinematics(*this, tris[ti], k)) return false;
+    for (int i = 0; i < 18; i++) d[i] = (float)k.d[i];
+    axes[0] = k.e1, axes[1] = k.e2, axes[2] = k.e3;
+    return true;
+}
+
+void FemFrame::eval_tris(SoftBody& b, int chunk, std::vector<Event>& evs) {
+    const size_t t_end = std::min(tris.size(), (size_t)(chunk + 1) * kTriChunk);
+    for (size_t ti = (size_t)chunk * kTriChunk; ti < t_end; ti++) {
+        FrameTri& t = tris[ti];
+        TriOut& o = tri_out_[ti];
+        TriTan& tg = tri_tan_[ti];
+        o.on = tg.on = false;
+        if (t.broken) continue;
+        TriKin k;
+        if (!tri_kinematics(*this, t, k)) continue;
+        const ShellSection& s = shell_sections[t.section];
+        double b3[3], c3[3], A2;
+        tri_grad(t.X, b3, c3, A2);
+        if (!(A2 > 0)) continue;
+        const double nu = s.nu, Dm = (double)s.E / (1 - nu * nu);
+        // the membrane's strain and stress (Pa)
+        auto membrane = [&](double eps[3], double sig[3]) {
+            eps[0] = eps[1] = eps[2] = 0;
+            for (int i = 0; i < 3; i++) {
+                eps[0] += b3[i] * k.d[6 * i] / A2;
+                eps[1] += c3[i] * k.d[6 * i + 1] / A2;
+                eps[2] += (c3[i] * k.d[6 * i] + b3[i] * k.d[6 * i + 1]) / A2;
+            }
+            sig[0] = Dm * (eps[0] + nu * eps[1]), sig[1] = Dm * (nu * eps[0] + eps[1]), sig[2] = Dm * 0.5 * (1 - nu) * eps[2];
+        };
+        double eps[3], sig[3];
+        membrane(eps, sig);
+        auto von_mises = [](const double m[3]) { return std::sqrt(std::max(0.0, m[0] * m[0] - m[0] * m[1] + m[1] * m[1] + 3 * m[2] * m[2])); };
+        float util = 0;
+        if (s.yield > 0 && b.allow_deform) {
+            // the membrane flows: radially back to the yield stress, the rest shape following the stretch (the element's
+            // stiffness rebuilt once it has flowed a little)
+            const double seq = von_mises(sig);
+            util = (float)(seq / s.yield);
+            if (seq > s.yield) {
+                const double r = 1.0 - s.yield / seq;
+                for (int i = 0; i < 3; i++) t.X[i][0] += (float)(r * k.d[6 * i]), t.X[i][1] += (float)(r * k.d[6 * i + 1]), k.d[6 * i] *= 1 - r, k.d[6 * i + 1] *= 1 - r;
+                const float mx = (t.X[0][0] + t.X[1][0] + t.X[2][0]) / 3.0f, my = (t.X[0][1] + t.X[1][1] + t.X[2][1]) / 3.0f;
+                for (int i = 0; i < 3; i++) t.X[i][0] -= mx, t.X[i][1] -= my;
+                // (the plastic stretch: the rest shape against the authored one, F = [dX] [dX0]^-1, its largest principal
+                // stretch; crushed it folds and does not tear)
+                const double a0x = t.X0[1][0] - t.X0[0][0], a0y = t.X0[1][1] - t.X0[0][1], b0x = t.X0[2][0] - t.X0[0][0], b0y = t.X0[2][1] - t.X0[0][1];
+                const double ax = t.X[1][0] - t.X[0][0], ay = t.X[1][1] - t.X[0][1], bx = t.X[2][0] - t.X[0][0], by = t.X[2][1] - t.X[0][1];
+                const double det = a0x * b0y - b0x * a0y;
+                if (std::fabs(det) > 1e-12) {
+                    const double i00 = b0y / det, i01 = -b0x / det, i10 = -a0y / det, i11 = a0x / det;
+                    const double F00 = ax * i00 + bx * i10, F01 = ax * i01 + bx * i11, F10 = ay * i00 + by * i10, F11 = ay * i01 + by * i11;
+                    const double C00 = F00 * F00 + F10 * F10, C01 = F00 * F01 + F10 * F11, C11 = F01 * F01 + F11 * F11;
+                    const double lmax = 0.5 * (C00 + C11) + std::sqrt(0.25 * (C00 - C11) * (C00 - C11) + C01 * C01);
+                    t.dmg = std::max(t.dmg, (float)(std::sqrt(lmax) - 1.0));
+                }
+                tri_k_ok_[ti] = 0;
+                tri_grad(t.X, b3, c3, A2);
+                membrane(eps, sig);
+            }
+            // the bending: the moments at the three points, the largest against the plastic moment of the plate; past it
+            // the corners' rest rotations follow theirs, radially back to it
+            if (!tri_k_ok_[ti]) tri_build_k((uint32_t)ti);
+            const float* Bc = &tri_b_[ti * kTriB];
+            const double D = s.D(), Mp = 0.25 * s.yield * (double)s.t * s.t;
+            double meq = 0;
+            for (int g = 0; g < 3; g++) {
+                double kap[3] = {0, 0, 0};
+                for (int r = 0; r < 3; r++)
+                    for (int i = 0; i < 3; i++) kap[r] += Bc[g * 18 + r * 6 + 2 * i] * k.d[6 * i + 3] + Bc[g * 18 + r * 6 + 2 * i + 1] * k.d[6 * i + 4];
+                const double m[3] = {D * (kap[0] + nu * kap[1]), D * (nu * kap[0] + kap[1]), D * 0.5 * (1 - nu) * kap[2]};
+                meq = std::max(meq, von_mises(m));
+            }
+            util = std::max(util, (float)(meq / Mp));
+            if (meq > Mp) {
+                const double r = 1.0 - Mp / meq;
+                for (int i = 0; i < 3; i++) {
+                    t.th0[i].x += (float)(r * k.d[6 * i + 3]), t.th0[i].y += (float)(r * k.d[6 * i + 4]);
+                    k.d[6 * i + 3] *= 1 - r, k.d[6 * i + 4] *= 1 - r;
+                }
+                t.dmg = std::max(t.dmg, 1e-5f); // (yielded: shown so)
+            }
+            // (the plastic rotations into the rest frames past a few hundredths: the rotations measured stay small)
+            for (int i = 0; i < 3; i++)
+                if (dot(t.th0[i], t.th0[i]) > 0.02f * 0.02f) t.r0[i] = normalize(t.r0[i] * quat_exp(-t.th0[i])), t.th0[i] = vec3(0);
+            if (t.dmg > s.elongation && b.allow_break) evs.push_back({(uint32_t)ti, (uint8_t)4, 0.0f});
+        }
+        t.util = util;
+        if (!tri_k_ok_[ti]) tri_build_k((uint32_t)ti);
+        // the corners' forces and moments: -K d in the element's axes
+        const float* P = &tri_k_[ti * kTriK];
+        double f[18];
+        for (int i = 0; i < 18; i++) {
+            double v = 0;
+            for (int j = 0; j < 18; j++) v += (double)P[kKMap.m[i][j]] * k.d[j];
+            f[i] = v;
+        }
+        o.on = true;
+        for (int i = 0; i < 3; i++) {
+            o.f[i] = -(k.e1 * (float)f[6 * i] + k.e2 * (float)f[6 * i + 1] + k.e3 * (float)f[6 * i + 2]);
+            o.t[i] = -(k.e1 * (float)f[6 * i + 3] + k.e2 * (float)f[6 * i + 4] + k.e3 * (float)f[6 * i + 5]);
+        }
+        // the tangent: the axes, and the geometric stiffness of the membrane's tension (its compression left out, as the
+        // members' is) between the corners, A grad N_i^T (t sigma)+ grad N_j
+        tg.on = true;
+        tg.e1 = k.e1, tg.e2 = k.e2, tg.e3 = k.e3;
+        {
+            const double sx = sig[0] * s.t, sy = sig[1] * s.t, sxy = sig[2] * s.t;
+            const double tr = 0.5 * (sx + sy), df = std::sqrt(0.25 * (sx - sy) * (sx - sy) + sxy * sxy);
+            const double l1 = std::max(0.0, tr + df), l2 = std::max(0.0, tr - df);
+            // (the positive part: its eigenvectors)
+            double vx = sxy, vy = l1 - sx;
+            if (std::fabs(vx) + std::fabs(vy) < 1e-12 * (std::fabs(sx) + std::fabs(sy) + 1)) vx = sx >= sy ? 1 : 0, vy = sx >= sy ? 0 : 1;
+            const double vl = std::sqrt(vx * vx + vy * vy);
+            vx /= vl, vy /= vl;
+            const double S[2][2] = {{l1 * vx * vx + l2 * vy * vy, (l1 - l2) * vx * vy}, {(l1 - l2) * vx * vy, l1 * vy * vy + l2 * vx * vx}};
+            const double A = 0.5 * A2;
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++) {
+                    const double gi[2] = {b3[i] / A2, c3[i] / A2}, gj[2] = {b3[j] / A2, c3[j] / A2};
+                    tg.g[i][j] = (float)(A * (gi[0] * (S[0][0] * gj[0] + S[0][1] * gj[1]) + gi[1] * (S[1][0] * gj[0] + S[1][1] * gj[1])));
+                }
+        }
+    }
+}
+
 void FemFrame::compute_forces(SoftBody& b) {
+    const int chunks = begin_forces(b);
+    for (int c = 0; c < chunks; c++) eval_forces(b, c);
+    end_forces(b);
+}
+
+int FemFrame::begin_forces(SoftBody& b) {
     if (!ready_) finalize(b);
     if (tan_.size() != elems.size()) tan_.assign(elems.size(), Tangent());
     // a node that is not where its double position rounds to was moved by something else (a reset, a repair)
@@ -401,13 +971,40 @@ void FemFrame::compute_forces(SoftBody& b) {
         double* x = &xd[i * 3];
         if ((float)x[0] != p.x || (float)x[1] != p.y || (float)x[2] != p.z) x[0] = p.x, x[1] = p.y, x[2] = p.z;
     }
-    vec3* F = b.force.data();
     member_f.assign(node.size(), vec3(0));
+    // (the frame nodes some member is welded to: a released end's damping turns its node against the member only where
+    // the node's turning is someone's - a node held by released ends alone has the inertia of a few grams)
+    bool any_damp = false;
+    for (const FrameSection& s : sections) any_damp |= s.joint_damp > 0;
+    if (any_damp) {
+        welded_.assign(node.size(), 0);
+        for (const FrameElement& e : elems)
+            if (!e.broken) welded_[e.a] |= e.end_a == FJ_RIGID, welded_[e.b] |= e.end_b == FJ_RIGID;
+    }
+    out_.resize(elems.size());
+    tri_out_.resize(tris.size());
+    if (tri_tan_.size() != tris.size()) tri_tan_.assign(tris.size(), TriTan());
+    if (tri_k_ok_.size() != tris.size()) tri_k_.assign(tris.size() * kTriK, 0.0f), tri_b_.assign(tris.size() * kTriB, 0.0f), tri_k_ok_.assign(tris.size(), 0);
+    const int chunks = (int)((elems.size() + kElemChunk - 1) / kElemChunk) + (int)((tris.size() + kTriChunk - 1) / kTriChunk);
+    chunk_events_.resize(std::max<size_t>(chunk_events_.size(), (size_t)chunks));
+    for (int c = 0; c < chunks; c++) chunk_events_[c].clear();
+    return chunks;
+}
+
+void FemFrame::eval_forces(SoftBody& b, int chunk) {
     static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
-    for (size_t ei = 0; ei < elems.size(); ei++) {
+    std::vector<Event>& evs = chunk_events_[chunk];
+    const int mchunks = (int)((elems.size() + kElemChunk - 1) / kElemChunk);
+    if (chunk >= mchunks) { // (the triangles' chunks after the members')
+        eval_tris(b, chunk - mchunks, evs);
+        return;
+    }
+    const size_t e_end = std::min(elems.size(), (size_t)(chunk + 1) * kElemChunk);
+    for (size_t ei = (size_t)chunk * kElemChunk; ei < e_end; ei++) {
         FrameElement& e = elems[ei];
         Tangent& t = tan_[ei];
-        t.on = false;
+        ElemOut& o = out_[ei];
+        t.on = false, o.on = false;
         if (e.broken) continue;
         Kin k;
         if (!kinematics(*this, e, k)) continue;
@@ -503,20 +1100,40 @@ void FemFrame::compute_forces(SoftBody& b) {
                     printf("frame: member %zu (%u-%u) %s: damage %.3f, hinges %.3f %.3f, N %.0f, T %.1f\n", ei, node[e.a], node[e.b],
                            "tears off its joint", e.damage, e.dmg_a, e.dmg_b, N, T);
                 bool dup = false;
-                for (const Event& ev : events_) dup |= ev.elem == ei;
-                if (!dup) events_.push_back({(uint32_t)ei, (uint8_t)kind, 0.5f});
+                for (const Event& ev : evs) dup |= ev.elem == ei;
+                if (!dup) evs.push_back({(uint32_t)ei, (uint8_t)kind, 0.5f});
             }
         }
         // nodal forces (-B^T g) and moments: the shear of the end moments acts across the member at its current length,
         // so forces and moments balance exactly
         const float Sy = Ma.x + Mb.x, Sz = Ma.y + Mb.y;
         const vec3 fa = k.e1 * N + k.e3 * (Sy / k.L) - k.e2 * (Sz / k.L);
-        F[node[e.a]] += fa;
-        F[node[e.b]] -= fa;
-        member_f[e.a] += fa;
-        member_f[e.b] -= fa;
-        torque[e.a] += k.e1 * T - k.e2 * Ma.x - k.e3 * Ma.y;
-        torque[e.b] += k.e1 * (-T) - k.e2 * Mb.x - k.e3 * Mb.y;
+        o.on = true;
+        o.fa = fa;
+        o.ta = k.e1 * T - k.e2 * Ma.x - k.e3 * Ma.y;
+        o.tb = k.e1 * (-T) - k.e2 * Mb.x - k.e3 * Mb.y;
+        // a mount that lets go: past the section's break force at its ends (axial and shear) for a while it tears off
+        // its end a (the overload over time: a bolt yields before it breaks. On the peak alone the stiff frame's ringing
+        // as a car dropped 5 m landed on its wheels tore all four doors off, the hood and the fenders)
+        if (s.break_force > 0 && b.allow_break && !(e.torn & 1)) {
+            const float fl = length(fa);
+            e.overload = std::max(0.0f, e.overload + (fl / s.break_force - 1.0f) * (last_h_ > 0 ? last_h_ : 5e-4f));
+            if (e.overload > kOverloadTime) {
+                bool dup = false;
+                for (const Event& ev : evs) dup |= ev.elem == ei;
+                if (!dup) evs.push_back({(uint32_t)ei, (uint8_t)1, 0.5f});
+                if (dbg) printf("frame: member %zu (%u-%u) lets go at %.0f N (breaks at %.0f)\n", ei, node[e.a], node[e.b], fl, s.break_force);
+            }
+        }
+        // a released end's damping: its node's turning against the member's (the welded end's node), both ways
+        if (s.joint_damp > 0 && (e.end_a != FJ_RIGID) != (e.end_b != FJ_RIGID)) {
+            const uint32_t fr = e.end_a != FJ_RIGID ? e.a : e.b, fw = fr == e.a ? e.b : e.a;
+            if (welded_[fr] && welded_[fw]) {
+                const vec3 tq = (w[fr] - w[fw]) * -s.joint_damp;
+                if (fr == e.a) o.ta += tq, o.tb -= tq;
+                else o.tb += tq, o.ta -= tq;
+            }
+        }
         // the plastic rotations into the rest frames (E_a = E exp(r_a): turned by -p there, it measures r_a - p; the
         // co-rotated frame, their mean on the chord, moves only by a second-order twist); the twist half into each end
         const float kBake = 0.02f;
@@ -546,6 +1163,39 @@ void FemFrame::compute_forces(SoftBody& b) {
         if (t.elastic_hold > 0) t.elastic_hold--, t.unload = t.yield;
         t.ma = Ma, t.mb = Mb, t.N = N, t.T = T;
     }
+}
+
+void FemFrame::end_forces(SoftBody& b) {
+    vec3* F = b.force.data();
+    for (size_t ei = 0; ei < elems.size() && ei < out_.size(); ei++) {
+        const ElemOut& o = out_[ei];
+        if (!o.on) continue;
+        const FrameElement& e = elems[ei];
+        F[node[e.a]] += o.fa;
+        F[node[e.b]] -= o.fa;
+        member_f[e.a] += o.fa;
+        member_f[e.b] -= o.fa;
+        torque[e.a] += o.ta;
+        torque[e.b] += o.tb;
+    }
+    for (size_t ti = 0; ti < tris.size() && ti < tri_out_.size(); ti++) {
+        const TriOut& o = tri_out_[ti];
+        if (!o.on) continue;
+        const FrameTri& t = tris[ti];
+        for (int i = 0; i < 3; i++) {
+            F[node[t.n[i]]] += o.f[i];
+            member_f[t.n[i]] += o.f[i];
+            torque[t.n[i]] += o.t[i];
+        }
+    }
+    if (!mounts.empty()) mount_forces(b);
+    const size_t chunks = (elems.size() + kElemChunk - 1) / kElemChunk + (tris.size() + kTriChunk - 1) / kTriChunk;
+    for (size_t c = 0; c < chunks && c < chunk_events_.size(); c++)
+        for (const Event& x : chunk_events_[c]) {
+            bool dup = false;
+            for (const Event& ev : events_) dup |= ev.elem == x.elem && (ev.kind == 4) == (x.kind == 4);
+            if (!dup) events_.push_back(x);
+        }
 }
 
 FemFrame::Tangent FemFrame::effective(const Tangent& t) const {
@@ -675,18 +1325,46 @@ void FemFrame::hold(SoftBody& b, float step) {
 }
 
 void FemFrame::solve(SoftBody& b, float h, float step, float theta, float dissipation) {
-    if (!ready_ || node.empty()) return;
-    const int n = (int)node.size();
+    const int nc = solve_begin(b, h, step, theta, dissipation);
+    for (int c = 0; c < nc; c++) solve_component(b, c);
+    solve_end(b);
+}
+
+int FemFrame::solve_begin(SoftBody& b, float h, float step, float theta, float dissipation) {
+    if (!ready_ || node.empty()) return 0;
+    last_h_ = h;
     impulse.resize(node.size(), vec3(0));
     dissipation = std::clamp(dissipation, 0.0f, 1.0f);
     theta = std::clamp(theta, 0.25f + 0.5f * dissipation, 1.0f); // (unconditionally stable)
-    std::vector<char>& fixed = fixed_;
-    fixed.assign(n, 0);
-    const vec3* F = b.force.data();
+    fixed_.assign(node.size(), 0);
+    sv_.h = h, sv_.step = step, sv_.theta = theta, sv_.dissipation = dissipation;
     // (a sub-cycled body's contacts with other bodies, held over its short steps: World::step_island)
-    const vec3* E = h > step && b.ext_force.size() == b.nodes.size() ? b.ext_force.data() : nullptr;
+    sv_.ext = h > step && b.ext_force.size() == b.nodes.size() ? b.ext_force.data() : nullptr;
+    w0_ = w;
+    comp_stats_.assign(comp_range_.size(), CompStats());
+    return (int)comp_range_.size();
+}
+
+void FemFrame::solve_end(SoftBody&) {
+    for (const CompStats& cs : comp_stats_) solve_failures += cs.failures, clamps += cs.clamps, passes_ += cs.passes;
+    for (vec3& t : torque) t = vec3(0); // (torques from outside, e.g. the tests, add up until the next step)
+    for (vec3& c : contact_n) c = vec3(0);
+    for (vec3& c : contact_f) c = vec3(0);
+}
+
+// One component's implicit step: its nodes are the range [k0, k1) of the permuted order, its pattern closed in it
+void FemFrame::solve_component(SoftBody& b, int comp) {
+    const float h = sv_.h, step = sv_.step, theta = sv_.theta, dissipation = sv_.dissipation;
+    std::vector<char>& fixed = fixed_;
+    const vec3* F = b.force.data();
+    const vec3* E = sv_.ext;
+    const int k0 = comp_range_[comp].first, k1 = comp_range_[comp].second;
+    const std::vector<uint32_t>& celems = comp_elems_[comp];
+    std::vector<Changed>& changed = comp_changed_[comp];
+    CompStats& st = comp_stats_[comp];
+    const size_t d0 = (size_t)k0 * 36, d1 = (size_t)k1 * 36, o0 = (size_t)col_ptr_[k0] * 36, o1 = (size_t)col_ptr_[k1] * 36, r0 = (size_t)k0 * 6, r1 = (size_t)k1 * 6;
     bool any_yield = false;
-    for (const Tangent& t : tan_) any_yield |= t.on && t.yield;
+    for (uint32_t ei : celems) any_yield |= tan_[ei].on && tan_[ei].yield;
     const double h2 = (double)theta * h * h, hd = (double)dissipation * h * h;
     // a member into the system (D, O, R: the diagonal and off-diagonal blocks and the right side): the matrix takes
     // (theta h^2 + beta h) K + theta h^2 Kg, the right side -(theta_d h^2 + beta h) K v (theta_d: numerical dissipation;
@@ -739,27 +1417,28 @@ void FemFrame::solve(SoftBody& b, float h, float step, float theta, float dissip
             add_block(Of + (size_t)p * 36, ro, co, -1.0);
         }
     };
-    changed_.clear();
+    changed.clear();
     for (int pass = 0; pass < 3; pass++) {
     PROFILE_ACCUM("Frame assemble");
-    passes_++;
+    st.passes++;
     if (pass > 0) {
         // again with the unloaded hinges' elastic tangents: those members' change into the system assembled before
         // (kept: the factorization works in place), not the whole assembly again
-        for (const Changed& ch : changed_) {
+        for (const Changed& ch : changed) {
             Tangent was = tan_[ch.elem];
             was.unload = ch.unload;
             add_member(ch.elem, effective(was), -1.0, false, diagA_.data(), offA_.data(), rhsA_.data());
             add_member(ch.elem, effective(tan_[ch.elem]), 1.0, false, diagA_.data(), offA_.data(), rhsA_.data());
         }
-        changed_.clear();
-        std::copy(diagA_.begin(), diagA_.end(), diag_.begin());
-        std::copy(offA_.begin(), offA_.end(), off_.begin());
-        std::copy(rhsA_.begin(), rhsA_.end(), rhs_.begin());
+        changed.clear();
+        std::copy(diagA_.begin() + d0, diagA_.begin() + d1, diag_.begin() + d0);
+        std::copy(offA_.begin() + o0, offA_.begin() + o1, off_.begin() + o0);
+        std::copy(rhsA_.begin() + r0, rhsA_.begin() + r1, rhs_.begin() + r0);
     } else {
-    std::fill(diag_.begin(), diag_.end(), 0.0);
-    std::fill(off_.begin(), off_.end(), 0.0);
-    for (int i = 0; i < n; i++) {
+    std::fill(diag_.begin() + d0, diag_.begin() + d1, 0.0);
+    std::fill(off_.begin() + o0, off_.begin() + o1, 0.0);
+    for (int kk = k0; kk < k1; kk++) {
+        const int i = perm_[kk];
         const Node& x = b.nodes[node[i]];
         const int k = iperm_[i];
         double* D = &diag_[(size_t)k * 36];
@@ -806,13 +1485,77 @@ void FemFrame::solve(SoftBody& b, float h, float step, float theta, float dissip
             }
         }
     }
-    for (size_t ei = 0; ei < elems.size(); ei++) {
+    for (uint32_t ei : celems) {
         if (!tan_[ei].on || elems[ei].broken) continue;
         add_member(ei, effective(tan_[ei]), 1.0, true, diag_.data(), off_.data(), rhs_.data());
     }
+    // the triangles: their local stiffness turned into the world's axes, block by block (R K_ij R^T, R the element's
+    // axes for the translations and the rotations alike), with the geometric stiffness of their tension
+    for (uint32_t ti : comp_tris_[comp]) {
+        const TriTan& tg = tri_tan_[ti];
+        const FrameTri& t = tris[ti];
+        if (!tg.on || t.broken || !tri_k_ok_[ti]) continue;
+        double Kl[18][18];
+        unpack_k(&tri_k_[(size_t)ti * kTriK], Kl);
+        const double beta = (double)shell_sections[t.section].damping * h;
+        const double c = h2 + beta, cr = hd + beta;
+        const double E[3][3] = {{tg.e1.x, tg.e2.x, tg.e3.x}, {tg.e1.y, tg.e2.y, tg.e3.y}, {tg.e1.z, tg.e2.z, tg.e3.z}}; // (E[p][a]: axis a)
+        bool fx[3];
+        int kk[3];
+        for (int i = 0; i < 3; i++) fx[i] = fixed[t.n[i]], kk[i] = iperm_[t.n[i]];
+        // the material damping's part of the right side: -(theta_d h^2 + beta h) K v, in the element's axes
+        if (cr != 0) {
+            double vl[18], fl[18];
+            for (int i = 0; i < 3; i++) {
+                const vec3 v = b.nodes[node[t.n[i]]].v, om = w[t.n[i]];
+                for (int a = 0; a < 3; a++) {
+                    vl[6 * i + a] = E[0][a] * v.x + E[1][a] * v.y + E[2][a] * v.z;
+                    vl[6 * i + 3 + a] = E[0][a] * om.x + E[1][a] * om.y + E[2][a] * om.z;
+                }
+            }
+            for (int r = 0; r < 18; r++) {
+                double v = 0;
+                for (int q = 0; q < 18; q++) v += Kl[r][q] * vl[q];
+                fl[r] = v;
+            }
+            for (int i = 0; i < 3; i++) {
+                if (fx[i]) continue;
+                double* R = &rhs_[(size_t)kk[i] * 6];
+                for (int p = 0; p < 3; p++) {
+                    R[p] -= cr * (E[p][0] * fl[6 * i] + E[p][1] * fl[6 * i + 1] + E[p][2] * fl[6 * i + 2]);
+                    R[3 + p] -= cr * (E[p][0] * fl[6 * i + 3] + E[p][1] * fl[6 * i + 4] + E[p][2] * fl[6 * i + 5]);
+                }
+            }
+        }
+        // the block of corners (i, j) in the world's axes, times c, into D (row-major 6 x 6)
+        auto block = [&](int i, int j, double* D, double gsign) {
+            for (int ra = 0; ra < 2; ra++)
+                for (int cb = 0; cb < 2; cb++) {
+                    double T[3][3];
+                    const int r0 = 6 * i + 3 * ra, c0 = 6 * j + 3 * cb;
+                    for (int p = 0; p < 3; p++)
+                        for (int bb = 0; bb < 3; bb++) T[p][bb] = E[p][0] * Kl[r0][c0 + bb] + E[p][1] * Kl[r0 + 1][c0 + bb] + E[p][2] * Kl[r0 + 2][c0 + bb];
+                    for (int p = 0; p < 3; p++)
+                        for (int q = 0; q < 3; q++) D[(3 * ra + p) * 6 + 3 * cb + q] += c * (T[p][0] * E[q][0] + T[p][1] * E[q][1] + T[p][2] * E[q][2]);
+                }
+            const double g = gsign * h2 * tg.g[i][j];
+            if (g != 0)
+                for (int p = 0; p < 3; p++) D[p * 7] += g;
+        };
+        for (int i = 0; i < 3; i++)
+            if (!fx[i]) block(i, i, &diag_[(size_t)kk[i] * 36], 1.0);
+        for (int e = 0; e < 3; e++) {
+            const int i = e, j = (e + 1) % 3, p = tri_block_[ti][e];
+            if (p < 0 || fx[i] || fx[j]) continue;
+            // (the block's row is the later corner in the order)
+            if (tri_swap_[ti][e]) block(i, j, &off_[(size_t)p * 36], 1.0);
+            else block(j, i, &off_[(size_t)p * 36], 1.0);
+        }
+    }
     // the body's springs on frame nodes: (theta h^2 k + h d) e e^T, their tangent now (a shock past or near its bound:
     // the bound's stiffness; a slack rope: none)
-    for (const Link& l : links_) {
+    for (uint32_t li : comp_links_[comp]) {
+        const Link& l = links_[li];
         if (l.beam >= b.beams.size()) continue;
         const Beam& bm = b.beams[l.beam];
         if (bm.flags & BF_BROKEN) continue;
@@ -849,19 +1592,45 @@ void FemFrame::solve(SoftBody& b, float h, float step, float theta, float dissip
                 for (int j = 0; j < 3; j++) O[i * 6 + j] -= c * ee[i] * ee[j];
         }
     }
-    if (any_yield) diagA_ = diag_, offA_ = off_, rhsA_ = rhs_;
+    // the released ends' damping (compute_forces put its torque from the velocities before the step in): h c on the
+    // two nodes' turning, against each other, so it takes the turning after the step (explicit, a hinge of 2 N m s/rad
+    // on a lid's light frame node spun it up and the lid's hinges tore off as the car stood)
+    if (welded_.size() == node.size())
+        for (uint32_t ei : celems) {
+            const FrameElement& e = elems[ei];
+            const FrameSection& s = sections[e.section];
+            if (e.broken || !(s.joint_damp > 0) || (e.end_a != FJ_RIGID) == (e.end_b != FJ_RIGID) || !welded_[e.a] || !welded_[e.b]) continue;
+            const double c = (double)h * s.joint_damp;
+            for (uint32_t fn : {e.a, e.b})
+                if (!fixed[fn])
+                    for (int i = 3; i < 6; i++) diag_[(size_t)iperm_[fn] * 36 + i * 7] += c;
+            if (const int p = elem_block_[ei]; p >= 0 && !fixed[e.a] && !fixed[e.b])
+                for (int i = 3; i < 6; i++) off_[(size_t)p * 36 + i * 7] -= c;
+        }
+    // the damped mounts' ends: h c on the node's turning against the other end's at the step's start (that end in another
+    // component's system: each side implicit on its own)
+    for (const MountDamp& md : comp_mdamp_[comp]) {
+        if (fixed[md.self] || md.mount >= mounts.size() || mounts[md.mount].broken) continue;
+        const double c = (double)h * md.damp;
+        const size_t ks = (size_t)iperm_[md.self];
+        const vec3 dw = w0_[md.self] - w0_[md.other];
+        for (int i = 3; i < 6; i++) diag_[ks * 36 + i * 7] += c;
+        rhs_[ks * 6 + 3] -= c * dw.x, rhs_[ks * 6 + 4] -= c * dw.y, rhs_[ks * 6 + 5] -= c * dw.z;
+    }
+    if (any_yield) {
+        std::copy(diag_.begin() + d0, diag_.begin() + d1, diagA_.begin() + d0);
+        std::copy(off_.begin() + o0, off_.begin() + o1, offA_.begin() + o0);
+        std::copy(rhs_.begin() + r0, rhs_.begin() + r1, rhsA_.begin() + r0);
+    }
     }
     // block Cholesky, right-looking over the precomputed pattern (the diagonal blocks' inverse diagonals kept)
     PROFILE_ACCUM("Frame factor");
-    for (int k = 0; k < n; k++) {
+    for (int k = k0; k < k1; k++) {
         double* Lkk = &diag_[(size_t)k * 36];
         double* dk = &dinv_[(size_t)k * 6];
         if (!chol6(Lkk, dk)) {
-            solve_failures++;
-            for (vec3& t : torque) t = vec3(0);
-            for (vec3& c : contact_n) c = vec3(0);
-            for (vec3& c : contact_f) c = vec3(0);
-            for (vec3& J : impulse) J = vec3(0);
+            st.failures++;
+            for (int kk = k0; kk < k1; kk++) impulse[perm_[kk]] = vec3(0);
             return; // (the members' forces stay in b.force: an explicit step this once)
         }
         for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) {
@@ -875,7 +1644,7 @@ void FemFrame::solve(SoftBody& b, float h, float step, float theta, float dissip
         }
     }
     // L L^T x = r
-    for (int k = 0; k < n; k++) {
+    for (int k = k0; k < k1; k++) {
         double* y = &rhs_[(size_t)k * 6];
         forward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], y);
         for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) {
@@ -888,7 +1657,7 @@ void FemFrame::solve(SoftBody& b, float h, float step, float theta, float dissip
             }
         }
     }
-    for (int k = n - 1; k >= 0; k--) {
+    for (int k = k1 - 1; k >= k0; k--) {
         double* x = &rhs_[(size_t)k * 6];
         for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) {
             const double* L = &off_[(size_t)p * 36];
@@ -913,7 +1682,7 @@ void FemFrame::solve(SoftBody& b, float h, float step, float theta, float dissip
         v = b.nodes[node[fn]].v + vec3((float)x[0], (float)x[1], (float)x[2]);
         om = w[fn] + vec3((float)x[3], (float)x[4], (float)x[5]);
     };
-    for (size_t ei = 0; ei < elems.size(); ei++) {
+    for (uint32_t ei : celems) {
         Tangent& t = tan_[ei];
         const uint8_t y = (uint8_t)(t.yield & ~t.unload);
         if (!t.on || !y || elems[ei].broken) continue;
@@ -929,36 +1698,37 @@ void FemFrame::solve(SoftBody& b, float h, float step, float theta, float dissip
         if ((y & 2) && dot(rb, t.mb) < 0) u |= 2;
         if ((y & 4) && dot(t.e1, dv) * t.N < 0) u |= 4;
         if ((y & 8) && dot(t.e1, wb - wa) * t.T < 0) u |= 8;
-        if (u) changed_.push_back({(uint32_t)ei, t.unload}), t.unload |= u, t.elastic_hold = 16, again = true;
+        if (u) changed.push_back({(uint32_t)ei, t.unload}), t.unload |= u, t.elastic_hold = 16, again = true;
     }
     if (!again) break;
     }
     // the new velocities: to the body's integrator as a force, the rotations advanced here
     vec3* Fw = b.force.data();
-    for (int i = 0; i < n; i++) {
+    for (int kk = k0; kk < k1; kk++) {
+        const int i = perm_[kk];
         if (fixed[i]) {
             w[i] = vec3(0);
             continue;
         }
-        const double* x = &rhs_[(size_t)iperm_[i] * 6];
+        const double* x = &rhs_[(size_t)kk * 6];
         const Node& nd = b.nodes[node[i]];
         vec3 dv((float)x[0], (float)x[1], (float)x[2]);
         const vec3 dw((float)x[3], (float)x[4], (float)x[5]);
         if (!std::isfinite(dv.x + dv.y + dv.z + dw.x + dw.y + dw.z)) {
-            solve_failures++;
+            st.failures++;
             continue;
         }
         // (safety: no real impact changes a node's velocity by 40 m/s in a step or spins it past 3000 rad/s; a node
         // squeezed between heavy bodies by stiff contacts could, and would fling the frame apart)
         const float kMaxDv = 40.0f, kMaxW = 3000.0f;
-        if (const float l = length(dv); l > kMaxDv) dv *= kMaxDv / l, clamps++;
+        if (const float l = length(dv); l > kMaxDv) dv *= kMaxDv / l, st.clamps++;
         Fw[node[i]] = dv * (nd.mass / step);
         w[i] += dw;
-        if (const float l = length(w[i]); l > kMaxW) w[i] *= kMaxW / l, clamps++;
+        if (const float l = length(w[i]); l > kMaxW) w[i] *= kMaxW / l, st.clamps++;
+        static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
+        if (dbg && (length(dv) >= kMaxDv * 0.999f || length(w[i]) >= kMaxW * 0.999f))
+            printf("frame: node %u (component %d of %d nodes) clamped: dv %.1f m/s, spin %.0f rad/s\n", node[i], comp, k1 - k0, length(dv), length(w[i]));
     }
-    for (vec3& t : torque) t = vec3(0); // (torques from outside, e.g. the tests, add up until the next step)
-    for (vec3& c : contact_n) c = vec3(0);
-    for (vec3& c : contact_f) c = vec3(0);
 }
 
 void FemFrame::node_inertia(uint32_t fn, const SoftBody& b) {
@@ -967,6 +1737,9 @@ void FemFrame::node_inertia(uint32_t fn, const SoftBody& b) {
     float I = 0;
     for (const FrameElement& e : elems)
         if (!e.broken && (e.a == fn || e.b == fn)) I += element_mass(e) * e.L0 * e.L0 / 78.0f;
+    // (a triangle's corner: its third of the mass over its third of the area, as a patch turning about its middle)
+    for (const FrameTri& t : tris)
+        if (!t.broken && (t.n[0] == fn || t.n[1] == fn || t.n[2] == fn)) I += t.mass * t.area0 / 108.0f;
     const float mn = node[fn] < b.nodes.size() ? b.nodes[node[fn]].mass : 0.0f;
     inertia[fn] = std::max(I, std::max(1e-6f, mn * 1e-4f));
 }
@@ -974,6 +1747,7 @@ void FemFrame::node_inertia(uint32_t fn, const SoftBody& b) {
 int FemFrame::members_at(uint32_t fn) const {
     int n = 0;
     for (const FrameElement& e : elems) n += !e.broken && (e.a == fn || e.b == fn);
+    for (const FrameTri& t : tris) n += !t.broken && (t.n[0] == fn || t.n[1] == fn || t.n[2] == fn); // (a shell's corner)
     return n;
 }
 
@@ -1095,10 +1869,30 @@ bool FemFrame::tear(SoftBody& b, uint32_t ei, int end) {
 bool FemFrame::process_events(SoftBody& b) {
     if (events_.empty()) return false;
     const size_t n0 = b.nodes.size();
+    // the shocks' seats before the first tear: the members at each end's frame node
+    for (Shock& s : b.shocks)
+        if (s.seat[0] == 255 && s.beam < b.beams.size()) {
+            const int sa = slot(b.beams[s.beam].a), sb = slot(b.beams[s.beam].b);
+            s.seat[0] = sa < 0 ? 0 : (uint8_t)std::clamp(members_at((uint32_t)sa), 1, 254);
+            s.seat[1] = sb < 0 ? 0 : (uint8_t)std::clamp(members_at((uint32_t)sb), 1, 254);
+        }
     std::vector<Event> ev;
     ev.swap(events_);
+    static const bool tdbg = getenv("BL_FRAMEDBG") != nullptr;
     for (const Event& x : ev) {
         switch (x.kind) {
+        case 4: // a triangle torn out of the shell: its corners stay, with their mass
+            if (x.elem < tris.size() && !tris[x.elem].broken) {
+                FrameTri& t = tris[x.elem];
+                t.broken = true;
+                if (t.coll >= 0 && t.coll < (int)b.tris.size()) b.tris[t.coll].torn = true;
+                tris_torn++;
+                b.stats.broken_beams++;
+                debris_check = true;
+                ready_ = false;
+                if (tdbg) printf("frame: triangle %u (%u %u %u) torn out: plastic strain %.3f\n", x.elem, node[t.n[0]], node[t.n[1]], node[t.n[2]], t.dmg);
+            }
+            break;
         case 0: split(b, x.elem, x.t); break;
         case 1: tear(b, x.elem, 0); break;
         case 2: tear(b, x.elem, 1); break;
@@ -1108,6 +1902,44 @@ bool FemFrame::process_events(SoftBody& b) {
             break;
         }
     }
+    // a mount whose seat tore (a member torn off one of its nodes) lets go
+    static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
+    for (size_t i = 0; i < mounts.size(); i++) {
+        FrameMount& m = mounts[i];
+        if (m.broken || !m.made) continue;
+        bool torn = false;
+        const int na = std::max(1, m.na);
+        for (int j = 0; j < na && !torn; j++) {
+            const int sj = slot(m.na > 0 ? m.an[j] : m.a);
+            torn = sj < 0 || members_at((uint32_t)sj) < m.members[j];
+        }
+        const int sb = slot(m.b);
+        torn |= sb < 0 || members_at((uint32_t)sb) < m.members[4];
+        if (!torn) continue;
+        if (dbg) printf("frame: mount %zu (%u-%u) lets go at %.0f N (breaks at %.0f): its seat tore\n", i, m.a, m.b, m.f, m.brk);
+        m.broken = true;
+        mounts_broken++;
+        b.stats.broken_beams++;
+        debris_check = true;
+        ready_ = false;
+    }
+    // and a shock whose seat tore down to a member or none: the node left on it hung on its spring and bump stop (the
+    // Buggy's shock towers torn off in a head-on: a top, half a kilo on a single tube and the stop's 2e7 N/m, flung at
+    // 400 m/s); a hub that lost its steering arm keeps its tyre's beams
+    for (size_t i = 0; i < b.shocks.size(); i++) {
+        const Shock& s = b.shocks[i];
+        if (s.beam >= b.beams.size() || (b.beams[s.beam].flags & BF_BROKEN)) continue;
+        bool torn = false;
+        for (int e = 0; e < 2 && !torn; e++) {
+            if (s.seat[e] == 0 || s.seat[e] == 255) continue;
+            const int sl = slot(e ? b.beams[s.beam].b : b.beams[s.beam].a);
+            torn = sl < 0 || (members_at((uint32_t)sl) < s.seat[e] && members_at((uint32_t)sl) <= 1);
+        }
+        if (!torn) continue;
+        if (dbg) printf("frame: shock %zu (%u-%u) lets go: its seat tore\n", i, b.beams[s.beam].a, b.beams[s.beam].b);
+        b.beams[s.beam].flags |= BF_BROKEN;
+        b.stats.broken_beams++;
+    }
     if (!ready_) {
         // the frame nodes' pattern again (their orientation, velocities and positions are kept)
         torque.resize(node.size(), vec3(0));
@@ -1115,6 +1947,7 @@ bool FemFrame::process_events(SoftBody& b) {
         body_ = &b;
         analyse();
         tan_.assign(elems.size(), Tangent());
+        tri_tan_.assign(tris.size(), TriTan());
         ready_ = true;
     }
     return b.nodes.size() != n0;
@@ -1143,6 +1976,10 @@ void FemFrame::compact(SoftBody& b) {
     for (const FrameElement& e : elems)
         if (!e.broken) es.push_back(e);
     for (const FrameElement& e : es) keep[e.a] = keep[e.b] = 0;
+    std::vector<FrameTri> ts;
+    for (const FrameTri& t : tris)
+        if (!t.broken) ts.push_back(t);
+    for (const FrameTri& t : ts) keep[t.n[0]] = keep[t.n[1]] = keep[t.n[2]] = 0;
     std::vector<uint32_t> nn;
     std::vector<quat> qq;
     std::vector<vec3> ww, tt, cc, jj;
@@ -1156,17 +1993,22 @@ void FemFrame::compact(SoftBody& b) {
         xx.insert(xx.end(), {xd[i * 3], xd[i * 3 + 1], xd[i * 3 + 2]});
     }
     for (FrameElement& e : es) e.a = (uint32_t)keep[e.a], e.b = (uint32_t)keep[e.b];
+    for (FrameTri& t : ts)
+        for (uint32_t& v : t.n) v = (uint32_t)keep[v];
     for (uint32_t v : node)
         if (v < slot_.size()) slot_[v] = -1;
     node.swap(nn), q.swap(qq), w.swap(ww), inertia.swap(ii), torque.swap(tt), contact_n.swap(cc), impulse.swap(jj), xd.swap(xx);
     member_f.assign(node.size(), vec3(0));
     contact_f.assign(node.size(), vec3(0));
     elems.swap(es);
+    tris.swap(ts);
+    tri_k_.assign(tris.size() * kTriK, 0.0f), tri_b_.assign(tris.size() * kTriB, 0.0f), tri_k_ok_.assign(tris.size(), 0);
     for (size_t i = 0; i < node.size(); i++) slot_[node[i]] = (int32_t)i;
     events_.clear();
     body_ = &b;
     analyse();
     tan_.assign(elems.size(), Tangent());
+    tri_tan_.assign(tris.size(), TriTan());
     ready_ = true;
 }
 
@@ -1186,10 +2028,25 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
     std::vector<char> other(n, 0); // (held by something else than frame members)
     for (const FrameElement& e : elems)
         if (!e.broken) join(node[e.a], node[e.b]);
+    // (a shell of triangle elements stays in the body: held by them)
+    for (const FrameTri& t : tris)
+        if (!t.broken) {
+            join(node[t.n[0]], node[t.n[1]]), join(node[t.n[1]], node[t.n[2]]);
+            for (uint32_t v : t.n) other[node[v]] = 1;
+        }
+    // (a part on mounts, a sheet on welds: held by them; a part's frame and its skin go together)
+    for (const FrameMount& m : mounts)
+        if (!m.broken) join(m.a, m.b), other[m.a] = other[m.b] = 1;
+    for (const Weld& wd : b.welds) {
+        if (wd.broken) continue;
+        for (uint32_t i = wd.first; i < wd.first + wd.count && i < b.weld_nodes.size(); i++) join(wd.anchor, b.weld_nodes[i]);
+        other[wd.anchor] = 1;
+    }
     for (const Beam& bm : b.beams)
         if (!(bm.flags & BF_BROKEN)) join(bm.a, bm.b), other[bm.a] = other[bm.b] = 1;
     for (const Shell& sh : b.shells) join(sh.n[0], sh.n[1]), join(sh.n[1], sh.n[2]), other[sh.n[0]] = other[sh.n[1]] = other[sh.n[2]] = 1;
-    for (const Triangle& t : b.tris) join(t.a, t.b), join(t.b, t.c), other[t.a] = other[t.b] = other[t.c] = 1;
+    for (const Triangle& t : b.tris) // (a hull triangle holds nothing: it goes with the debris, torn)
+        if (!t.torn && t.two_sided) join(t.a, t.b), join(t.b, t.c), other[t.a] = other[t.b] = other[t.c] = 1;
     for (const Joint& j : b.joints)
         if (!j.broken && j.parent_frame < b.frames.size()) join(b.frames[j.parent_frame].node, j.child_node), other[j.child_node] = 1;
     for (const Capsule& c : b.capsules) join(c.a, c.b), other[c.a] = other[c.b] = 1;
@@ -1294,7 +2151,10 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
         nb->compute_aabb();
         out.push_back(std::move(nb));
     }
-    // in this body: the debris' nodes switched off (their indices stay: vehicles and meshes refer to nodes by number)
+    // in this body: the debris' nodes switched off (their indices stay: vehicles and meshes refer to nodes by number),
+    // the hull triangles on them torn
+    for (Triangle& t : b.tris)
+        if (!t.two_sided && ((t.a < n && new_idx[t.a] >= 0) || (t.b < n && new_idx[t.b] >= 0) || (t.c < n && new_idx[t.c] >= 0))) t.torn = true;
     for (uint32_t i = 0; i < n; i++) {
         if (new_idx[i] < 0) continue;
         Node& x = b.nodes[i];
@@ -1315,6 +2175,8 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
 void FemFrame::renumber(const SoftBody& b, const std::vector<uint32_t>& nidx) {
     for (uint32_t& v : node)
         if (v < nidx.size()) v = nidx[v];
+    for (FrameMount& m : mounts)
+        if (m.a < nidx.size() && m.b < nidx.size()) m.a = nidx[m.a], m.b = nidx[m.b];
     slot_.assign(b.nodes.size(), -1);
     for (size_t i = 0; i < node.size(); i++)
         if (node[i] < slot_.size()) slot_[node[i]] = (int32_t)i;
@@ -1363,7 +2225,21 @@ void FemFrame::split_off(SoftBody& b, const std::vector<int>& part_of, const std
         f.tan_.assign(f.elems.size(), Tangent());
         f.ready_ = true;
     }
-    // the kept frame: its nodes renumbered (those gone are unused now), then compacted
+    // (a triangle with a corner gone to a piece is torn out: the frame's triangles stay with the kept body)
+    for (FrameTri& t : tris)
+        for (uint32_t v : t.n)
+            if (!t.broken && node[v] < part_of.size() && part_of[node[v]] >= 0) {
+                t.broken = true;
+                if (t.coll >= 0 && t.coll < (int)b.tris.size()) b.tris[t.coll].torn = true;
+            }
+    // the kept frame: its nodes renumbered (those gone are unused now), then compacted; a mount with an end gone lets go
+    for (FrameMount& m : mounts) {
+        if (m.a >= part_of.size() || m.b >= part_of.size() || part_of[m.a] >= 0 || part_of[m.b] >= 0) {
+            m.broken = true;
+            continue;
+        }
+        m.a = nidx[m.a], m.b = nidx[m.b];
+    }
     for (uint32_t& v : node) v = v < part_of.size() && part_of[v] < 0 ? nidx[v] : 0;
     slot_.assign(b.nodes.size(), -1);
     compact(b);
@@ -1398,6 +2274,18 @@ int FemFrame::break_near(SoftBody& b, vec3 p, float r) {
         if (length2(a + d * t - p) > r * r) continue;
         n += cut(b, (uint32_t)ei, t);
     }
+    // the triangles within reach: torn out
+    for (FrameTri& t : tris) {
+        if (t.broken) continue;
+        vec3 bary;
+        const vec3 c = closest_on_triangle(p, b.nodes[node[t.n[0]]].p, b.nodes[node[t.n[1]]].p, b.nodes[node[t.n[2]]].p, bary);
+        if (length2(c - p) > r * r) continue;
+        t.broken = true;
+        if (t.coll >= 0 && t.coll < (int)b.tris.size()) b.tris[t.coll].torn = true;
+        tris_torn++;
+        ready_ = false;
+        n++;
+    }
     finish_cuts(b, n);
     return n;
 }
@@ -1418,6 +2306,7 @@ void FemFrame::finish_cuts(SoftBody& b, int tears) {
         body_ = &b;
         analyse();
         tan_.assign(elems.size(), Tangent());
+        tri_tan_.assign(tris.size(), TriTan());
         ready_ = true;
     }
     if (tears) b.topo_changed = true, b.topo_version++, b.shk.version++;
@@ -1430,6 +2319,30 @@ int FemFrame::repair() {
         if (!std::isfinite(w[i].x + w[i].y + w[i].z)) w[i] = vec3(0), n++;
     }
     return n;
+}
+
+double FemFrame::tri_energy(double* parts) const {
+    double U = 0;
+    if (parts) parts[0] = parts[1] = parts[2] = 0;
+    for (size_t ti = 0; ti < tris.size(); ti++) {
+        const FrameTri& t = tris[ti];
+        TriKin k;
+        if (t.broken || !tri_kinematics(*this, t, k)) continue;
+        double K[18][18];
+        tri_local_k(t.X, shell_sections[t.section], K);
+        // the parts: the dofs of the membrane (u, v), of the bending (w, theta_x, theta_y); the drilling the rest
+        auto quad = [&](int mask) {
+            double e = 0;
+            for (int i = 0; i < 18; i++)
+                for (int j = 0; j < 18; j++)
+                    if ((mask >> (i % 6) & 1) && (mask >> (j % 6) & 1)) e += k.d[i] * K[i][j] * k.d[j];
+            return 0.5 * e;
+        };
+        const double all = quad(63), mem = quad(3), bend = quad(28);
+        U += all;
+        if (parts) parts[0] += mem, parts[1] += bend, parts[2] += all - mem - bend;
+    }
+    return U;
 }
 
 double FemFrame::strain_energy(const SoftBody& b, double* parts) const {

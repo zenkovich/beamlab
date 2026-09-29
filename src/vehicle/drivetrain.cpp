@@ -2,6 +2,8 @@
 #include "core/util.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace bl {
 
@@ -428,6 +430,16 @@ void Drivetrain::update(float dt, const VehicleInput& in, SoftBody& b) {
             abs_state[i] = 1.0f;
         }
         w.brake = adb + hb;
+    }
+    // (BL_DRIVEDBG=1: the engine, the clutch and what reaches the wheels, twice a second)
+    static const bool dbg = getenv("BL_DRIVEDBG") != nullptr;
+    static float dbg_clock = 0;
+    if (dbg && (dbg_clock += dt) >= 0.5f) {
+        dbg_clock = 0;
+        printf("drive: rpm %5.0f gear %d acc %.2f clutch %.2f clutch T %6.0f wheel rpm %6.1f ground %5.2f m/s | wheels", rpm, gear, cur_acc, clutch, clutch_torque, wheel_rpm,
+               ground_speed);
+        for (size_t i = 0; i < b.wheels.size(); i++) printf(" [%.1f rad/s T %.0f tc %.2f br %.0f]", b.wheels[i].speed, b.wheels[i].torque, tc_state[i], b.wheels[i].brake);
+        printf("\n");
     }
 }
 

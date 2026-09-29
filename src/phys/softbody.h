@@ -92,6 +92,9 @@ struct Shock {
     float damp_in_slow = 1, split_in = 1, damp_in_fast = 1, damp_out_slow = 1, split_out = 1, damp_out_fast = 1;
     float short_bound = 0, long_bound = 0; // fractions of L
     float bound_spring = 9e6f, bound_damp = 12000; // target stiffness at the bump stops
+    // the members holding each end's frame node when the frame first tore (0: not a frame node, 255: not yet): torn
+    // down to one or none, the shock lets go (FemFrame::process_events)
+    uint8_t seat[2] = {255, 255};
 };
 
 // Oriented node: orientation + angular velocity for frame-based joints.
@@ -132,6 +135,9 @@ struct Joint {
 struct Triangle {
     uint32_t a, b, c;
     uint8_t surface = 0;
+    // false: a hull triangle (cab option `h`), one-sided and solid: its winding faces out, a node up to the body's
+    // hull_depth behind it over its face is pushed back out along its normal (a thin two-sided surface pushes a node
+    // that got past its middle on through: two cars' frames went through each other)
     bool two_sided = true;
     bool torn = false;     // stretched far beyond its rest size (material torn apart): no collision
     float rest_edge2 = 0;  // longest rest edge, squared
@@ -144,6 +150,41 @@ struct Triangle {
 constexpr float kMaxNodeSpeed = 400.0f;
 constexpr float kTornStretch2 = 2.5f * 2.5f;
 inline float max_edge2(vec3 a, vec3 b, vec3 c) { return std::max(length2(b - a), std::max(length2(c - b), length2(a - c))); }
+// the point of triangle a b c nearest p, and its barycentric weights for a, b, c (Ericson, Real-Time Collision
+// Detection 5.1.5)
+inline vec3 closest_on_triangle(vec3 p, vec3 a, vec3 b, vec3 c, vec3& bary) {
+    vec3 ab = b - a, ac = c - a, ap = p - a;
+    float d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0 && d2 <= 0) { bary = {1, 0, 0}; return a; }
+    vec3 bp = p - b;
+    float d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0 && d4 <= d3) { bary = {0, 1, 0}; return b; }
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+        float v = d1 / (d1 - d3);
+        bary = {1 - v, v, 0};
+        return a + ab * v;
+    }
+    vec3 cp = p - c;
+    float d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0 && d5 <= d6) { bary = {0, 0, 1}; return c; }
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+        float w = d2 / (d2 - d6);
+        bary = {1 - w, 0, w};
+        return a + ac * w;
+    }
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        bary = {0, 1 - w, w};
+        return b + (c - b) * w;
+    }
+    float denom = 1.0f / (va + vb + vc);
+    float v = vb * denom, w = vc * denom;
+    bary = {1 - v - w, v, w};
+    return a + ab * v + ac * w;
+}
 
 struct Capsule {
     uint32_t a, b;
@@ -363,6 +404,7 @@ struct Wheel {
     float mass = 0;                 // sum of tyre node masses
     // per-substep inputs (set by the vehicle controller)
     float torque = 0;               // drive torque from the differentials (N m)
+    float drive_torque = 0;         // (the drivetrain's torque for the whole substep: held for its later short steps)
     float brake = 0;                // available brake torque (N m)
     // state
     float speed = 0;                // tangential speed of the tread (m/s)
@@ -506,6 +548,24 @@ public:
     bool ductile = false;               // tensile yield doesn't weaken beams (metal sheets); RoR default = false
     bool is_static_like = false;        // anchored scenery (trees, bridges) -> sleeps aggressively
     int collision_group = 0;            // bodies with the same non-zero group don't collide
+    float hull_depth = 0.3f;            // how deep behind a hull triangle (Triangle::two_sided false) a node is still pushed out (m)
+    // how far past its box the body reaches for other bodies' nodes: its hull triangles' depth, if it has any
+    float hull_reach() const {
+        if (hull_count < 0) {
+            int n = 0;
+            for (const Triangle& t : tris) n += !t.two_sided;
+            hull_count = n;
+        }
+        return hull_count > 0 ? hull_depth : 0.0f;
+    }
+    mutable int hull_count = -1;        // (cached: the hull triangles in tris, -1 unknown)
+    // which of `tris` are the sheet's own (Shell::tri), 1 each
+    std::vector<char> shell_tri_mask() const {
+        std::vector<char> m(tris.size(), 0);
+        for (const Shell& sh : shells)
+            if (sh.tri < tris.size()) m[sh.tri] = 1;
+        return m;
+    }
 
     // runtime
     AABB aabb;
@@ -690,8 +750,15 @@ public:
     // critical. With anchor2: the point `t` of the way from the anchor to it on the member between them holds it (the
     // pull shared in that proportion). Returns false if the node is on no triangle.
     bool add_weld(uint32_t anchor, uint32_t node, float radius, float brk, float k, float h, int anchor2 = -1, float t = 0);
-    void compute_weld_forces();
-    void compute_wheel_forces(float dt);
+    // fem_torque: the step the frame's forces are computed on (its solve takes the torques then): a weld held off its
+    // anchor (a panel standing off its tube, a lamp) puts the moment of its pull on the anchor's rotation, else the
+    // offset turning with the anchor pushed the sheet without the anchor feeling it (not conservative: the frame's
+    // nodes spun up to the solver's clamps)
+    void compute_weld_forces(bool fem_torque = false);
+    // first: the substep's first short step (the drivetrain set the wheels' torque just now); a sub-cycled body (a
+    // refined sheet: 2 or 4 short steps) keeps that torque for the later ones - it was zeroed after the first, and a
+    // car whose panel had one dent drove at half power
+    void compute_wheel_forces(float dt, bool first = true);
     void compute_slide_forces();
     // Edge springs + bending hinges of the shells; overloads are queued as events.
     // Short step `step` of `sub` (of length h) in the current substep: each shell is evaluated at the rate of its
@@ -726,11 +793,19 @@ public:
     // The membrane projection of the sheets whose material has `membrane` (after the integration of a short step h):
     // returns the edges it moved.
     int project_membrane(float h);
+    int mem_moved = 0, mem_edges_out = 0; // (the last projection: edges it moved, edges it found out of their band; diagnostics)
+    // in the projection's first sweep the rate of stretch of every edge that left its band in the last 64 short steps
+    // taken down by this part (0..1): the membrane's damping. The soft springs inside the band and its hard ends made a
+    // car's welded panels rattle for good (the floors, the door glass half a millimetre a frame as it stood, the nodes'
+    // speeds up to a metre a second between); a velocity projection, stable at any step, it leaves the sheet's turning
+    // and moving whole alone
+    float membrane_damp = 0;
     std::vector<uint8_t> ground_touch;  // (a projected sheet's nodes on the ground, collide_static: bit 0 in this short
                                         // step, bit 1 in this frame)
     struct MemEdge {                    // (project_membrane's list: each edge once, its one or two triangles' slots)
         uint32_t a, b, shell;
-        uint32_t e;
+        uint32_t e : 24;
+        uint32_t hot : 8;                    // (short steps left to damp it: it left its band lately)
         uint32_t shell2 = UINT32_MAX, e2 = 0; // (the triangle across it, if any: its copy of L follows)
         float L, band, force;           // plastic rest length, yield strain x L0, the strip's yield force (N)
     };

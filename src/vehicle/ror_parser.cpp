@@ -40,7 +40,7 @@ const char* const kShock2Opts = "ismMnv";
 const char* const kShock3Opts = "imMnv";
 const char* const kHydroOpts = "jsaeruvxyghni";
 const char* const kCommandOpts = "nirfcpo";
-const char* const kCabOpts = "ncbpusrDFS";
+const char* const kCabOpts = "ncbpusrDFSh";
 const char* const kTieOpts = "nvis";
 
 // ------------------------------------------------------------------ keywords
@@ -48,7 +48,7 @@ const char* const kTieOpts = "nvis";
 enum class Kw : uint8_t {
     NONE,
     // blocks with a handler here
-    AXLES, BEAMS, BRAKES, CAB, CAMERAS, CINECAM, COMMANDS, COMMANDS2, CONTACTERS, ENGINE, ENGOPTION, FIXES, JOINTS, SHELLS, WELDS,
+    AXLES, BEAMS, BRAKES, CAB, CAMERAS, CINECAM, COMMANDS, COMMANDS2, CONTACTERS, ENGINE, ENGOPTION, FIXES, JOINTS, SHELLS, WELDS, MOUNTS, FEM_TRIS,
     FLEXBODIES, FLEXBODYWHEELS, GLOBALS, GUISETTINGS, HYDROS, MANAGEDMATERIALS, MESHWHEELS, MESHWHEELS2, MINIMASS,
     NODES, NODES2, PROPS, ROPES, SHOCKS, SHOCKS2, SHOCKS3, TEXCOORDS, TIES, TORQUECURVE, WHEELDETACHERS, WHEELS,
     WHEELS2,
@@ -67,7 +67,7 @@ enum class Kw : uint8_t {
     ADD_ANIMATION, ANTILOCKBRAKES, AUTHOR, BACKMESH, CRUISECONTROL, DEFAULT_SKIN, DETACHER_GROUP, EXTCAMERA,
     FILEFORMATVERSION, FILEINFO, FLEXBODY_CAMERA_MODE, FORSET, FORVERT, GUID, PROP_CAMERA_MODE, SECTION,
     SET_BEAM_DEFAULTS, SET_BEAM_DEFAULTS_SCALE, SET_COLLISION_RANGE, SET_DEFAULT_MINIMASS, SET_INERTIA_DEFAULTS,
-    SET_MANAGEDMATERIALS_OPTIONS, SET_NODE_DEFAULTS, SET_SHELL_MATERIAL, SET_FRAME_SECTION, SET_SKELETON_SETTINGS, SPEEDLIMITER, SUBMESH, SUBMESH_GROUNDMODEL,
+    SET_MANAGEDMATERIALS_OPTIONS, SET_NODE_DEFAULTS, SET_SHELL_MATERIAL, SET_FRAME_SECTION, SET_FEM_SHELL, SET_SKELETON_SETTINGS, SPEEDLIMITER, SUBMESH, SUBMESH_GROUNDMODEL,
     TRACTIONCONTROL,
     // terminators
     END, END_COMMENT, END_DESCRIPTION, END_SECTION,
@@ -107,7 +107,7 @@ const KwInfo kKeywords[] = {
     {"guisettings", Kw::GUISETTINGS, false}, {"help", Kw::HELP, false}, {"hideinchooser", Kw::HIDEINCHOOSER, false},
     {"hookgroup", Kw::HOOKGROUP, false}, {"hooks", Kw::HOOKS, false}, {"hydros", Kw::HYDROS, false},
     {"importcommands", Kw::IMPORTCOMMANDS, false}, {"interaxles", Kw::INTERAXLES, false},
-    {"joints", Kw::JOINTS, false}, {"welds", Kw::WELDS, false}, {"lockgroups", Kw::LOCKGROUPS, false}, {"lockgroup_default_nolock", Kw::LOCKGROUP_DEFAULT_NOLOCK, false},
+    {"joints", Kw::JOINTS, false}, {"welds", Kw::WELDS, false}, {"mounts", Kw::MOUNTS, false}, {"fem_tris", Kw::FEM_TRIS, false}, {"lockgroups", Kw::LOCKGROUPS, false}, {"lockgroup_default_nolock", Kw::LOCKGROUP_DEFAULT_NOLOCK, false},
     {"managedmaterials", Kw::MANAGEDMATERIALS, false}, {"materialflarebindings", Kw::MATERIALFLAREBINDINGS, false},
     {"meshwheels", Kw::MESHWHEELS, false}, {"meshwheels2", Kw::MESHWHEELS2, false},
     {"minimass", Kw::MINIMASS, false}, {"nodecollision", Kw::NODECOLLISION, false}, {"nodes", Kw::NODES, false},
@@ -122,7 +122,7 @@ const KwInfo kKeywords[] = {
     {"set_inertia_defaults", Kw::SET_INERTIA_DEFAULTS, true},
     {"set_managedmaterials_options", Kw::SET_MANAGEDMATERIALS_OPTIONS, true},
     {"set_node_defaults", Kw::SET_NODE_DEFAULTS, true}, {"set_shadows", Kw::SET_SHADOWS, false},
-    {"set_shell_material", Kw::SET_SHELL_MATERIAL, true}, {"set_frame_section", Kw::SET_FRAME_SECTION, true}, {"set_skeleton_settings", Kw::SET_SKELETON_SETTINGS, true}, {"shells", Kw::SHELLS, false}, {"shocks", Kw::SHOCKS, false},
+    {"set_shell_material", Kw::SET_SHELL_MATERIAL, true}, {"set_frame_section", Kw::SET_FRAME_SECTION, true}, {"set_fem_shell", Kw::SET_FEM_SHELL, true}, {"set_skeleton_settings", Kw::SET_SKELETON_SETTINGS, true}, {"shells", Kw::SHELLS, false}, {"shocks", Kw::SHOCKS, false},
     {"shocks2", Kw::SHOCKS2, false}, {"shocks3", Kw::SHOCKS3, false},
     {"slidenode_connect_instantly", Kw::SLIDENODE_CONNECT_INSTANTLY, false}, {"slidenodes", Kw::SLIDENODES, false},
     {"slopebrake", Kw::SLOPEBRAKE, true}, {"soundsources", Kw::SOUNDSOURCES, false},
@@ -358,6 +358,7 @@ private:
     int detacher_ = 0;
     int shell_mat_ = 0; // (BeamLab) the shells' material in effect: 0 the globals', k shell_materials[k - 1]
     int frame_sec_ = -1; // (BeamLab) the frame elements' section in effect (frame_sections of the module; -1: none yet)
+    int fem_shell_ = -1; // (BeamLab) the triangle elements' shell in effect (fem_shells of the module; -1: none yet)
     float default_minimass_ = -1.0f;
     bool mm_double_sided_ = false;
     bool has_submesh_ = false;
@@ -559,9 +560,16 @@ void Parser::change_module(const std::string& name) {
     // (the frame section in effect goes on in the next module, as the beam defaults do)
     const bool carry = frame_sec_ >= 0 && frame_sec_ < (int)md().frame_sections.size();
     const Document::FrameSectionDef sec = carry ? md().frame_sections[frame_sec_] : Document::FrameSectionDef();
+    const bool carry_shell = fem_shell_ >= 0 && fem_shell_ < (int)md().fem_shells.size();
+    const Document::FemShellDef shell = carry_shell ? md().fem_shells[fem_shell_] : Document::FemShellDef();
     auto enter = [&](int m) {
         cur_ = m;
         frame_sec_ = -1;
+        fem_shell_ = -1;
+        if (carry_shell) {
+            md().fem_shells.push_back(shell);
+            fem_shell_ = (int)md().fem_shells.size() - 1;
+        }
         if (carry) {
             md().frame_sections.push_back(sec);
             frame_sec_ = (int)md().frame_sections.size() - 1;
@@ -611,12 +619,28 @@ void Parser::keyword(Kw kw) {
             else d.end_a = d.end_b = phys::frame_joint(e);
         }
         if (ntok_ > 6 && f(6) > 0) d.joint_k = f(6);
+        if (ntok_ > 7 && f(7) > 0) d.brk = f(7);
+        if (ntok_ > 8 && f(8) > 0) d.joint_damp = f(8);
         if (!(d.outer > 0)) {
             warn_at(line_no_, "set_frame_section: outer size %g, using 0.04", d.outer);
             d.outer = 0.04f;
         }
         md().frame_sections.push_back(d);
         frame_sec_ = (int)md().frame_sections.size() - 1;
+        return;
+    }
+    case Kw::SET_FEM_SHELL: {
+        // (BeamLab) the shell of the triangle elements (fem_tris) that follow: material, thickness m[, r, g, b]
+        Document::FemShellDef d;
+        if (ntok_ > 1) d.material = std::string(tok_[1]);
+        if (ntok_ > 2) d.thickness = f(2);
+        if (ntok_ > 5) d.color = vec3(f(3), f(4), f(5));
+        if (!(d.thickness > 0)) {
+            warn_at(line_no_, "set_fem_shell: thickness %g, using 0.001", d.thickness);
+            d.thickness = 0.001f;
+        }
+        md().fem_shells.push_back(d);
+        fem_shell_ = (int)md().fem_shells.size() - 1;
         return;
     }
     case Kw::SET_SHELL_MATERIAL: {
@@ -912,6 +936,26 @@ void Parser::data_line() {
         if (ntok_ > 4) w.k = f(4);
         if (ntok_ > 6) w.anchor2 = ref(5), w.t = f(6);
         md().welds.push_back(w);
+        return;
+    }
+    case Kw::MOUNTS: { // (BeamLab) node a, node b, break force N[, stiffness N/m[, turning damping N m s/rad]]
+        if (!need(2)) return;
+        Document::MountDef m;
+        m.a = ref(0);
+        m.b = ref(1);
+        if (ntok_ > 2) m.brk = f(2);
+        if (ntok_ > 3) m.k = f(3);
+        if (ntok_ > 4) m.damp = f(4);
+        md().mounts.push_back(m);
+        return;
+    }
+    case Kw::FEM_TRIS: { // (BeamLab) triangle elements of the FEM frame: n1, n2, n3
+        if (!need(3)) return;
+        if (fem_shell_ < 0 || fem_shell_ >= (int)md().fem_shells.size()) {
+            md().fem_shells.push_back(Document::FemShellDef());
+            fem_shell_ = (int)md().fem_shells.size() - 1;
+        }
+        md().fem_tris.push_back({ref(0), ref(1), ref(2), fem_shell_});
         return;
     }
     case Kw::SHELLS: // (BeamLab) the cab triangles that are triangle elements: n1, n2, n3
@@ -1610,6 +1654,16 @@ void Parser::merge(const Module& m) {
     app(doc_.fixes, s.fixes);
     app(doc_.joints, s.joints);
     app(doc_.welds, s.welds);
+    app(doc_.mounts, s.mounts);
+    {
+        // (a module's triangle elements' shells follow the ones before)
+        const int off = (int)doc_.fem_shells.size();
+        for (auto t : s.fem_tris) {
+            t.shell += off;
+            doc_.fem_tris.push_back(t);
+        }
+        app(doc_.fem_shells, s.fem_shells);
+    }
     {
         // (a module's shell materials follow the ones before: its shells' indices move with them)
         const int off = (int)doc_.shell_materials.size();
@@ -1709,6 +1763,8 @@ template <class F> void Parser::for_each_ref(F&& fix) {
         fix(w.anchor), fix(w.node);
         if (w.anchor2 >= 0) fix(w.anchor2);
     }
+    for (auto& m : d.mounts) fix(m.a), fix(m.b);
+    for (auto& t : d.fem_tris) fix(t.n1), fix(t.n2), fix(t.n3);
     for (auto& s : d.slidenodes) {
         fix(s.node);
         for (int& n : s.rail) fix(n);

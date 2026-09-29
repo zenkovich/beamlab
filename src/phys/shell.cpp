@@ -1285,7 +1285,7 @@ int SoftBody::project_membrane(float h) {
                 const int j = s.nb[e];
                 if (j >= 0 && (uint32_t)j < si && shell_material(shells[j]).membrane > 0) continue; // (the one with the lower index has it)
                 MemEdge me;
-                me.a = s.n[e], me.b = s.n[nx(e)], me.shell = si, me.e = (uint32_t)e;
+                me.a = s.n[e], me.b = s.n[nx(e)], me.shell = si, me.e = (uint32_t)e, me.hot = 0;
                 me.L = s.L[e], me.band = m.yield * s.L0[e], me.force = m.membrane * s.area0 / std::max(1e-6f, s.L0[e]);
                 if (j >= 0) {
                     const Shell& t = shells[j];
@@ -1328,6 +1328,12 @@ int SoftBody::project_membrane(float h) {
     // (at rest no plastic flow, as in the hinges (shell_kernel's P.deform): a drum with rings, bent elastically with
     // its dents, pressed on its sheet for good, and the sheet flowed on under it, crept and walked)
     const bool flow = allow_deform && !(resting && max_speed < rest_plastic);
+    int out_band = 0;
+    // the membrane's damping (membrane_damp): the rate of stretch of the edges that left their band lately taken down by
+    // that part, in the first sweep (a pass of its own over the edges cost as much as the projection)
+    const float edamp = std::min(membrane_damp, 1.0f);
+    constexpr int kHot = 64; // (short steps an edge is damped after it left its band: damping every edge in a pass of its own
+                             // cost 2 ms a frame on the Frame Car)
     for (int it = 0; it < kIters; it++) {
         const int before = moved;
         for (size_t k0 = 0; k0 < ne; k0++) {
@@ -1336,7 +1342,22 @@ int SoftBody::project_membrane(float h) {
             Node& B = nd[me.b];
             const vec3 d = B.p - A.p;
             const float lo = me.L - me.band, hi = me.L + me.band, len2 = length2(d);
-            if (len2 >= lo * lo && len2 <= hi * hi) continue; // (within the band: most edges, no root)
+            const bool inside = len2 >= lo * lo && len2 <= hi * hi;
+            if (it == 0 && edamp > 0) {
+                // (the edges that left their band in the last few steps: the rattle is theirs, and the rest of the sheet
+                // skipped cheaply)
+                if (!inside) me.hot = kHot;
+                if (me.hot > 0 && len2 > 1e-14f) {
+                    const float wa = A.inv_mass, wb = B.inv_mass, w = wa + wb;
+                    if (w > 0) {
+                        const float j = edamp * dot(B.v - A.v, d) / (w * len2); // (along d / |d|: no root)
+                        A.v += d * (j * wa), B.v -= d * (j * wb);
+                    }
+                    if (inside) me.hot = me.hot - 1;
+                }
+            }
+            if (inside) continue; // (within the band: most edges, no root)
+            if (it == 0) out_band++;
             float wa = (touch[me.a] & 1) ? 0.0f : A.inv_mass, wb = (touch[me.b] & 1) ? 0.0f : B.inv_mass;
             if (wa + wb <= 0) wa = A.inv_mass, wb = B.inv_mass; // (both on the ground: as before)
             const float w = wa + wb;
@@ -1363,6 +1384,7 @@ int SoftBody::project_membrane(float h) {
         }
         if (moved == before) break;
     }
+    mem_moved = moved, mem_edges_out = out_band;
     return moved;
 }
 

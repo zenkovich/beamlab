@@ -13,17 +13,6 @@ namespace bl {
 
 using namespace phys;
 
-namespace {
-
-bool has_opt(const std::string& s, char c) { return s.find(c) != std::string::npos; }
-
-// Ogre Vector3::perpendicular
-vec3 ogre_perpendicular(vec3 a) {
-    vec3 p = cross(a, vec3(1, 0, 0));
-    if (length2(p) < 1e-12f) p = cross(a, vec3(0, 1, 0));
-    return normalize(p);
-}
-
 // Incremental 3D convex hull (small point sets). Returns CCW-outward triangles as point indices.
 std::vector<std::array<int, 3>> convex_hull(const std::vector<vec3>& pts) {
     std::vector<std::array<int, 3>> faces;
@@ -75,6 +64,18 @@ std::vector<std::array<int, 3>> convex_hull(const std::vector<vec3>& pts) {
     }
     return faces;
 }
+
+namespace {
+
+bool has_opt(const std::string& s, char c) { return s.find(c) != std::string::npos; }
+
+// Ogre Vector3::perpendicular
+vec3 ogre_perpendicular(vec3 a) {
+    vec3 p = cross(a, vec3(1, 0, 0));
+    if (length2(p) < 1e-12f) p = cross(a, vec3(0, 1, 0));
+    return normalize(p);
+}
+
 
 } // namespace
 
@@ -510,6 +511,23 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
             if (!tyre[b.n2]) mass[b.n2] += share + own;
             frame_mass[bi] = 2.0f * (share + own);
         }
+        // triangle elements (fem_tris): their own mass, rho t A, a third at each corner; the dry mass over them by their
+        // area when nothing else carries it (a body that is a shell alone)
+        double tri_area = 0;
+        for (const auto& t : d.fem_tris) {
+            if (t.n1 < 0 || t.n2 < 0 || t.n3 < 0 || t.n1 >= N || t.n2 >= N || t.n3 >= N || t.shell < 0 || t.shell >= (int)d.fem_shells.size()) continue;
+            const float A = 0.5f * length(cross(pos[t.n2] - pos[t.n1], pos[t.n3] - pos[t.n1]));
+            const auto& sh = d.fem_shells[t.shell];
+            const float own = phys::make_shell_section(sh.material, sh.thickness).mass_per_m2() * A / 3.0f;
+            for (int v : {t.n1, t.n2, t.n3}) mass[v] += own, frame_node[v] = 1;
+            tri_area += A;
+        }
+        if (all <= 0 && tri_area > 0)
+            for (const auto& t : d.fem_tris) {
+                if (t.n1 < 0 || t.n2 < 0 || t.n3 < 0 || t.n1 >= N || t.n2 >= N || t.n3 >= N) continue;
+                const float A = 0.5f * length(cross(pos[t.n2] - pos[t.n1], pos[t.n3] - pos[t.n1]));
+                for (int v : {t.n1, t.n2, t.n3}) mass[v] += (float)(d.dry_mass * A / tri_area / 3.0);
+            }
         // (the plain beams' share of the dry mass was given out against their length alone: scaled down to theirs)
         if (flen > 0 && total_len > 0)
             for (const auto& x : pb) {
@@ -540,13 +558,26 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
     int ncoll = 0;
     for (const auto& sm : d.submeshes)
         for (const auto& c : sm.cabs) {
-            if (c.options.find_first_of("cpuDFS") == std::string::npos) continue;
+            if (c.options.find_first_of("cpuDFSh") == std::string::npos) continue;
             if (c.n1 == c.n2 || c.n2 == c.n3 || c.n1 == c.n3) continue;
             if (c.n1 >= N || c.n2 >= N || c.n3 >= N) continue;
-            body.tris.push_back({(uint32_t)c.n1, (uint32_t)c.n2, (uint32_t)c.n3, SURF_METAL, true});
+            // (option h: a hull triangle - one-sided and solid, see Triangle::two_sided; it tears when an edge is stretched
+            // 2.5 times, a car cut in two leaves no triangle across the gap)
+            const bool hull = c.options.find('h') != std::string::npos;
+            body.tris.push_back({(uint32_t)c.n1, (uint32_t)c.n2, (uint32_t)c.n3, SURF_METAL, !hull, false, hull ? max_edge2(pos[c.n1], pos[c.n2], pos[c.n3]) : 0.0f});
             cab_node[c.n1] = cab_node[c.n2] = cab_node[c.n3] = true;
             ncoll++;
         }
+    // (the triangle elements are collision triangles too: two-sided; torn with them)
+    std::vector<int32_t> fem_tri_coll(d.fem_tris.size(), -1);
+    for (size_t ti = 0; ti < d.fem_tris.size(); ti++) {
+        const auto& t = d.fem_tris[ti];
+        if (t.n1 < 0 || t.n2 < 0 || t.n3 < 0 || t.n1 >= N || t.n2 >= N || t.n3 >= N || t.n1 == t.n2 || t.n2 == t.n3 || t.n1 == t.n3) continue;
+        fem_tri_coll[ti] = (int32_t)body.tris.size();
+        body.tris.push_back({(uint32_t)t.n1, (uint32_t)t.n2, (uint32_t)t.n3, SURF_METAL, true, false, max_edge2(pos[t.n1], pos[t.n2], pos[t.n3])});
+        cab_node[t.n1] = cab_node[t.n2] = cab_node[t.n3] = true;
+        ncoll++;
+    }
     for (int c : d.contacters)
         if (c >= 0 && c < N) flags[c] |= NF_CONTACTER;
     for (int i = 0; i < N; i++) {
@@ -675,6 +706,8 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
             if (sec_id[b.frame] < 0) {
                 phys::FrameSection sec = frame_secs[b.frame];
                 sec.joint_k = fs.joint_k;
+                sec.break_force = fs.brk;
+                sec.joint_damp = fs.joint_damp;
                 sec_id[b.frame] = body.fem.add_section(sec);
             }
             const uint32_t e = body.fem.add_element((uint32_t)b.n1, (uint32_t)b.n2, (uint16_t)sec_id[b.frame], (uint8_t)(b.end_a >= 0 ? b.end_a : fs.end_a),
@@ -682,8 +715,28 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
             // (the mass it put on its nodes: its share of the dry mass and its own; moved along when it splits or tears)
             body.fem.elems[e].mass = frame_mass[bi];
         }
-        body.fem.finalize(body);
+        // the parts on the frame at a distance (`mounts`): both ends frame nodes
+        for (const auto& m : d.mounts)
+            if (m.a >= 0 && m.b >= 0 && m.a < N && m.b < N && body.fem.slot((uint32_t)m.a) >= 0 && body.fem.slot((uint32_t)m.b) >= 0)
+                body.fem.add_mount((uint32_t)m.a, (uint32_t)m.b, m.brk, m.k, m.damp);
+            else
+                warnings.push_back(format("mount %d-%d: not between two frame nodes", m.a, m.b));
     }
+    // ---- triangle elements (FEM shells: phys::FrameTri) on frame nodes of their own or the members'
+    if (!d.fem_tris.empty()) {
+        std::vector<int> shell_id(d.fem_shells.size(), -1);
+        for (size_t ti = 0; ti < d.fem_tris.size(); ti++) {
+            const auto& t = d.fem_tris[ti];
+            if (fem_tri_coll[ti] < 0 || t.shell < 0 || t.shell >= (int)d.fem_shells.size()) {
+                warnings.push_back(format("fem triangle %d %d %d: degenerate or no such nodes", t.n1, t.n2, t.n3));
+                continue;
+            }
+            if (shell_id[t.shell] < 0) shell_id[t.shell] = body.fem.add_shell_section(phys::make_shell_section(d.fem_shells[t.shell].material, d.fem_shells[t.shell].thickness));
+            const uint32_t k = body.fem.add_tri((uint32_t)t.n1, (uint32_t)t.n2, (uint32_t)t.n3, (uint16_t)shell_id[t.shell], (int32_t)ti, fem_tri_coll[ti]);
+            body.fem.tris[k].mass = body.fem.shell_sections[shell_id[t.shell]].mass_per_m2() * 0.5f * length(cross(pos[t.n2] - pos[t.n1], pos[t.n3] - pos[t.n1]));
+        }
+    }
+    if (!body.fem.empty()) body.fem.finalize(body);
     drive.hydros.clear();
     for (auto& [pi, c] : hyd)
         if (beam_index[pi] >= 0) {

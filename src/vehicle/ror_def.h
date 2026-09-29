@@ -336,15 +336,20 @@ struct Document {
         int max_level = -1;
     };
     std::vector<ShellMaterialDef> shell_materials;
-    // (BeamLab) `set_frame_section material, shape, outer size m, wall m[, joints[, joint stiffness N m/rad]]`: the
-    // section of the frame elements that follow (beams with the option F: FEM beams). shape: tube, box, rod, bar;
-    // joints (both ends, or `a/b`): rigid, ball (or pinned), hinge_v, hinge_h, swivel, elastic; pinned1 / pinned2: a
-    // ball at one end. A frame element's line may name its own: `n1, n2, F[, joint a[, joint b]]`
+    // (BeamLab) `set_frame_section material, shape, outer size m, wall m[, joints[, joint stiffness N m/rad[, break
+    // force N[, joint damping N m s/rad]]]]`: the section of the frame elements that follow (beams with the option F:
+    // FEM beams). shape: tube, box, rod, bar; joints (both ends, or `a/b`): rigid, ball (or pinned), hinge_v, hinge_h,
+    // swivel, elastic; pinned1 / pinned2: a ball at one end. A frame element's line may name its own:
+    // `n1, n2, F[, joint a[, joint b]]`. Break force: the member tears off its end a when the force at its ends passes
+    // it (a bolted mount, a hinge that lets a door go); joint damping: a released end resists turning (a ball joint's
+    // friction, a hinge's)
     struct FrameSectionDef {
         std::string material = "Steel", shape = "tube";
         float outer = 0.04f, wall = 0.002f;
         int end_a = 0, end_b = 0;   // phys::FrameJoint
         float joint_k = 2.0e4f;     // elastic joints (N m/rad)
+        float brk = 0;              // break force (N), 0: none
+        float joint_damp = 0;       // released joints' damping (N m s/rad)
     };
     std::vector<FrameSectionDef> frame_sections;
     // (BeamLab) `welds`: anchor, sheet node, radius m, break force N[, stiffness N/m[, anchor2, t]]: the sheet held on a frame node (or the point t of the way to anchor2) at
@@ -357,6 +362,29 @@ struct Document {
         float t = 0;
     };
     std::vector<WeldDef> welds;
+    // (BeamLab) `mounts`: node a, node b, break force N[, stiffness N/m[, turning damping N m s/rad]]: b held at the
+    // point of a's frame where it stands (a part on the body at a distance: no member between them; phys::FrameMount),
+    // both frame nodes; no stiffness: the most the nodes' masses take at the step. A part held by mounts alone is a
+    // component of the frame solved on its own
+    struct MountDef {
+        int a = 0, b = 0;
+        float brk = 0, k = 0, damp = 0;
+    };
+    std::vector<MountDef> mounts;
+    // (BeamLab) `fem_tris`: n1, n2, n3 - triangle elements of the FEM frame (a shell: membrane and bending in the frame's
+    // implicit step; phys::FrameTri), of the `set_fem_shell material, thickness m[, r, g, b]` in effect before them (none:
+    // 1 mm steel). Their nodes are frame nodes (shared with the frame elements); their mass goes on them
+    struct FemShellDef {
+        std::string material = "Steel";
+        float thickness = 0.001f;
+        vec3 color{-1, -1, -1};     // (below 0: the vehicle's paint)
+    };
+    std::vector<FemShellDef> fem_shells;
+    struct FemTriDef {
+        int n1 = 0, n2 = 0, n3 = 0;
+        int shell = 0;              // fem_shells index
+    };
+    std::vector<FemTriDef> fem_tris;
     std::vector<JointDef> joints;
     std::vector<ShellDef> shells;
     std::vector<TieDef> ties;

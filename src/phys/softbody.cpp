@@ -314,6 +314,8 @@ void SoftBody::compute_beam_forces() {
         if (brk && std::fabs(slen) > b.strength && !(b.flags & BF_NO_BREAK)) {
             b.flags |= BF_BROKEN;
             stats.broken_beams++;
+            static const bool dbg = getenv("BL_BEAMDBG") != nullptr; // (diagnostics: which beam broke)
+            if (dbg) printf("beam %u-%u broke at %.0f N (strength %.0f)\n", b.a, b.b, std::fabs(slen), b.strength);
             continue;
         }
         b.stress = slen;
@@ -542,13 +544,15 @@ void SoftBody::compute_joint_forces() {
 
 // RoR CalcWheels: brake "stop torque", torque -> tangential tread forces, speed measurement,
 // reaction torque on the suspension arm.
-void SoftBody::compute_wheel_forces(float dt) {
+void SoftBody::compute_wheel_forces(float dt, bool first) {
     Node* nd = nodes.data();
     vec3* f = force.data();
     float speed_sum = 0, spin_sum = 0;
     int nprop = 0;
     for (Wheel& w : wheels) {
         if (w.detached || w.nodes.empty()) continue;
+        if (first) w.drive_torque = w.torque;
+        else w.torque = w.drive_torque;
         if (w.brake > 0) {
             float stop = -w.avg_speed * w.radius * w.mass / dt - w.last_retorque;
             w.torque += w.speed > 0 ? clampf(stop, -w.brake, 0.0f) : clampf(stop, 0.0f, w.brake);

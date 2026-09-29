@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace bl::phys {
 
@@ -400,6 +402,9 @@ void SoftBody::shell_eval(int chunk) {
         const bool swap = hg.meta & SK::kSwap;
         const uint32_t lo = swap ? oth : si, hi = swap ? si : oth;
         const uint32_t elo = swap ? (hg.other >> 30) : (hg.meta & 3u);
+        static const bool evdbg = getenv("BL_SHELLEVDBG") != nullptr; // (diagnostics: what overloaded)
+        if (evdbg && (std::fabs(dth) * eq > hg.lim || std::fabs(dth) * eq > M.refine_angle))
+            printf("shell hinge event: triangles %u %u fold %.3f rad (x eq %.3f) limit %.3f refine at %.3f\n", lo, hi, dth, std::fabs(dth) * eq, hg.lim, M.refine_angle);
         if (std::fabs(dth) * eq > hg.lim) {
             evH.push_back({lo * 3 + elo, hi, 1});
         } else if (std::fabs(dth) * eq > M.refine_angle && P.budget_left &&
@@ -464,6 +469,9 @@ void SoftBody::shell_eval(int chunk) {
         if (ax.cool) SH[si].cool = --ax.cool;
         if (brk && !ax.pending) {
             const bool can_refine = P.budget_left && (ax.flags & SK::kRefinable);
+            static const bool evdbg = getenv("BL_SHELLEVDBG") != nullptr;
+            if (evdbg && (worst > 1.0f || ((worst > HOT[si >> 2].rf[si & 3] || plastic) && can_refine)))
+                printf("shell edge event: triangle %u worst %.3f of the break (refine at %.3f) plastic %d edge %d\n", si, worst, HOT[si >> 2].rf[si & 3], (int)plastic, worst_e);
             if (worst > 1.0f) {
                 if (can_refine) evE.push_back({si, 0, 0});
                 else if (!ax.cool) evE.push_back({si, 1, (uint8_t)worst_e});

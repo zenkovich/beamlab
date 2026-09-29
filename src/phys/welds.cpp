@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace bl::phys {
 
@@ -45,6 +47,11 @@ bool SoftBody::add_weld(uint32_t anchor, uint32_t node, float radius, float brk,
     // (explicit: a quarter of the stable stiffness on the effective mass of the pair, anchor and centre)
     const float m_eff = 1.0f / inv_m, k_max = 0.25f * m_eff / (h * h);
     wd.k = k > 0 ? std::min(k, k_max) : k_max;
+    // (held off the anchor: the pull's moment turns the anchor, a stiffness k |off|^2 on its rotation, explicit - kept
+    // within a tenth of what the node's rotational inertia takes in a step; a lamp 20 cm off a tube's node at the
+    // full stiffness rang the node to pieces)
+    static const bool no_cap = getenv("BL_WELD_NOCAP") != nullptr; // (diagnostics)
+    if (!no_cap && wd.slot >= 0 && wd.slot < (int)fem.inertia.size() && length2(off) > 1e-8f) wd.k = std::min(wd.k, 0.1f * fem.inertia[wd.slot] / (h * h * length2(off)));
     wd.c = 2.0f * 0.33f * std::sqrt(wd.k * m_eff);
     wd.brk = brk;
     weld_nodes.insert(weld_nodes.end(), group.begin(), group.end());
@@ -53,7 +60,7 @@ bool SoftBody::add_weld(uint32_t anchor, uint32_t node, float radius, float brk,
     return true;
 }
 
-void SoftBody::compute_weld_forces() {
+void SoftBody::compute_weld_forces(bool fem_torque) {
     Node* nd = nodes.data();
     vec3* F = force.data();
     const uint32_t* gn = weld_nodes.data();
@@ -70,11 +77,18 @@ void SoftBody::compute_weld_forces() {
         if (wd.brk > 0 && length2(fs) > wd.brk * wd.brk) {
             wd.broken = true;
             stats.broken_welds++;
+            static const bool dbg = getenv("BL_WELDDBG") != nullptr; // (which weld let go, and how far it was pulled)
+            if (dbg)
+                printf("weld %d broke: anchor %u node %u (%.2f %.2f %.2f) pulled %.1f mm, %.0f N of %.0f\n", (int)(&wd - welds.data()), wd.anchor, gn[wd.first],
+                       nd[gn[wd.first]].p.x, nd[gn[wd.first]].p.y, nd[gn[wd.first]].p.z, length(d) * 1000.0f, length(fs), wd.brk);
             continue;
         }
         const vec3 f = fs + (av - cv) * wd.c; // (on the sheet; the anchor takes it back)
         F[wd.anchor] -= f * (1 - t);
         if (t > 0) F[wd.anchor2] -= f * t;
+        // (and the moment: -dU/dtheta of 1/2 k |ap - q off - c|^2 is (q off) x f on the anchor's rotation)
+        static const bool no_torque = getenv("BL_WELD_NOTORQUE") != nullptr; // (diagnostics)
+        if (fem_torque && !no_torque && wd.slot >= 0 && wd.slot < (int)fem.torque.size()) fem.torque[wd.slot] += cross(off, f);
         for (uint32_t i = wd.first; i < wd.first + wd.count; i++) F[gn[i]] += f * gw[i];
     }
 }
