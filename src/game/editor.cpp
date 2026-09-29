@@ -5,6 +5,7 @@
 #include "core/util.h"
 #include "game/editor_internal.h"
 #include "game/game.h"
+#include "vehicle/builder.h"
 #include "vehicle/vehicle.h"
 
 #include "imgui.h"
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <functional>
 #include <map>
 #include <set>
@@ -103,6 +105,12 @@ void ModelEditor::open() {
     if (!m_model.ref_path.empty() && m_ref_loaded != m_model.ref_path) ref_load(m_model.ref_path);
     // (screenshots and scripted checks)
     if (getenv("BL_EDITOR_EMPTY")) set_model(edit::make_empty(), "");
+    if (const char* tpl = getenv("BL_EDITOR_TPL")) { // (a template: index[,nx,nz,sx,sy,sz,mm])
+        int n0 = m_tpl_n[0], n1 = m_tpl_n[1];
+        sscanf(tpl, "%d,%d,%d,%f,%f,%f,%f", &m_tpl, &n0, &n1, &m_tpl_size.x, &m_tpl_size.y, &m_tpl_size.z, &m_tpl_mm);
+        m_tpl_n[0] = n0, m_tpl_n[1] = n1;
+        set_model(make_template(m_tpl), "");
+    }
     if (const char* f = getenv("BL_EDITOR_FILE")) load(f); // (a model file as it is, not saved unless asked)
     if (const char* id = getenv("BL_EDITOR_VEHICLE")) { // (a copy of a vehicle, graphics included)
         if (const VehicleEntry* e = find_vehicle(id)) {
@@ -111,7 +119,7 @@ void ModelEditor::open() {
         }
     }
     if (getenv("BL_EDITOR_QUAD")) m_quad = true;
-    if (const char* f = getenv("BL_EDITOR_FACES")) m_face_mode = std::clamp(atoi(f), 0, 2); // (scripted checks: the shapes' faces)
+    if (const char* f = getenv("BL_EDITOR_FACES")) m_face_mode = std::clamp(atoi(f), 0, 3); // (scripted checks: the shapes' faces)
     if (const char* bb = getenv("BL_EDITOR_BARREL")) { // (scripted checks: a circle pulled into a drum, as by hand)
         float r = 0.3f, h = 0.9f, y = 0.3f;
         int sides = 16;
@@ -355,7 +363,7 @@ uint64_t ModelEditor::preview_signature() const {
     uint64_t h = mixs(1469598103934665603ull, m.home);
     h = mix(h, m.nodes.size());
     for (const edit::Node& n : m.nodes) h = mixv(h, n.p);
-    for (const edit::Tri& t : m.tris) h = mix(mix(mix(mix(mix(h, t.a), t.b), t.c), t.submesh + 7), (uint64_t)t.collision | (uint64_t)t.shell << 1);
+    for (const edit::Tri& t : m.tris) h = mix(mix(mix(mix(mix(h, t.a), t.b), t.c), t.submesh + 7), (uint64_t)t.collision | (uint64_t)t.shell << 1 | (uint64_t)t.fem << 2);
     for (const edit::Wheel& w : m.wheels) {
         h = mix(mix(mix(mix(h, w.type), w.n1), w.n2), w.rays);
         h = mixf(mixf(mixf(h, w.radius), w.rim_radius), w.width);
@@ -751,9 +759,10 @@ int ModelEditor::sel_count(SelKind k) const {
     case SelKind::Nodes: return (int)m_sel.size();
     case SelKind::Beams: return (int)m_sel_beams.size();
     case SelKind::Shells:
-    case SelKind::Cab: {
+    case SelKind::Cab:
+    case SelKind::Fem: {
         int n = 0;
-        for (int i : m_sel_tris) n += m_model.tris[i].shell == (k == SelKind::Shells);
+        for (int i : m_sel_tris) n += tri_sel_kind(m_model.tris[i]) == k;
         return n;
     }
     case SelKind::Shocks: return (int)m_sel_shocks.size();
@@ -765,8 +774,8 @@ int ModelEditor::sel_count(SelKind k) const {
 }
 
 const char* ModelEditor::sel_kind_name(SelKind k, bool many) {
-    static const char* one[] = {"node", "beam", "shell", "cab triangle", "shock", "rod", "wheel", "joint"};
-    static const char* more[] = {"nodes", "beams", "shells", "cab triangles", "shocks", "rods", "wheels", "joints"};
+    static const char* one[] = {"node", "beam", "shell", "cab triangle", "shock", "rod", "wheel", "joint", "FEM triangle"};
+    static const char* more[] = {"nodes", "beams", "shells", "cab triangles", "shocks", "rods", "wheels", "joints", "FEM triangles"};
     const int i = std::clamp((int)k, 0, (int)SelKind::Count - 1);
     return many ? more[i] : one[i];
 }
@@ -781,7 +790,7 @@ void ModelEditor::select_filter(SelKind k, bool only) {
     if (!keep(SelKind::Wheels)) m_sel_wheels.clear();
     if (!keep(SelKind::Joints)) m_sel_joints.clear();
     m_sel_tris.erase(std::remove_if(m_sel_tris.begin(), m_sel_tris.end(),
-                                    [&](int i) { return !keep(m_model.tris[i].shell ? SelKind::Shells : SelKind::Cab); }),
+                                    [&](int i) { return !keep(tri_sel_kind(m_model.tris[i])); }),
                      m_sel_tris.end());
     m_chain = m_chain_start = -1;
     m_picks.clear();
@@ -811,7 +820,7 @@ void ModelEditor::fill_selection() {
     }
     push_undo();
     std::vector<int> ids = m_sel;
-    const bool shell = m_face_mode == 2;
+    const int kind = face_kind();
     if (ids.size() == 4) {
         vec3 c(0);
         for (int i : ids) c += m_model.nodes[i].p;
@@ -822,10 +831,10 @@ void ModelEditor::fill_selection() {
             const vec3 da = m_model.nodes[a].p - c, db = m_model.nodes[b].p - c;
             return std::atan2(dot(da, v), dot(da, u)) < std::atan2(dot(db, v), dot(db, u));
         });
-        add_tri_sym(ids[0], ids[1], ids[2], shell);
-        add_tri_sym(ids[0], ids[2], ids[3], shell);
+        add_tri_sym(ids[0], ids[1], ids[2], kind);
+        add_tri_sym(ids[0], ids[2], ids[3], kind);
     } else {
-        add_tri_sym(ids[0], ids[1], ids[2], shell);
+        add_tri_sym(ids[0], ids[1], ids[2], kind);
     }
     m_status = "Filled: check the outside (the white line) and flip if needed";
 }
@@ -1073,7 +1082,7 @@ void ModelEditor::add_beam_sym(int a, int b) {
     if (x >= 0 && y >= 0 && m_model.add_beam(x, y, m_group) >= 0) m_model.beams.back().layer = m_layer;
 }
 
-void ModelEditor::add_tri_sym(int a, int b, int c, bool shell) {
+void ModelEditor::add_tri_sym(int a, int b, int c, int kind) {
     if (a == b || b == c || a == c) return;
     auto exists = [&](int x, int y, int z) {
         std::array<int, 3> k{x, y, z};
@@ -1086,8 +1095,13 @@ void ModelEditor::add_tri_sym(int a, int b, int c, bool shell) {
         return false;
     };
     edit::Tri t;
-    t.a = a, t.b = b, t.c = c, t.shell = shell, t.layer = m_layer;
-    t.shell_preset = shell ? m_shell_preset : 0;
+    t.a = a, t.b = b, t.c = c, t.shell = kind == 1, t.layer = m_layer;
+    t.shell_preset = kind == 1 ? m_shell_preset : 0;
+    if (kind == 2) { // (a FEM triangle makes its own collision surface)
+        m_model.ensure_fem_preset();
+        t.fem = true, t.collision = false;
+        t.fem_preset = std::clamp(m_fem_preset, 0, (int)m_model.fem_presets.size() - 1);
+    }
     if (!exists(a, b, c)) m_model.tris.push_back(t);
     if (!m_symmetry) return;
     const int x = twin_or_self(a), y = twin_or_self(b), z = twin_or_self(c);
@@ -1112,9 +1126,42 @@ void ModelEditor::triangulate_selection(int mode) {
         m_status = std::to_string(m_model.beams.size() - nb) + " beams laid over the selection";
     } else {
         const size_t nt = m_model.tris.size();
-        for (const auto& t : tris) add_tri_sym(t[0], t[1], t[2], mode == 2);
-        m_status = std::to_string(m_model.tris.size() - nt) + (mode == 2 ? " shell" : " cab") + " triangles laid over the selection";
+        for (const auto& t : tris) add_tri_sym(t[0], t[1], t[2], mode - 1);
+        m_status = std::to_string(m_model.tris.size() - nt) + (mode == 3 ? " FEM" : mode == 2 ? " shell" : " cab") + " triangles laid over the selection";
     }
+}
+
+void ModelEditor::hull_selection() {
+    if (m_sel.size() < 4) {
+        m_status = "A collision hull needs at least 4 selected nodes (not on one plane)";
+        return;
+    }
+    std::vector<vec3> pts;
+    for (int i : m_sel) pts.push_back(m_model.nodes[i].p);
+    const auto faces = convex_hull(pts);
+    if (faces.empty()) {
+        m_status = "The selected nodes lie on one plane: no hull";
+        return;
+    }
+    push_undo();
+    std::set<std::array<int, 3>> have;
+    for (const edit::Tri& t : m_model.tris) {
+        std::array<int, 3> k{t.a, t.b, t.c};
+        std::sort(k.begin(), k.end());
+        have.insert(k);
+    }
+    int added = 0;
+    for (const auto& f : faces) {
+        edit::Tri t;
+        t.a = m_sel[f[0]], t.b = m_sel[f[1]], t.c = m_sel[f[2]]; // (counter-clockwise from outside: facing out)
+        std::array<int, 3> k{t.a, t.b, t.c};
+        std::sort(k.begin(), k.end());
+        if (!have.insert(k).second) continue;
+        t.collision = true, t.shell = false, t.options = "ch", t.layer = m_layer;
+        m_model.tris.push_back(t);
+        added++;
+    }
+    m_status = std::to_string(added) + " hull triangles round the selection (one-sided collision, not drawn in the game)";
 }
 
 void ModelEditor::move_selection(vec3 delta) {
@@ -1179,7 +1226,7 @@ void ModelEditor::make_rect(vec3 a, vec3 b, int view) {
         for (int i = 0; i <= nx; i++) id[(size_t)j * (nx + 1) + i] = add_node(a + u * (du * i / nx) + v * (dv * j / ny), true);
     auto at = [&](int i, int j) { return id[(size_t)j * (nx + 1) + i]; };
     // shell faces hold their shape themselves (in the plane and in bending): no beams unless asked
-    const bool beams = m_face_mode != 2 || m_shell_beams;
+    const bool beams = m_face_mode < 2 || m_shell_beams;
     // a rectangle across the symmetry plane is its own mirror: its faces and braces are not mirrored again
     const bool keep_sym = m_symmetry;
     bool self_sym = m_symmetry;
@@ -1197,8 +1244,8 @@ void ModelEditor::make_rect(vec3 a, vec3 b, int view) {
                 if (m_face_mode) {
                     int p0 = at(i, j), p1 = at(i + 1, j), p2 = at(i + 1, j + 1), p3 = at(i, j + 1);
                     if (flip) std::swap(p1, p3);
-                    add_tri_sym(p0, p1, p2, m_face_mode == 2);
-                    add_tri_sym(p0, p2, p3, m_face_mode == 2);
+                    add_tri_sym(p0, p1, p2, face_kind());
+                    add_tri_sym(p0, p2, p3, face_kind());
                 }
             }
         }
@@ -1222,7 +1269,7 @@ void ModelEditor::make_circle(vec3 c, vec3 r, int view) {
     }
     const bool center = m_circle_center || m_face_mode;
     const int ci = center ? add_node(c, true) : -1;
-    const bool beams = m_face_mode != 2 || m_shell_beams; // (shell faces: no beams unless asked)
+    const bool beams = m_face_mode < 2 || m_shell_beams; // (shell and FEM faces: no beams unless asked)
     const bool keep_sym = m_symmetry;
     bool self_sym = m_symmetry;
     for (int n : ring) self_sym &= std::find(ring.begin(), ring.end(), twin_or_self(n)) != ring.end();
@@ -1234,8 +1281,8 @@ void ModelEditor::make_circle(vec3 c, vec3 r, int view) {
         if (beams) add_beam_sym(a, b);
         if (beams && ci >= 0) add_beam_sym(ci, a);
         if (m_face_mode && ci >= 0) {
-            if (flip) add_tri_sym(ci, b, a, m_face_mode == 2);
-            else add_tri_sym(ci, a, b, m_face_mode == 2);
+            if (flip) add_tri_sym(ci, b, a, face_kind());
+            else add_tri_sym(ci, a, b, face_kind());
         }
     }
     if (ci < 0 && beams) // (a ring alone needs bracing: chords across)
@@ -1315,9 +1362,12 @@ void ModelEditor::pushpull_apply(float d) {
     }
     push_undo();
     const vec3 off = m_pp_n * d;
-    const bool shell = M.tris[m_pp_region[0]].shell;
-    // a shell face makes a box of shells, which holds its shape itself: no beams unless asked (a cab face needs them)
-    const bool beams = !shell || m_shell_beams;
+    const edit::Tri& face = M.tris[m_pp_region[0]];
+    const bool shell = face.shell, fem = face.fem, coll = face.collision;
+    const int shell_preset = face.shell_preset, fem_preset = face.fem_preset;
+    // a shell (or FEM) face makes a box of shells, which holds its shape itself: no beams unless asked (a cab face
+    // needs them)
+    const bool beams = !(shell || fem) || m_shell_beams;
     auto beam = [&](int a, int b) {
         if (beams && M.add_beam(a, b, m_group) >= 0) M.beams.back().layer = m_layer;
     };
@@ -1347,7 +1397,8 @@ void ModelEditor::pushpull_apply(float d) {
         const vec3 mid = (M.nodes[a].p + M.nodes[top[b]].p) * 0.5f;
         if (dot(nn, mid - center) < 0) std::swap(t1.b, t1.c), std::swap(t2.b, t2.c);
         t1.shell = t2.shell = shell, t1.layer = t2.layer = m_layer;
-        t1.shell_preset = t2.shell_preset = M.tris[m_pp_region[0]].shell_preset;
+        t1.shell_preset = t2.shell_preset = shell_preset;
+        t1.fem = t2.fem = fem, t1.fem_preset = t2.fem_preset = fem_preset, t1.collision = t2.collision = coll;
         M.tris.push_back(t1), M.tris.push_back(t2);
     }
     // the cap: the face's triangles move up to the copies (facing out); a free face leaves a base behind

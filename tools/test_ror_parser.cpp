@@ -552,6 +552,79 @@ void test_editor_models() {
               "merge: %d gone, %zu nodes, %zu beams (expected %d), %zu tris, doubles %d", gone, m.nodes.size(), m.beams.size(), expect, m.tris.size(), (int)dup);
         printf("  merging nodes: ok\n");
     }
+    // a collision hull's triangles (option h: one-sided, solid) through the file: written with c and h, read back as
+    // collision cabs with h, imported as hull triangles again (the others stay plain cabs)
+    {
+        bl::edit::Model m = bl::edit::make_box(2, 2, 2, vec3(1, 1, 1), 100);
+        const size_t plain = m.tris.size();
+        for (auto f : {std::array<int, 3>{0, 1, 2}, std::array<int, 3>{0, 2, 3}}) {
+            bl::edit::Tri t;
+            t.a = f[0], t.b = f[1], t.c = f[2], t.options = "ch";
+            m.tris.push_back(t);
+        }
+        const std::string path = temp_file("bl_editor_hull.truck", bl::edit::write_truck(m));
+        Document d;
+        CHECK(parse_truck_file(path, d) && d.warnings.empty(), "hull model parse (%zu warnings)", d.warnings.size());
+        int with_h = 0, with_c = 0;
+        for (auto& sm : d.submeshes)
+            for (auto& c : sm.cabs) with_h += c.options.find('h') != std::string::npos, with_c += c.options.find('c') != std::string::npos;
+        bl::edit::Model back;
+        std::vector<std::string> notes;
+        CHECK(bl::edit::import_document(d, back, notes), "hull model import");
+        int hulls = 0;
+        for (const auto& t : back.tris) hulls += t.hull() && t.collision;
+        CHECK(with_h == 2 && with_c >= 2 && hulls == 2 && back.tris.size() == plain + 2, "hull triangles: %d with h, %d with c, %d read back as hull of %zu", with_h, with_c, hulls,
+              back.tris.size());
+        printf("  collision hull triangles: ok\n");
+    }
+    // mounts (a part held on the frame at a distance): node a, node b, break force[, stiffness[, turning damping]]
+    {
+        const std::string text = "Mounted\nglobals\n100, 0\nnodes\n0, 0, 0, 0\n1, 1, 0, 0\n2, 0, 1, 0\n3, 1, 1, 0\nset_frame_section Steel, tube, 0.03, 0.002\nbeams\n0, 1, F\n2, 3, F\n"
+                                 "mounts\n1, 3, 5000, 2e6, 3\n0, 2, 800\nend\n";
+        const std::string path = temp_file("bl_mounts.truck", text);
+        Document d;
+        CHECK(parse_truck_file(path, d) && d.warnings.empty(), "mounts parse (%zu warnings)", d.warnings.size());
+        CHECK(d.mounts.size() == 2 && d.mounts[0].a == 1 && d.mounts[0].b == 3 && d.mounts[0].brk == 5000 && d.mounts[0].k == 2e6f && d.mounts[0].damp == 3 &&
+                  d.mounts[1].brk == 800 && d.mounts[1].k == 0 && d.mounts[1].damp == 0,
+              "mounts read: %zu", d.mounts.size());
+        printf("  mounts: ok\n");
+    }
+    // FEM triangles: `fem_tris` with `set_fem_shell material, thickness[, r, g, b]` before its triangles (a triangle
+    // before any: the default, 1 mm steel); the editor writes them back as it read them
+    {
+        const std::string text = "Fem\nglobals\n0, 0\nnodes\n0, 0, 0, 0\n1, 1, 0, 0\n2, 0, 0, 1\n3, 1, 0, 1\n4, 1, 1, 1\nfem_tris\n0, 1, 2\n"
+                                 "set_fem_shell Aluminium, 0.002, 0.2, 0.3, 0.4\n1, 3, 2\n3, 4, 2\nend\n";
+        Document d;
+        CHECK(parse_truck_file(temp_file("bl_fem_tris.truck", text), d) && d.warnings.empty(), "fem_tris parse (%zu warnings)", d.warnings.size());
+        CHECK(d.fem_tris.size() == 3 && d.fem_shells.size() == 2 && d.fem_tris[0].shell == 0 && d.fem_tris[1].shell == 1 && d.fem_tris[2].shell == 1 &&
+                  d.fem_tris[1].n1 == 1 && d.fem_tris[1].n2 == 3 && d.fem_tris[1].n3 == 2,
+              "fem_tris read: %zu triangles, %zu shells", d.fem_tris.size(), d.fem_shells.size());
+        if (d.fem_shells.size() == 2)
+            CHECK(d.fem_shells[0].material == "Steel" && d.fem_shells[0].thickness == 0.001f && d.fem_shells[1].material == "Aluminium" &&
+                      d.fem_shells[1].thickness == 0.002f && std::fabs(d.fem_shells[1].color.y - 0.3f) < 1e-6f,
+                  "fem shells: %s %g, %s %g", d.fem_shells[0].material.c_str(), d.fem_shells[0].thickness, d.fem_shells[1].material.c_str(), d.fem_shells[1].thickness);
+        bl::edit::Model back;
+        std::vector<std::string> notes;
+        CHECK(bl::edit::import_document(d, back, notes) && back.fem_count() == 3 && back.fem_presets.size() == 2 && back.tris[2].fem_preset == 1 &&
+                  !back.tris[0].collision && !back.tris[0].shell,
+              "fem_tris into the editor: %d FEM triangles, %zu presets", back.fem_count(), back.fem_presets.size());
+        // the editor's box of FEM triangles, written and read back
+        bl::edit::Model box = bl::edit::make_fem_box(3, vec3(1, 1, 1), 0.0015f);
+        bl::edit::FemPreset thick = box.fem_presets[0];
+        thick.name = "Thick", thick.thickness = 0.004f, thick.material = "Chromoly";
+        box.fem_presets.push_back(thick);
+        for (int i = 0; i < 6; i++) box.tris[i].fem_preset = 1;
+        Document db;
+        bl::edit::Model box2;
+        CHECK(parse_truck_file(temp_file("bl_fem_box.truck", bl::edit::write_truck(box)), db) && db.warnings.empty() && bl::edit::import_document(db, box2, notes),
+              "FEM box round trip: %zu warnings", db.warnings.size());
+        int ones = 0;
+        for (const auto& t : box2.tris) ones += t.fem && t.fem_preset == 1;
+        CHECK(db.fem_tris.size() == box.tris.size() && db.beams.empty() && db.submeshes.empty() && box2.fem_count() == (int)box.tris.size() && ones == 6 &&
+                  box2.fem_presets.size() == 2 && box2.fem_presets[1].material == "Chromoly" && box2.fem_presets[1].thickness == 0.004f,
+              "FEM box: %zu of %zu triangles, %zu beams, %d of the thick shell", db.fem_tris.size(), box.tris.size(), db.beams.size(), ones);
+        printf("  FEM triangles: ok\n");
+    }
     // the cockpit camera (cinecam) only when asked for, and only in a file to drive: the editor's preview and physics
     // test get no node and beams of it (a shell-only shape would have had its eight beams along its edges); an older
     // editor's file (it wrote one for every model) reads back without it, a foreign vehicle's with it
@@ -591,6 +664,7 @@ void test_editor_models() {
         g.frame_material = "Chromoly", g.frame_shape = 1, g.frame_outer = 0.03f, g.frame_wall = 0.0015f;
         m.groups.push_back(g);
         g.name = "strut", g.frame_shape = 0, g.frame_end_a = 1, g.frame_end_b = 5, g.frame_joint_k = 3000.0f; // (ball / elastic)
+        g.frame_break = 1500.0f, g.frame_joint_damp = 2.5f; // (a mount that tears, a damped joint)
         m.groups.push_back(g);
         const int cage = (int)m.groups.size() - 2, strut = cage + 1;
         for (size_t i = 0; i < m.beams.size(); i++) m.beams[i].group = i < 4 ? cage : i < 6 ? strut : m.beams[i].group;
@@ -605,6 +679,7 @@ void test_editor_models() {
               d.joints.size());
         CHECK(d.frame_sections.size() == 2 && d.frame_sections[0].material == "Chromoly" && d.frame_sections[0].shape == "box" && d.frame_sections[0].end_a == 0 &&
                   d.frame_sections[1].end_a == 1 && d.frame_sections[1].end_b == 5 && d.frame_sections[1].joint_k == 3000.0f &&
+                  d.frame_sections[1].brk == 1500.0f && d.frame_sections[1].joint_damp == 2.5f && d.frame_sections[0].brk == 0 && d.frame_sections[0].joint_damp == 0 &&
                   std::fabs(d.frame_sections[0].outer - 0.03f) < 1e-6f,
               "frame sections read back");
         CHECK(d.beams[1].end_a == 0 && d.beams[1].end_b == 2, "a beam's own joints: %d %d", d.beams[1].end_a, d.beams[1].end_b);
@@ -616,11 +691,11 @@ void test_editor_models() {
             const auto& h = back.groups[b.group];
             if (!h.is_frame()) continue;
             if (h.frame_end_a == 0 && h.frame_end_b == 0 && h.frame_material == "Chromoly" && h.frame_shape == 1 && h.frame_outer == 0.03f && h.frame_wall == 0.0015f) ok_cage++;
-            if (h.frame_end_a == 1 && h.frame_end_b == 5 && h.frame_joint_k == 3000.0f && h.frame_shape == 0) ok_strut++;
+            if (h.frame_end_a == 1 && h.frame_end_b == 5 && h.frame_joint_k == 3000.0f && h.frame_shape == 0 && h.frame_break == 1500.0f && h.frame_joint_damp == 2.5f) ok_strut++;
         }
         CHECK(ok_cage == 4 && ok_strut == 2, "frame presets read back: %d welded box members, %d ball / elastic tubes", ok_cage, ok_strut);
         CHECK(back.beams[1].end_a < 0 && back.beams[1].end_b == 2, "a beam's own joints read back: %d %d", back.beams[1].end_a, back.beams[1].end_b);
-        printf("  frame elements and their joints: ok\n");
+        printf("  frame elements, their joints, break force and joint damping: ok\n");
     }
     // a rigid preset writes a pair of joints per beam and reads back as a rigid preset
     {
@@ -992,7 +1067,7 @@ int main() {
         read_text_file(path_join(root, rel), text);
         shipped += rel.rfind("editor/", 0) != 0 && text.find(";written by the BeamLab model editor") == std::string::npos;
     }
-    CHECK(shipped == 73, "expected 73 vehicle files, found %zu", shipped);
+    CHECK(shipped == 75, "expected 75 vehicle files, found %zu", shipped);
     CHECK(worst_ms_per_kline * 5 < 5.0, "parsing is too slow");
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "ALL CHECKS PASSED", g_failures);
     return g_failures ? 1 : 0;

@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <map>
+#include <tuple>
 #include <set>
 #include <sstream>
 
@@ -184,8 +186,27 @@ int Model::node_uses(int n) const {
 
 int Model::shell_count() const {
     int c = 0;
-    for (const Tri& t : tris) c += t.shell;
+    for (const Tri& t : tris) c += t.shell && !t.fem;
     return c;
+}
+
+int Model::fem_count() const {
+    int c = 0;
+    for (const Tri& t : tris) c += t.fem;
+    return c;
+}
+
+FemPreset Model::fem_preset(int i) const { return i >= 0 && i < (int)fem_presets.size() ? fem_presets[i] : FemPreset(); }
+
+int Model::ensure_fem_preset() {
+    if (fem_presets.empty()) fem_presets.push_back(FemPreset());
+    return 0;
+}
+
+void Model::remove_fem_preset(int i) {
+    if (i < 0 || i >= (int)fem_presets.size() || fem_presets.size() <= 1) return;
+    fem_presets.erase(fem_presets.begin() + i);
+    for (Tri& t : tris) t.fem_preset = t.fem_preset == i ? 0 : t.fem_preset > i ? t.fem_preset - 1 : t.fem_preset;
 }
 
 int Model::nearest_node(vec3 p, float r) const {
@@ -593,6 +614,71 @@ Model make_box(int nx, int ny, int nz, vec3 size, float mass) {
     return m;
 }
 
+Model make_fem_plate(int nx, int nz, vec2 size, float thickness) {
+    Model m;
+    m.title = "FEM plate";
+    m.dry_mass = 0.0f;
+    m.engine = false;
+    FemPreset fp;
+    fp.thickness = thickness, fp.name = "Steel " + fmt("%.1f", thickness * 1000.0f) + " mm", fp.color = vec3(0.62f, 0.64f, 0.67f);
+    m.fem_presets.push_back(fp);
+    nx = std::max(2, nx), nz = std::max(2, nz);
+    auto id = [&](int i, int k) { return i * nz + k; };
+    for (int i = 0; i < nx; i++)
+        for (int k = 0; k < nz; k++) {
+            Node n;
+            n.p = vec3((i / (float)(nx - 1) - 0.5f) * size.x, 0.5f, (k / (float)(nz - 1) - 0.5f) * size.y);
+            m.nodes.push_back(n);
+        }
+    auto tri = [&](int a, int b, int c) {
+        Tri t;
+        t.a = a, t.b = b, t.c = c, t.fem = true, t.collision = false;
+        m.tris.push_back(t);
+    };
+    for (int i = 0; i + 1 < nx; i++)
+        for (int k = 0; k + 1 < nz; k++) {
+            const int a = id(i, k), b = id(i + 1, k), c = id(i + 1, k + 1), d = id(i, k + 1);
+            if ((i + k) % 2 == 0) tri(a, c, b), tri(a, d, c);
+            else tri(a, d, b), tri(b, d, c);
+        }
+    return m;
+}
+
+Model make_fem_box(int n, vec3 size, float thickness) {
+    Model m;
+    m.title = "FEM box";
+    m.dry_mass = 0.0f;
+    m.engine = false;
+    FemPreset fp;
+    fp.thickness = thickness, fp.name = "Steel " + fmt("%.1f", thickness * 1000.0f) + " mm", fp.color = vec3(0.78f, 0.30f, 0.12f);
+    m.fem_presets.push_back(fp);
+    n = std::max(1, n);
+    std::map<std::tuple<long, long, long>, int> at;
+    auto node = [&](vec3 p) {
+        const auto key = std::make_tuple(std::lround(p.x * 1000.0), std::lround(p.y * 1000.0), std::lround(p.z * 1000.0));
+        if (auto it = at.find(key); it != at.end()) return it->second;
+        Node x;
+        x.p = p;
+        m.nodes.push_back(x);
+        return at[key] = (int)m.nodes.size() - 1;
+    };
+    auto grid = [&](vec3 o, vec3 du, vec3 dv) {
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++) {
+                const int a = node(o + du * (float)i + dv * (float)j), b = node(o + du * (float)(i + 1) + dv * (float)j);
+                const int c = node(o + du * (float)(i + 1) + dv * (float)(j + 1)), d = node(o + du * (float)i + dv * (float)(j + 1));
+                Tri t1, t2;
+                t1.fem = t2.fem = true, t1.collision = t2.collision = false;
+                if ((i + j) & 1) t1.a = a, t1.b = b, t1.c = c, t2.a = a, t2.b = c, t2.c = d;
+                else t1.a = a, t1.b = b, t1.c = d, t2.a = b, t2.b = c, t2.c = d;
+                m.tris.push_back(t1), m.tris.push_back(t2);
+            }
+    };
+    const vec3 o(-0.5f * size.x, 0.05f, -0.5f * size.z), X(size.x / n, 0, 0), Y(0, size.y / n, 0), Z(0, 0, size.z / n);
+    grid(o, Z, X), grid(o + vec3(0, size.y, 0), X, Z), grid(o, X, Y), grid(o + vec3(0, 0, size.z), Y, X), grid(o, Y, Z), grid(o + vec3(size.x, 0, 0), Z, Y);
+    return m;
+}
+
 Model make_plate(int nx, int nz, vec2 size, float mass, bool sheet) {
     Model m;
     m.title = sheet ? "Sheet" : "Plate";
@@ -957,7 +1043,8 @@ std::string write_truck(const Model& m, bool preview) {
                 if (g.is_frame()) {
                     const std::string ja = phys::frame_joint_name((phys::FrameJoint)g.frame_end_a), jb = phys::frame_joint_name((phys::FrameJoint)g.frame_end_b);
                     o += "set_frame_section " + g.frame_material + ", " + phys::frame_shape_name((phys::FrameShape)std::clamp(g.frame_shape, 0, 3)) + ", " +
-                         fmt("%.4f", g.frame_outer) + ", " + fmt("%.4f", g.frame_wall) + ", " + (ja == jb ? ja : ja + "/" + jb) + ", " + num(g.frame_joint_k) + "\n";
+                         fmt("%.4f", g.frame_outer) + ", " + fmt("%.4f", g.frame_wall) + ", " + (ja == jb ? ja : ja + "/" + jb) + ", " + num(g.frame_joint_k) +
+                         (g.frame_break > 0 || g.frame_joint_damp > 0 ? ", " + num(g.frame_break) + ", " + num(g.frame_joint_damp) : std::string()) + "\n";
                 }
             }
             const BeamGroup& g = m.groups[std::clamp(cur, 0, (int)m.groups.size() - 1)];
@@ -1171,7 +1258,7 @@ std::string write_truck(const Model& m, bool preview) {
             section();
             for (int i = 0; i < (int)m.tris.size(); i++) {
                 const Tri& t = m.tris[i];
-                if (t.submesh != s) continue;
+                if (t.submesh != s || t.fem) continue;
                 mark(t.layer, -1);
                 o += fmt("%d", t.a) + ", " + fmt("%d", t.b) + ", " + fmt("%d", t.c) + ", " + cab_opts(t) + "\n";
             }
@@ -1181,7 +1268,7 @@ std::string write_truck(const Model& m, bool preview) {
         (void)order;
         std::vector<int> own;
         for (int i = 0; i < (int)m.tris.size(); i++)
-            if (m.tris[i].submesh < 0 || m.tris[i].submesh >= (int)m.submeshes.size()) own.push_back(i);
+            if ((m.tris[i].submesh < 0 || m.tris[i].submesh >= (int)m.submeshes.size()) && !m.tris[i].fem) own.push_back(i);
         if (!own.empty()) {
         // texture coordinates: a planar map of the model (x along, y + z across), the sheet body's material plane
         o += ";editor-own-submesh\n";
@@ -1204,7 +1291,7 @@ std::string write_truck(const Model& m, bool preview) {
         }
         bool other_mats = false;
         for (const Tri& t : m.tris) other_mats |= t.shell && t.shell_preset > 0 && t.shell_preset <= (int)m.shell_presets.size();
-        if (m.shell_count() > 0 && (m.shell_count() < (int)m.tris.size() || other_mats)) {
+        if (m.shell_count() > 0 && (m.shell_count() < (int)m.tris.size() - m.fem_count() || other_mats)) {
             // the triangle elements, by material: the sheet material of the globals first, then each of the others
             // after its `set_shell_material name, material, kg/m2, drawn thickness, r, g, b, refinement depth`
             o += "shells\n;(BeamLab) the cab triangles that are triangle elements of the sheet body\n";
@@ -1221,8 +1308,24 @@ std::string write_truck(const Model& m, bool preview) {
                          fmt("%.3f", sp.color.y) + ", " + fmt("%.3f", sp.color.z) + ", " + fmt("%d", sp.max_level) + "\n";
                 }
                 for (const Tri& t : m.tris)
-                    if (t.shell && (k == 0 ? t.shell_preset <= 0 || t.shell_preset > (int)m.shell_presets.size() : t.shell_preset == k))
+                    if (t.shell && !t.fem && (k == 0 ? t.shell_preset <= 0 || t.shell_preset > (int)m.shell_presets.size() : t.shell_preset == k))
                         o += fmt("%d", t.a) + ", " + fmt("%d", t.b) + ", " + fmt("%d", t.c) + "\n";
+            }
+        }
+        if (m.fem_count() > 0) {
+            // the FEM triangles, by shell: `set_fem_shell material, thickness, r, g, b` before each's triangles
+            o += "fem_tris\n;(BeamLab) triangle elements of the FEM frame: n1, n2, n3, of the set_fem_shell before them\n";
+            section();
+            const int np = std::max(1, (int)m.fem_presets.size());
+            for (int k = 0; k < np; k++) {
+                bool any = false;
+                for (const Tri& t : m.tris) any |= t.fem && (std::clamp(t.fem_preset, 0, np - 1) == k);
+                if (!any) continue;
+                const FemPreset fp = m.fem_preset(k);
+                o += "set_fem_shell " + fp.material + ", " + num(fp.thickness) + ", " + fmt("%.3f", fp.color.x) + ", " + fmt("%.3f", fp.color.y) + ", " + fmt("%.3f", fp.color.z) +
+                     "\n";
+                for (const Tri& t : m.tris)
+                    if (t.fem && std::clamp(t.fem_preset, 0, np - 1) == k) o += (mark(t.layer, -1), fmt("%d", t.a)) + ", " + fmt("%d", t.b) + ", " + fmt("%d", t.c) + "\n";
             }
         }
     }
@@ -1313,13 +1416,15 @@ bool import_document(const ror::Document& d, Model& m, std::vector<std::string>&
             g.frame_outer = fs->outer, g.frame_wall = fs->wall;
             g.hold_rotation = false;
             g.frame_end_a = fs->end_a, g.frame_end_b = fs->end_b, g.frame_joint_k = fs->joint_k;
+            g.frame_break = fs->brk, g.frame_joint_damp = fs->joint_damp;
         }
         for (int i = 0; i < (int)m.groups.size(); i++) {
             const BeamGroup& h = m.groups[i];
             if (h.spring == g.spring && h.damp == g.damp && h.deform == g.deform && h.brk == g.brk && h.plastic == g.plastic && h.invisible == g.invisible &&
                 h.type == g.type && h.hold_rotation == g.hold_rotation && (!held || fs || h.joint_k == g.joint_k) &&
                 (!fs || (h.frame_material == g.frame_material && h.frame_shape == g.frame_shape && h.frame_outer == g.frame_outer && h.frame_wall == g.frame_wall &&
-                         h.frame_end_a == g.frame_end_a && h.frame_end_b == g.frame_end_b && h.frame_joint_k == g.frame_joint_k)))
+                         h.frame_end_a == g.frame_end_a && h.frame_end_b == g.frame_end_b && h.frame_joint_k == g.frame_joint_k && h.frame_break == g.frame_break &&
+                         h.frame_joint_damp == g.frame_joint_damp)))
                 return i;
         }
         static const vec4 palette[] = {vec4(0.85f, 0.85f, 0.85f, 1), vec4(0.55f, 0.85f, 1, 1), vec4(1, 0.75f, 0.3f, 1), vec4(1, 0.4f, 0.4f, 1),
@@ -1448,6 +1553,24 @@ bool import_document(const ror::Document& d, Model& m, std::vector<std::string>&
             std::sort(q.begin(), q.end());
             if (q == k) t.shell = true, t.shell_preset = s.mat;
         }
+    }
+    // the FEM triangles and their shells (a preset each; the names are the editor's)
+    for (const auto& fs : d.fem_shells) {
+        FemPreset p;
+        p.material = fs.material, p.thickness = fs.thickness;
+        if (fs.color.x >= 0) p.color = fs.color;
+        p.name = fs.material + " " + fmt("%.1f", fs.thickness * 1000.0f) + " mm";
+        m.fem_presets.push_back(p);
+    }
+    for (const auto& ft : d.fem_tris) {
+        if (!ok(ft.n1) || !ok(ft.n2) || !ok(ft.n3)) {
+            dropped++;
+            continue;
+        }
+        Tri t;
+        t.a = map[ft.n1], t.b = map[ft.n2], t.c = map[ft.n3];
+        t.fem = true, t.collision = false, t.shell = false, t.fem_preset = ft.shell;
+        m.tris.push_back(t);
     }
     for (const auto& sm : d.shell_materials) {
         ShellPreset p;
@@ -1758,6 +1881,9 @@ std::vector<std::string> validate(const Model& m) {
     }
     for (const Prop& p : m.props)
         if (p.ref == p.x || p.ref == p.y || p.x == p.y) out.push_back("prop " + p.mesh + ": its ref, x and y nodes must differ");
+    if (m.fem_count() > 0 && m.fem_presets.empty()) out.push_back("FEM triangles without a FEM shell preset (the default, 1 mm steel, is written)");
+    for (const FemPreset& fp : m.fem_presets)
+        if (!(fp.thickness > 0)) out.push_back("FEM shell " + fp.name + ": no thickness");
     if (m.engine && m.wheels.empty()) out.push_back("an engine but no wheels");
     if (m.engine && m.gears.empty()) out.push_back("an engine without gears");
     return out;

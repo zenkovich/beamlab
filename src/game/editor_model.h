@@ -37,6 +37,8 @@ struct BeamGroup {                  // a set_beam_defaults preset
     float frame_outer = 0.04f, frame_wall = 0.002f; // outer diameter or side, wall (m)
     int frame_end_a = 0, frame_end_b = 0;
     float frame_joint_k = 2.0e4f;   // elastic joints (N m/rad)
+    float frame_break = 0;          // break force (N) past which a member tears off its end a (a mount, a hinge), 0: none
+    float frame_joint_damp = 0;     // released joints' damping (N m s/rad)
     bool is_frame() const { return type == BEAM_FRAME; }
 };
 
@@ -51,6 +53,16 @@ struct ShellPreset {
     float kg_m2 = 15.7f, thickness = 0.006f;
     vec3 color{-1, -1, -1};
     int max_level = -1;
+};
+
+// a shell of FEM triangle elements (the truck's `fem_tris`, phys::FrameTri): a sheet of one of the frame members'
+// materials of a thickness - the body is the structure (membrane and bending in the frame's implicit step), no frame
+// under it needed; its look (below 0: the vehicle's paint)
+struct FemPreset {
+    std::string name = "Body steel 1 mm";
+    std::string material = "Steel";
+    float thickness = 0.001f;
+    vec3 color{0.78f, 0.14f, 0.10f};
 };
 
 struct Layer {
@@ -105,12 +117,15 @@ struct Hydro {                      // steering rod: its length follows the stee
 
 struct Tri {                        // cab triangle: a collision surface, or a triangle element of the sheet body
     int a = 0, b = 0, c = 0;
-    bool collision = true;
+    bool collision = true;          // (a collision hull's triangle: `options` has 'h', one-sided, solid behind)
     bool shell = false;             // a triangle element (Model::sheet_material): it bends, dents and cracks
     int layer = 0;
     int submesh = -1;               // an imported submesh (its texture coordinates, material), -1: the editor's own
     int shell_preset = 0;           // a shell's material (Model::shell_preset): 0 the model's sheet material
+    bool fem = false;               // a triangle element of the FEM frame (Model::fem_presets): not a cab triangle (it
+    int fem_preset = 0;             // makes its own collision surface), neither `collision` nor `shell`
     std::string options;            // the cab options of an imported triangle (collision letters follow `collision`)
+    bool hull() const { return !shell && options.find('h') != std::string::npos; }
 };
 
 struct Joint {                      // a beam with orientation: the child node is held at its rest offset in the
@@ -184,6 +199,9 @@ struct Model {
     // more materials for the shells (Tri::shell_preset k >= 1: shell_presets[k - 1]; 0 is the sheet_* above): a glass
     // window, a plastic bumper, an aluminium bonnet on a steel body. Written as `set_shell_material` in the shells section
     std::vector<struct ShellPreset> shell_presets;
+    // the FEM triangles' shells (Tri::fem_preset; the first made when the first such triangle is): written as
+    // `set_fem_shell` in the fem_tris section
+    std::vector<FemPreset> fem_presets;
     // the skin: the cab triangles drawn in a flat colour (globals cab material `color/r,g,b`; a model with shell
     // triangles is drawn by its sheet instead); off: the imported cab material, if any
     bool skin = true;
@@ -202,7 +220,9 @@ struct Model {
     float min_rpm = 1000.0f, max_rpm = 6000.0f, torque = 300.0f, diff = 4.0f, reverse = 3.0f, neutral = 1.0f;
     std::vector<float> gears{3.2f, 2.0f, 1.4f, 1.0f, 0.8f};
     bool engine_car = true;         // engoption type c (car) / t (truck)
-    float clutch_force = 200.0f, inertia = 0.4f;
+    // (a road car's: the engine inertia is in the drivetrain's rpm units, 0.4 made it rev ~5x too slowly and a clutch of
+    // 200 slipped - the car crawled; RoR mods use 0.05-0.1 and 300-1000)
+    float clutch_force = 1000.0f, inertia = 0.08f;
     float brake_force = 3000.0f;
     int cam_center = -1, cam_back = -1, cam_left = -1; // -1: chosen automatically (write_truck)
     // a cockpit camera node (cinecam) above the centre on eight beams to the nearest nodes: a node and beams of its own
@@ -223,6 +243,10 @@ struct Model {
     std::vector<Prop> props;
     std::vector<Submesh> submeshes;
     int shell_count() const;
+    int fem_count() const;
+    FemPreset fem_preset(int i) const;               // (none yet: the default)
+    int ensure_fem_preset();                         // a preset to make triangles of: the first (made if none)
+    void remove_fem_preset(int i);                   // (its triangles take the first)
     int wheel_node_count(int w) const;       // the nodes wheel w makes
     int file_node(int ref) const;            // a node reference (explicit or a wheel's) in the written file's numbering
     int ref_of_file_node(int n) const;       // and back (-1: none)
@@ -284,6 +308,8 @@ Model make_box(int nx, int ny, int nz, vec3 size, float mass);             // br
 Model make_plate(int nx, int nz, vec2 size, float mass, bool sheet);      // a flat sheet of triangles (with a frame)
 Model make_cylinder(int segments, int rings, float radius, float length, float mass);
 Model make_cart(float length, float width, float height, float mass);     // a braced box body on four wheels
+Model make_fem_plate(int nx, int nz, vec2 size, float thickness);         // a steel plate of FEM triangles
+Model make_fem_box(int n, vec3 size, float thickness);                    // a hollow box of FEM triangles, n x n a face
 
 // ---- tools
 // Delaunay triangulation of the nodes projected on their flattest plane (the axis of least extent): the triangles

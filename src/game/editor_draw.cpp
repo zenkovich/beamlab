@@ -155,7 +155,7 @@ void ModelEditor::build_fill_mesh() {
         const vec3 n = normalize_or(cross(b - a, c - a), vec3(0, 1, 0));
         for (vec3 p : {a, b, c}) {
             idx.push_back((uint32_t)vs.size());
-            vs.push_back({p, n, vec2(t.shell ? 1.0f : 0.0f, 0)});
+            vs.push_back({p, n, vec2(t.shell || t.fem ? 1.0f : 0.0f, 0)});
         }
     }
     if (vs.empty()) return;
@@ -300,8 +300,9 @@ void ModelEditor::draw(Renderer& r, int view) {
         if (!elem_shown(Elem::Tri, i)) continue;
         const edit::Tri& t = M.tris[i];
         const int hi = hi_of(Elem::Tri, i);
-        const vec3 sc = t.shell ? shell_preset_color(t.shell_preset) * 1.15f + vec3(0.1f) : vec3(0);
-        uint32_t c = hi == 1 ? kSelCol : hi == 2 ? kHoverCol : t.shell ? Renderer::rgba(sc.x, sc.y, sc.z, 0.75f) : Renderer::rgba(0.5f, 0.75f, 1, t.collision ? 0.5f : 0.25f);
+        const vec3 sc = t.fem ? fem_preset_color(t.fem_preset) * 1.1f + vec3(0.12f) : t.shell ? shell_preset_color(t.shell_preset) * 1.15f + vec3(0.1f) : vec3(0);
+        uint32_t c = hi == 1 ? kSelCol : hi == 2 ? kHoverCol : t.shell || t.fem ? Renderer::rgba(sc.x, sc.y, sc.z, t.fem ? 0.9f : 0.75f)
+                     : t.hull() ? Renderer::rgba(1.0f, 0.62f, 0.15f, 0.55f) : Renderer::rgba(0.5f, 0.75f, 1, t.collision ? 0.5f : 0.25f);
         if (!hi && M.layer_locked(t.layer)) c = dim(c, 0.35f);
         const vec3 a = P(t.a), b = P(t.b), cc = P(t.c);
         if (hi) {
@@ -309,7 +310,7 @@ void ModelEditor::draw(Renderer& r, int view) {
             const vec3 m = (a + b + cc) * (1.0f / 3);
             const vec3 n = normalize_or(cross(b - a, cc - a), vec3(0, 1, 0));
             thick_line(r, vf, m, m + n * std::max(0.05f, vf.px_at(m) * 30), Renderer::rgba(1, 1, 1, 1), 2); // (the outside)
-        } else if ((!m_fill || m_model.beams.empty() || t.shell) && !skel_off) {
+        } else if ((!m_fill || m_model.beams.empty() || t.shell || t.fem) && !skel_off) {
             c = dim(c, skel);
             r.thick_line(a, b, c, bw * 0.7f), r.thick_line(b, cc, c, bw * 0.7f), r.thick_line(cc, a, c, bw * 0.7f);
         }
@@ -399,7 +400,7 @@ void ModelEditor::draw_tool_preview(Renderer& r, int view) {
     case Tool::Line:
         if (m_chain >= 0 && pk.valid()) axis_line(M.nodes[m_chain].p, pk.p);
         break;
-    case Tool::Tri: case Tool::Shell: case Tool::Shock: case Tool::Rod: case Tool::Wheel:
+    case Tool::Tri: case Tool::Shell: case Tool::FemTri: case Tool::Shock: case Tool::Rod: case Tool::Wheel:
         if (!m_picks.empty() && pk.valid()) {
             axis_line(M.nodes[m_picks.back()].p, pk.p);
             if (m_picks.size() == 2) thick_line(r, vf, W(M.nodes[m_picks[0]].p), W(pk.p), ghost, 2);

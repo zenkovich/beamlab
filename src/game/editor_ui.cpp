@@ -34,7 +34,7 @@ struct ToolInfo {
 };
 using I = ModelEditor::Icon;
 const ToolInfo kTools[] = {
-    {"Select", "Space", I::Select, "Click a node or an element (Shift adds, Ctrl toggles); drag a box: left to right takes what is inside, right to left what it touches; drag a selected node or a gizmo arrow to move; double click: the connected nodes, a whole face; keep only one kind of what is selected: Only in Properties or Alt+1 - 8 (nodes, beams, shells, cab, shocks, rods, wheels, joints)"},
+    {"Select", "Space", I::Select, "Click a node or an element (Shift adds, Ctrl toggles); drag a box: left to right takes what is inside, right to left what it touches; drag a selected node or a gizmo arrow to move; double click: the connected nodes, a whole face; keep only one kind of what is selected: Only in Properties or Alt+1 - 9 (nodes, beams, shells, cab, shocks, rods, wheels, joints, FEM triangles)"},
     {"Line", "L", I::Line, "Click point after point: a beam each time, a node made where a click lands off a node (on a beam: it is split); click the start to close; type a length + Enter; Esc or a right click ends"},
     {"Node", "N", I::Node, "Click to add a node in any view: the 3D view puts it on the work plane, the flat views at the depth of the selected node (the new node is selected)"},
     {"Rectangle", "R", I::Rect, "Two corners in the view's plane: nodes, edge beams, diagonals and faces (shell faces: no beams); type w,h + Enter"},
@@ -52,8 +52,9 @@ const ToolInfo kTools[] = {
     {"Wheel", "B", I::Wheel, "Two axle nodes, inner then outer: a wheel with the last wheel's settings"},
     {"Merge", "Ctrl+J: the selected", I::Merge, "Click a node, then the node it goes into: the elements on the first go to the second (with symmetry the twins too); Ctrl+J merges the selected nodes into one, the options merge the nodes closer than a distance"},
     {"Joint", "", I::Joint, "Frame elements (FEM beams): click near an end of one to join it to its node with the joint chosen below (welded, ball, hinges, swivel, elastic); Shift+click: its preset's joint again; with symmetry the twin's end too"},
+    {"FEM triangle", "Q", I::FemTri, "Three nodes: a FEM triangle, a shell element of the frame (membrane and bending, plastic past the yield, torn past the elongation) of the FEM shell chosen below; it makes its own collision surface. The Rectangle, Circle and Push / Pull tools make them too (Faces: FEM triangles)"},
 };
-static_assert(sizeof(kTools) / sizeof(kTools[0]) == 18, "one entry per tool");
+static_assert(sizeof(kTools) / sizeof(kTools[0]) == 19, "one entry per tool");
 // one line each: what the tool does (the tooltips have more)
 const char* kToolShort[] = {
     "Click or drag a box to select (Shift adds); drag to move",
@@ -74,6 +75,7 @@ const char* kToolShort[] = {
     "Two axle nodes, inner then outer: a wheel",
     "A node, then the node it goes into",
     "Click near a frame element's end: its joint",
+    "Three nodes: a FEM triangle (a shell element of the frame)",
 };
 
 const char* kViewNames[] = {"3D", "Front", "Side", "Top"};
@@ -189,6 +191,12 @@ void ModelEditor::draw_icon(ImDrawList* dl, Icon icon, float x, float y, float s
     case Icon::Shell:
         dl->AddTriangleFilled(P(0.5f, 0.16f), P(0.86f, 0.8f), P(0.14f, 0.8f), (col & 0x00ffffffu) | 0xa0000000u);
         tri(0.5f, 0.16f, 0.86f, 0.8f, 0.14f, 0.8f, false);
+        break;
+    case Icon::FemTri: // (a triangle cut into four, its nodes)
+        dl->AddTriangleFilled(P(0.5f, 0.14f), P(0.88f, 0.82f), P(0.12f, 0.82f), (col & 0x00ffffffu) | 0x60000000u);
+        tri(0.5f, 0.14f, 0.88f, 0.82f, 0.12f, 0.82f, false);
+        tri(0.31f, 0.48f, 0.69f, 0.48f, 0.5f, 0.82f, false);
+        dot(0.5f, 0.14f, 0.06f), dot(0.88f, 0.82f, 0.06f), dot(0.12f, 0.82f, 0.06f);
         break;
     case Icon::Shock: {
         dot(0.5f, 0.1f, 0.07f), dot(0.5f, 0.9f, 0.07f);
@@ -444,6 +452,7 @@ void ModelEditor::ui(ImFont* small) {
         if (m_preset_window) ui_preset_window();
         if (m_template_window) ui_template_window();
         if (m_shell_window) ui_shell_window();
+        if (m_fem_window) ui_fem_window();
         if (m_copy_window) ui_copy_window();
         ui_labels();
     }
@@ -651,6 +660,19 @@ void ModelEditor::ui_view_popup() {
     ImGui::PopItemWidth();
 }
 
+edit::Model ModelEditor::make_template(int tpl) const {
+    switch (tpl) {
+    case 0: return edit::make_cart(m_tpl_size.x, m_tpl_size.z, m_tpl_size.y, m_tpl_mass);
+    case 1: return edit::make_box(m_tpl_n[0], m_tpl_n[1], m_tpl_n[2], m_tpl_size, m_tpl_mass);
+    case 2: return edit::make_plate(m_tpl_n[0], m_tpl_n[1], vec2(m_tpl_size.x, m_tpl_size.y), m_tpl_mass, false);
+    case 3: return edit::make_plate(m_tpl_n[0], m_tpl_n[1], vec2(m_tpl_size.x, m_tpl_size.y), m_tpl_mass, true);
+    case 4: return edit::make_cylinder(m_tpl_n[0], m_tpl_n[1], m_tpl_size.y * 0.5f, m_tpl_size.x, m_tpl_mass);
+    case 6: return edit::make_fem_plate(m_tpl_n[0], m_tpl_n[1], vec2(m_tpl_size.x, m_tpl_size.y), m_tpl_mm * 0.001f);
+    case 7: return edit::make_fem_box(std::max(1, m_tpl_n[0]), m_tpl_size, m_tpl_mm * 0.001f);
+    default: return edit::make_empty();
+    }
+}
+
 void ModelEditor::ui_template_window() {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.35f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -659,28 +681,23 @@ void ModelEditor::ui_template_window() {
         ImGui::End();
         return;
     }
-    static const char* names[] = {"Cart (a box body, 4 wheels, an engine)", "Box", "Plate (cab triangles)", "Sheet (shell triangles)", "Cylinder", "Empty"};
+    static const char* names[] = {"Cart (a box body, 4 wheels, an engine)", "Box", "Plate (cab triangles)", "Sheet (shell triangles)", "Cylinder", "Empty",
+                                  "FEM plate (FEM triangles)", "FEM box (hollow, FEM triangles)"};
     if (props_begin("##tplprops", 0.35f)) {
         prop("Template");
-        ImGui::Combo("##tpl", &m_tpl, names, 6);
-        if (m_tpl == 0 || m_tpl == 1 || m_tpl == 4) prop("Size (m)"), ImGui::SliderFloat3("##size3", &m_tpl_size.x, 0.1f, 6.0f, "%.2f");
+        ImGui::Combo("##tpl", &m_tpl, names, 8);
+        if (m_tpl == 0 || m_tpl == 1 || m_tpl == 4 || m_tpl == 7) prop("Size (m)"), ImGui::SliderFloat3("##size3", &m_tpl_size.x, 0.1f, 6.0f, "%.2f");
         if (m_tpl == 1) prop("Nodes"), ImGui::SliderInt3("##n3", m_tpl_n, 2, 12);
-        if (m_tpl == 2 || m_tpl == 3) prop("Nodes"), ImGui::SliderInt2("##n2", m_tpl_n, 2, 24), prop("Size (m)"), ImGui::SliderFloat2("##size2", &m_tpl_size.x, 0.1f, 6.0f, "%.2f");
+        if (m_tpl == 7) prop("Segments a face"), ImGui::SliderInt("##nf", m_tpl_n, 1, 12);
+        if (m_tpl == 2 || m_tpl == 3 || m_tpl == 6) prop("Nodes"), ImGui::SliderInt2("##n2", m_tpl_n, 2, 24), prop("Size (m)"), ImGui::SliderFloat2("##size2", &m_tpl_size.x, 0.1f, 6.0f, "%.2f");
         if (m_tpl == 4) prop("Segments, rings"), ImGui::SliderInt2("##sr", m_tpl_n, 3, 24);
-        if (m_tpl != 5) prop("Mass"), ImGui::SliderFloat("##mass", &m_tpl_mass, 5.0f, 5000.0f, "%.0f kg", ImGuiSliderFlags_Logarithmic);
+        if (m_tpl != 5 && m_tpl < 6) prop("Mass"), ImGui::SliderFloat("##mass", &m_tpl_mass, 5.0f, 5000.0f, "%.0f kg", ImGuiSliderFlags_Logarithmic);
+        if (m_tpl >= 6) prop("Steel thickness", "The mass follows from the steel's density and the area"), ImGui::SliderFloat("##tmm", &m_tpl_mm, 0.3f, 20.0f, "%.2f mm", ImGuiSliderFlags_Logarithmic);
         props_end();
     }
     hint("The current model is replaced (Undo brings it back).");
     if (ImGui::Button("Create", ImVec2(-1, 0))) {
-        edit::Model m;
-        switch (m_tpl) {
-        case 0: m = edit::make_cart(m_tpl_size.x, m_tpl_size.z, m_tpl_size.y, m_tpl_mass); break;
-        case 1: m = edit::make_box(m_tpl_n[0], m_tpl_n[1], m_tpl_n[2], m_tpl_size, m_tpl_mass); break;
-        case 2: m = edit::make_plate(m_tpl_n[0], m_tpl_n[1], vec2(m_tpl_size.x, m_tpl_size.y), m_tpl_mass, false); break;
-        case 3: m = edit::make_plate(m_tpl_n[0], m_tpl_n[1], vec2(m_tpl_size.x, m_tpl_size.y), m_tpl_mass, true); break;
-        case 4: m = edit::make_cylinder(m_tpl_n[0], m_tpl_n[1], m_tpl_size.y * 0.5f, m_tpl_size.x, m_tpl_mass); break;
-        default: m = edit::make_empty(); break;
-        }
+        const edit::Model m = make_template(m_tpl);
         push_undo();
         const auto undo = m_undo;
         set_model(m, "");
@@ -761,6 +778,7 @@ void ModelEditor::ui_left(ImFont* small) {
         ui_tool_options();
         if (ImGui::CollapsingHeader("Beam presets", ImGuiTreeNodeFlags_DefaultOpen)) ui_presets();
         if (ImGui::CollapsingHeader("Shell materials", ImGuiTreeNodeFlags_DefaultOpen)) ui_shell_presets();
+        if (ImGui::CollapsingHeader("FEM shells", m_model.fem_count() ? ImGuiTreeNodeFlags_DefaultOpen : 0)) ui_fem_presets();
         if (ImGui::CollapsingHeader("Utilities", ImGuiTreeNodeFlags_DefaultOpen)) ui_utilities();
     }
     ImGui::PopFont();
@@ -776,7 +794,7 @@ void ModelEditor::ui_tools() {
     static const Group groups[] = {
         {"Select and change", {Tool::Select, Tool::Move, Tool::Rotate, Tool::Scale, Tool::Merge, Tool::Erase, Tool::Tape}},
         {"Draw", {Tool::Line, Tool::Node, Tool::Rect, Tool::Circle, Tool::PushPull}},
-        {"Add", {Tool::Tri, Tool::Shell, Tool::Shock, Tool::Rod, Tool::Wheel, Tool::Joint}},
+        {"Add", {Tool::Tri, Tool::Shell, Tool::FemTri, Tool::Shock, Tool::Rod, Tool::Wheel, Tool::Joint}},
     };
     const float bs = 32.0f;
     for (const Group& g : groups) {
@@ -804,7 +822,8 @@ void ModelEditor::ui_tools() {
 void ModelEditor::ui_tool_options() {
     // only the tools that have options show them
     const bool any = m_tool == Tool::Line || m_tool == Tool::Node || m_tool == Tool::Rect || m_tool == Tool::Circle || m_tool == Tool::Move || m_tool == Tool::Rotate ||
-                     m_tool == Tool::Scale || m_tool == Tool::Shell || m_tool == Tool::PushPull || m_tool == Tool::Merge || m_tool == Tool::Joint;
+                     m_tool == Tool::Scale || m_tool == Tool::Shell || m_tool == Tool::PushPull || m_tool == Tool::Merge || m_tool == Tool::Joint ||
+                     m_tool == Tool::FemTri;
     auto shell_mat = [&]() {
         std::vector<std::string> names;
         for (int i = 0; i < m_model.shell_preset_count(); i++) names.push_back(m_model.shell_preset(i).name + " (" + m_model.shell_preset(i).material + ")");
@@ -815,14 +834,27 @@ void ModelEditor::ui_tool_options() {
             ImGui::EndCombo();
         }
     };
+    auto fem_mat = [&]() {
+        std::vector<std::string> names;
+        const int n = std::max(1, (int)m_model.fem_presets.size());
+        for (int i = 0; i < n; i++) names.push_back(m_model.fem_preset(i).name);
+        prop("FEM shell", "What the new FEM triangles are made of: a material and a thickness (the FEM shells list)");
+        if (ImGui::BeginCombo("##femmat", names[std::clamp(m_fem_preset, 0, n - 1)].c_str())) {
+            for (int i = 0; i < n; i++)
+                if (ImGui::Selectable(names[i].c_str(), i == m_fem_preset)) m_fem_preset = i;
+            ImGui::EndCombo();
+        }
+    };
     if (!any) return;
     section_title("Options");
     auto faces = [&]() {
-        prop("Faces", "Cab: a collision surface; shell: elements of the sheet body (they bend, dent and crack)");
-        static const char* f[] = {"none", "cab triangles", "shell triangles"};
-        ImGui::Combo("##faces", &m_face_mode, f, 3);
-        if (m_face_mode == 2) {
-            shell_mat();
+        prop("Faces", "Cab: a collision surface; shell: elements of the sheet body (they bend, dent and crack); FEM: shell elements of the frame "
+                      "(solved with the FEM beams: membrane and bending, plasticity, tearing)");
+        static const char* f[] = {"none", "cab triangles", "shell triangles", "FEM triangles"};
+        ImGui::Combo("##faces", &m_face_mode, f, 4);
+        if (m_face_mode >= 2) {
+            if (m_face_mode == 2) shell_mat();
+            else fem_mat();
             prop("Beams too", "Shells hold their shape themselves (stretching and bending): no beams are made along them unless this is on");
             ImGui::Checkbox("##shellbeams", &m_shell_beams);
         }
@@ -850,7 +882,7 @@ void ModelEditor::ui_tool_options() {
         prop("Divisions");
         ImGui::SliderInt2("##div", m_rect_div, 1, 16);
         faces();
-        if (m_face_mode != 2 || m_shell_beams) {
+        if (m_face_mode < 2 || m_shell_beams) {
             prop("Diagonal beams");
             ImGui::Checkbox("##diag", &m_rect_diagonals);
         }
@@ -865,6 +897,7 @@ void ModelEditor::ui_tool_options() {
         plane();
         break;
     case Tool::Shell: shell_mat(); break;
+    case Tool::FemTri: fem_mat(); break;
     case Tool::Joint: {
         prop("Joint", "What a click near a frame element's end makes of its joint. Its axes: x along it, y up in its vertical plane, z across");
         ImGui::TextDisabled("%s", kJointNames[std::clamp(m_joint_type, 0, 5)]);
@@ -1060,7 +1093,7 @@ void ModelEditor::ui_preset_window() {
 
 void ModelEditor::ui_utilities() {
     const bool n2 = m_sel.size() >= 2, n1 = !m_sel.empty(), any = !selection_empty();
-    const bool n34 = m_sel.size() == 3 || m_sel.size() == 4, n3 = m_sel.size() >= 3;
+    const bool n34 = m_sel.size() == 3 || m_sel.size() == 4, n3 = m_sel.size() >= 3, n4 = m_sel.size() >= 4;
     auto group = [](const char* s) {
         ImGui::PushStyleColor(ImGuiCol_Text, kDimText);
         ImGui::TextUnformatted(s);
@@ -1074,6 +1107,11 @@ void ModelEditor::ui_utilities() {
     ImGui::SetItemTooltip("A Delaunay cover of the selected nodes (on their flattest plane) laid with beams");
     if (action_row(Icon::Tri, "Cover with cab triangles", "", n3)) triangulate_selection(1);
     if (action_row(Icon::Shell, "Cover with shells", "", n3)) triangulate_selection(2);
+    if (action_row(Icon::FemTri, "Cover with FEM triangles", "", n3)) triangulate_selection(3);
+    ImGui::SetItemTooltip("The cover laid with FEM triangles of the checked FEM shell (a sheet of the frame: no beams needed)");
+    if (action_row(Icon::Tri, "Collision hull round the selection", "", n4)) hull_selection();
+    ImGui::SetItemTooltip("The convex hull of the selected nodes as hull triangles: a coarse solid collision shell on a frame's\n"
+                          "nodes (not drawn in the game, one-sided, facing out). Select the frame's outer corners and run it.");
     group("Copy");
     if (action_row(Icon::Mirror, "Mirror to the other side", "Ctrl+M", n1)) mirror_selection();
     if (action_row(Icon::Copy, "Duplicate and move", "Ctrl+D", n1)) {
@@ -1233,10 +1271,16 @@ void ModelEditor::ui_physics_panel() {
             int bent = 0;
             for (const phys::FrameElement& e : fem.elems)
                 if (!e.broken) peak = std::max(peak, e.util), bent += e.damage > 1e-4f;
-            ImGui::TextDisabled("Frame: %zu members, peak load %.0f%% of yield", fem.elems.size(), peak * 100.0f);
-            ImGui::SetItemTooltip("The most loaded frame member: its force, moment or torque against the limit where it yields (or buckles). "
-                                  "Show the loads: the game's debug view, colour by stress");
+            int dented = 0;
+            for (const phys::FrameTri& t : fem.tris)
+                if (!t.broken) peak = std::max(peak, t.util), dented += t.dmg > 0;
+            if (fem.tris.empty()) ImGui::TextDisabled("Frame: %zu members, peak load %.0f%% of yield", fem.elems.size(), peak * 100.0f);
+            else if (fem.elems.empty()) ImGui::TextDisabled("Frame: %zu triangles, peak %.0f%% of yield", fem.tris.size(), peak * 100.0f);
+            else ImGui::TextDisabled("Frame: %zu members, %zu tris, peak %.0f%%", fem.elems.size(), fem.tris.size(), peak * 100.0f);
+            ImGui::SetItemTooltip("The most loaded frame member or triangle: its force, moment or torque (a triangle's stress) against the limit where it "
+                                  "yields (or buckles). Show the loads: the game's debug view, colour by stress");
             if (bent || fem.broken) ImGui::TextColored(ImVec4(1, 0.65f, 0.3f, 1), "%d bent for good, %d broken", bent, fem.broken);
+            if (dented || fem.tris_torn) ImGui::TextColored(ImVec4(1, 0.65f, 0.3f, 1), "%d triangles dented for good, %d torn", dented, fem.tris_torn);
         }
         ImGui::TextDisabled("%d broken beams", m_test->broken_beams() - fem.broken);
     }
@@ -1390,7 +1434,8 @@ void ModelEditor::ui_properties() {
             };
             row("Nodes", std::to_string(M.nodes.size()));
             row("Beams", std::to_string(M.beams.size()));
-            row("Triangles", std::to_string(M.tris.size()) + (M.shell_count() ? "  (" + std::to_string(M.shell_count()) + " shells)" : std::string()));
+            row("Triangles", std::to_string(M.tris.size()) + (M.shell_count() ? "  (" + std::to_string(M.shell_count()) + " shells)" : std::string()) +
+                                 (M.fem_count() ? "  (" + std::to_string(M.fem_count()) + " FEM)" : std::string()));
             row("Wheels", std::to_string(M.wheels.size()));
             row("Shocks, rods, joints", std::to_string(M.shocks.size()) + ", " + std::to_string(M.hydros.size()) + ", " + std::to_string(M.joints.size()));
             row("Meshes", std::to_string(M.flexbodies.size() + M.props.size()));
@@ -1622,22 +1667,60 @@ void ModelEditor::ui_properties() {
         }
     }
     if (!m_sel_tris.empty()) {
-        int shells = 0;
-        for (int i : m_sel_tris) shells += M.tris[i].shell;
+        int shells = 0, fems = 0;
+        for (int i : m_sel_tris) shells += M.tris[i].shell, fems += M.tris[i].fem;
         section_title(m_sel_tris.size() == 1 ? ("Triangle " + std::to_string(m_sel_tris[0])).c_str() : "Triangles");
         if (props_begin("##triprops")) {
-            int kind = shells ? 1 : 0;
-            static const char* kinds[] = {"cab (collision surface)", "shell (sheet element)"};
+            int hulls = 0;
+            for (int i : m_sel_tris) hulls += M.tris[i].hull();
+            int kind = fems ? 3 : shells ? 1 : hulls ? 2 : 0;
+            static const char* kinds[] = {"cab (collision surface)", "shell (sheet element)", "hull (solid collision, faces out)", "FEM shell (frame element)"};
             prop("Kind");
-            if (ImGui::Combo("##kind", &kind, kinds, 2)) {
+            if (ImGui::Combo("##kind", &kind, kinds, 4)) {
                 push_undo();
-                for (int i : m_sel_tris) M.tris[i].shell = kind == 1;
+                if (kind == 3) M.ensure_fem_preset();
+                for (int i : m_sel_tris) {
+                    edit::Tri& t = M.tris[i];
+                    if (kind == 3 && !t.fem) t.fem_preset = std::clamp(m_fem_preset, 0, (int)M.fem_presets.size() - 1);
+                    if (t.fem && kind != 3) t.collision = true;
+                    t.shell = kind == 1, t.fem = kind == 3;
+                    if (t.fem) t.collision = false;
+                    t.options.erase(std::remove(t.options.begin(), t.options.end(), 'h'), t.options.end());
+                    if (kind == 2) t.options += 'h', t.collision = true;
+                }
+                fems = kind == 3 ? (int)m_sel_tris.size() : 0;
             }
+            if (kind == 3) ImGui::SetItemTooltip("A shell element of the FEM frame: it stretches and bends (solved with the frame's beams), yields and keeps\n"
+                                                 "the dent past its material's yield stress, tears past its elongation; its own collision surface");
+            if (kind == 2) ImGui::SetItemTooltip("One-sided: a node up to 30 cm behind it is pushed back out along its outward normal (the amber tick).\n"
+                                                 "Lay it on a frame's nodes round the body: two frames can't go through each other.");
             bool coll = M.tris[m_sel_tris[0]].collision;
-            prop("Collision");
-            if (ImGui::Checkbox("##coll", &coll)) {
-                push_undo();
-                for (int i : m_sel_tris) M.tris[i].collision = coll;
+            if (!fems) {
+                prop("Collision");
+                if (ImGui::Checkbox("##coll", &coll)) {
+                    push_undo();
+                    for (int i : m_sel_tris) M.tris[i].collision = coll;
+                }
+            }
+            if (fems) {
+                std::vector<std::string> names;
+                const int np = std::max(1, (int)M.fem_presets.size());
+                for (int i = 0; i < np; i++) names.push_back(M.fem_preset(i).name);
+                int cur = 0;
+                for (int i : m_sel_tris)
+                    if (M.tris[i].fem) cur = std::clamp(M.tris[i].fem_preset, 0, np - 1);
+                prop("FEM shell", "The material and thickness (the FEM shells list in the left panel)");
+                if (ImGui::BeginCombo("##tfem", names[cur].c_str())) {
+                    for (int k = 0; k < np; k++)
+                        if (ImGui::Selectable(names[k].c_str(), k == cur)) {
+                            push_undo();
+                            for (int i : m_sel_tris)
+                                if (M.tris[i].fem) M.tris[i].fem_preset = k;
+                        }
+                    ImGui::EndCombo();
+                }
+                prop("");
+                if (ImGui::SmallButton("Edit the shell")) M.ensure_fem_preset(), m_fem_window = true, m_fem_edit = cur;
             }
             if (shells) {
                 std::vector<std::string> names;
@@ -1786,7 +1869,7 @@ void ModelEditor::ui_vehicle() {
             prop("Clutch force");
             m_dirty |= ImGui::SliderFloat("##clutch", &M.clutch_force, 10.0f, 5000.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
             prop("Engine inertia");
-            m_dirty |= ImGui::SliderFloat("##inertia", &M.inertia, 0.05f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+            m_dirty |= ImGui::SliderFloat("##inertia", &M.inertia, 0.02f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
         }
         prop("Brake force");
         m_dirty |= ImGui::SliderFloat("##brake", &M.brake_force, 100.0f, 50000.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
@@ -2030,6 +2113,13 @@ bool ModelEditor::ui_frame_section(edit::BeamGroup& g) {
         prop("Joint stiffness", "Elastic joints: the rotational spring (a rubber bushing some 1e3 - 1e4 N m/rad, a bolted joint 1e5 and up)");
         ch |= ImGui::SliderFloat("##fjk", &g.frame_joint_k, 100.0f, 1.0e7f, "%.3g N m/rad", ImGuiSliderFlags_Logarithmic);
     }
+    if (g.frame_end_a != phys::FJ_RIGID || g.frame_end_b != phys::FJ_RIGID) {
+        prop("Joint damping", "A released joint resists turning against its node: a door's hinge 2 - 5 N m s/rad, a ball joint's friction a few (0: free)");
+        ch |= ImGui::SliderFloat("##fjd", &g.frame_joint_damp, 0.0f, 50.0f, g.frame_joint_damp > 0 ? "%.2g N m s/rad" : "none");
+    }
+    prop("Breaks at", "A mount that tears off its node A when the force at its ends stands past this for 5 ms (a bolt, a hinge, a bracket; 0: never, "
+                      "the member breaks only as its material fails)");
+    ch |= ImGui::SliderFloat("##fbrk", &g.frame_break, 0.0f, 50000.0f, g.frame_break > 0 ? "%.0f N" : "never", ImGuiSliderFlags_Logarithmic);
     prop("Invisible", "Not drawn in the game");
     ch |= ImGui::Checkbox("##invisible", &g.invisible);
     const phys::FrameSection s = phys::make_frame_section(g.frame_material, (phys::FrameShape)g.frame_shape, g.frame_outer, g.frame_wall);
@@ -2234,7 +2324,8 @@ void ModelEditor::ui_elements() {
         return std::string(buf);
     });
     list("Triangles", (int)M.tris.size(), Elem::Tri, [&](int i) {
-        snprintf(buf, sizeof buf, "%4d  %d, %d, %d  %s%s", i, M.tris[i].a, M.tris[i].b, M.tris[i].c, M.tris[i].shell ? "shell" : "cab", M.tris[i].collision ? "" : " (no collision)");
+        snprintf(buf, sizeof buf, "%4d  %d, %d, %d  %s%s", i, M.tris[i].a, M.tris[i].b, M.tris[i].c, M.tris[i].fem ? "FEM" : M.tris[i].shell ? "shell" : "cab",
+                 M.tris[i].collision || M.tris[i].fem ? "" : " (no collision)");
         return std::string(buf);
     });
     list("Wheels", (int)M.wheels.size(), Elem::Wheel, [&](int i) {

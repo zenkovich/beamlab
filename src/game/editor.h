@@ -54,12 +54,12 @@ public:
         Select, Line, Node, Rect, Circle, PushPull, Move, Rotate, Scale, Tape, Erase, Tri, Shell, Shock, Rod, Wheel,
         Undo, Redo, Save, Drive, Physics, Close, Eye, EyeOff, Lock, Unlock, Plus, Trash, Edit, Copy, Quad, Grid, Floor,
         Symmetry, Snap, Frame, Chain, Pairs, Fill, Mirror, Connected, Grow, Invert, Hide, Show, Triangulate, Mesh, Link, Ids,
-        Width, Blast, Shoot, Laser, Merge, Joint, Divide, Count
+        Width, Blast, Shoot, Laser, Merge, Joint, Divide, FemTri, Count
     };
 
 private:
     enum class Mode { Edit, Deform, Physics, Drive };
-    enum class Tool { Select, Line, Node, Rect, Circle, PushPull, Move, Rotate, Scale, Tape, Erase, Tri, Shell, Shock, Rod, Wheel, Merge, Joint, Count };
+    enum class Tool { Select, Line, Node, Rect, Circle, PushPull, Move, Rotate, Scale, Tape, Erase, Tri, Shell, Shock, Rod, Wheel, Merge, Joint, FemTri, Count };
     enum class Elem { None, Beam, Shock, Hydro, Tri, Wheel, Joint };
     enum class Drag { None, Box, MoveFree, MoveAxis, Orbit, Pan, SplitX, SplitY, SplitXY, Grab, Erase };
     struct View {                    // a view of the model: the perspective one orbits, the others are orthographic
@@ -118,10 +118,11 @@ private:
     void select_invert();
     void select_grow();
     void select_by_preset(int group);
-    // the selection filter: the kinds a selection holds (its triangles as shells and cab faces); only: keep that kind
-    // alone, else drop it (Alt+1 - 8, Alt+Shift+1 - 8)
-    enum class SelKind { Nodes, Beams, Shells, Cab, Shocks, Rods, Wheels, Joints, Count };
+    // the selection filter: the kinds a selection holds (its triangles as shells, cab faces and FEM shells); only: keep
+    // that kind alone, else drop it (Alt+1 - 9, Alt+Shift+1 - 9)
+    enum class SelKind { Nodes, Beams, Shells, Cab, Shocks, Rods, Wheels, Joints, Fem, Count };
     int sel_count(SelKind k) const;
+    static SelKind tri_sel_kind(const edit::Tri& t) { return t.fem ? SelKind::Fem : t.shell ? SelKind::Shells : SelKind::Cab; }
     static const char* sel_kind_name(SelKind k, bool many);
     void select_filter(SelKind k, bool only);
     void ui_selection_filter();
@@ -150,8 +151,10 @@ private:
     int node_from_pick(const Pick& pk); // an existing node, or a new one (splitting a beam when the pick was on it)
     int twin_or_self(int n) const;   // the mirror twin, the node itself on the plane, -1 without
     void add_beam_sym(int a, int b);
-    void add_tri_sym(int a, int b, int c, bool shell = false);
-    void triangulate_selection(int mode); // 0 beams, 1 cab triangles, 2 shell triangles
+    void add_tri_sym(int a, int b, int c, int kind = 0); // 0 cab, 1 shell (sheet element), 2 FEM shell
+    void triangulate_selection(int mode); // 0 beams, 1 cab triangles, 2 shell triangles, 3 FEM triangles
+    int face_kind() const { return m_face_mode == 3 ? 2 : m_face_mode == 2 ? 1 : 0; } // (the new faces' add_tri_sym kind)
+    void hull_selection();                // the convex hull of the selected nodes as collision hull triangles
     void move_selection(vec3 delta);
     void op_apply(const std::function<vec3(vec3)>& f); // move / rotate / scale: the start positions mapped by f
     std::vector<int> selection_with_twins() const;
@@ -255,6 +258,7 @@ private:
     void ui_file_menu();
     void ui_view_popup();
     void ui_template_window();
+    edit::Model make_template(int tpl) const; // (the New model window's templates, with its sizes)
     void ui_copy_window();
     void ui_physics_panel();
     void ui_structure();
@@ -272,6 +276,11 @@ private:
     vec3 shell_preset_color(int preset) const;
     void apply_shell_preset_to_selection(int preset);
     void ui_shell_presets();
+    // the FEM shells (Model::fem_presets): the list, its window, the colour a preset's triangles are drawn in
+    void ui_fem_presets();
+    void ui_fem_window();
+    vec3 fem_preset_color(int preset) const;
+    void apply_fem_preset_to_selection(int preset);
     void ui_shell_window();
     void apply_preset_to_selection(int group);
     void set_selection_layer(int layer);
@@ -365,7 +374,7 @@ private:
     // options
     bool m_symmetry = true, m_snap = true, m_show_ids = false, m_fill = true, m_grid = true, m_floor = true;
     float m_snap_size = 0.05f, m_work_y = 0.0f;
-    int m_face_mode = 1;             // new faces (rectangle, circle, push / pull): 0 none, 1 cab triangles, 2 shells
+    int m_face_mode = 1;             // new faces (rectangle, circle, push / pull): 0 none, 1 cab triangles, 2 shells, 3 FEM
     bool m_rect_diagonals = true, m_circle_center = true, m_ref_snap = true, m_ref_show = true;
     float m_merge_tol = 0.01f;       // merge by distance: nodes closer than this (m)
     int m_joint_type = 1;            // the joint tool's joint (phys::FrameJoint)
@@ -388,6 +397,9 @@ private:
     int m_shell_preset = 0;          // the material of new shell triangles (Model::shell_preset)
     bool m_shell_window = false, m_shell_new = false;
     int m_shell_edit = -1;
+    int m_fem_preset = 0;            // the shell of new FEM triangles (Model::fem_preset)
+    bool m_fem_window = false;
+    int m_fem_edit = -1;
     edit::BeamGroup m_preset_draft;
     bool m_drag_pushed_ui = false;   // a panel's drag field took its undo snapshot
     bool m_show_binding = false;     // the Graphics tab is open: the bindings are drawn
@@ -397,6 +409,7 @@ private:
     int m_tpl_n[3] = {3, 2, 2};
     vec3 m_tpl_size{2.0f, 1.0f, 1.0f};
     float m_tpl_mass = 400;
+    float m_tpl_mm = 1.0f;           // the FEM templates' steel thickness
     // drawing of the filled triangles
     GpuMesh m_tri_mesh;
     int m_tri_mesh_count = -1;

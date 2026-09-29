@@ -578,7 +578,7 @@ void ModelEditor::tool_input() {
     case Tool::Rotate:
         if (m_op_stage >= 1) has_anchor = true, anchor = m_op_a;
         break;
-    case Tool::Tri: case Tool::Shell: case Tool::Shock: case Tool::Rod: case Tool::Wheel:
+    case Tool::Tri: case Tool::Shell: case Tool::FemTri: case Tool::Shock: case Tool::Rod: case Tool::Wheel:
         if (!m_picks.empty()) has_anchor = true, anchor = M.nodes[m_picks.back()].p;
         break;
     default: break;
@@ -916,6 +916,7 @@ void ModelEditor::tool_input() {
     // ---- node picks: triangle / shell (3), shock / rod / wheel (2); a click off a node makes one
     case Tool::Tri:
     case Tool::Shell:
+    case Tool::FemTri:
     case Tool::Shock:
     case Tool::Rod:
     case Tool::Wheel: {
@@ -923,7 +924,7 @@ void ModelEditor::tool_input() {
             if (m_picks.empty()) push_undo();
             const int n = node_from_pick(m_pick);
             if (std::find(m_picks.begin(), m_picks.end(), n) == m_picks.end()) m_picks.push_back(n);
-            const size_t need = m_tool == Tool::Tri || m_tool == Tool::Shell ? 3 : 2;
+            const size_t need = m_tool == Tool::Tri || m_tool == Tool::Shell || m_tool == Tool::FemTri ? 3 : 2;
             if (m_picks.size() == need) {
                 finish_picks();
                 m_picks.clear();
@@ -940,15 +941,17 @@ void ModelEditor::finish_picks() {
     const int a = m_picks[0], b = m_picks[1];
     switch (m_tool) {
     case Tool::Tri:
-    case Tool::Shell: {
+    case Tool::Shell:
+    case Tool::FemTri: {
         int c = m_picks[2];
         // facing the camera of the view it was made in
         int bb = b;
         const vec3 pa = M.nodes[a].p, pb = M.nodes[b].p, pc = M.nodes[c].p;
         const vec3 n = cross(pb - pa, pc - pa);
         if (dot(n, to_model(m_views[m_active_view].cam.pos) - (pa + pb + pc) * (1.0f / 3)) < 0) std::swap(bb, c);
-        add_tri_sym(a, bb, c, m_tool == Tool::Shell);
-        m_status = m_tool == Tool::Shell ? "Shell triangle added (a triangle element of the sheet)" : "Cab triangle added";
+        add_tri_sym(a, bb, c, m_tool == Tool::FemTri ? 2 : m_tool == Tool::Shell ? 1 : 0);
+        m_status = m_tool == Tool::FemTri ? "FEM triangle added (a shell element of the frame)"
+                   : m_tool == Tool::Shell ? "Shell triangle added (a triangle element of the sheet)" : "Cab triangle added";
         break;
     }
     case Tool::Shock: {
@@ -1238,7 +1241,8 @@ void ModelEditor::hotkeys() {
     static const K keys[] = {{ImGuiKey_Space, Tool::Select}, {ImGuiKey_L, Tool::Line},   {ImGuiKey_N, Tool::Node},   {ImGuiKey_R, Tool::Rect},
                              {ImGuiKey_C, Tool::Circle},     {ImGuiKey_P, Tool::PushPull}, {ImGuiKey_M, Tool::Move},  {ImGuiKey_O, Tool::Rotate},
                              {ImGuiKey_K, Tool::Scale},      {ImGuiKey_U, Tool::Tape},   {ImGuiKey_E, Tool::Erase},  {ImGuiKey_T, Tool::Tri},
-                             {ImGuiKey_Y, Tool::Shell},      {ImGuiKey_J, Tool::Shock},  {ImGuiKey_H, Tool::Rod},    {ImGuiKey_B, Tool::Wheel}};
+                             {ImGuiKey_Y, Tool::Shell},      {ImGuiKey_J, Tool::Shock},  {ImGuiKey_H, Tool::Rod},    {ImGuiKey_B, Tool::Wheel},
+                             {ImGuiKey_Q, Tool::FemTri}};
     for (const K& k : keys)
         if (pressed(k.key)) set_tool(k.tool);
     if (pressed(ImGuiKey_G)) m_snap = !m_snap;
