@@ -51,8 +51,8 @@ Useful command line options (`./build/beamlab --help`):
 | `--crane lift[,frame[,roll,pitch]]` | hang the player vehicle `lift` m up by the top of its frame (its highest nodes), tilted (degrees), let go at that frame (-1: never): the suspension's droop; `BL_SHOCKDBG=<frame>` prints the wheels' place, camber and toe in the body's frame |
 | `--shots <file>` | screenshot series in one run: one shot per line, `<frame> <camera preset> <png> [beams] [noui] [pause]` (`beams`: wireframe on top, `noui`: no menus or labels, `pause`: physics stops from that frame) |
 
-Diagnostics: `BL_SHOCKDBG=<frame>` prints every shock of every body at that frame (length against its rest length and
-bounds, spring and stop stiffness); `BL_EDITOR_GRAVITY=1`, `BL_EDITOR_SPEED=<x>` and `BL_EDITOR_CRANE=<m>` set up the model
+Diagnostics: `BL_DRIVEDBG=1` prints the player's engine, clutch and the torque reaching each wheel twice a second; `BL_WELDDBG=1` prints each weld that lets go (which, how far it was pulled, the force). The status line of a scripted run (`--action`, `--drive`) gives the panels' shake on their welds: the welded nodes' centre against the frame's point, as its speed (rms and most) and as it moves from one frame to the next (what the eye sees); `BL_MOVEDBG=<m/s>` names each weld that moves faster, `BL_JITTERDBG=1` the ones whose speed passes 0.25 m/s and the membrane's edges out of their band. `BL_HULL=0` leaves the hull triangles out of the collisions (the two-car tests still measure how far one frame got into the other's hull: the Scene status line). `BL_SHOCKDBG=<frame>` prints every shock of every body at that frame (length against its rest length and
+bounds, spring and stop stiffness); `BL_SHOCKLOG=1` prints the player's springs every frame, each as the share of its stroke from the short bound (0) to the long (100; below 0: in its bump stop); `BL_EDITOR_GRAVITY=1`, `BL_EDITOR_SPEED=<x>` and `BL_EDITOR_CRANE=<m>` set up the model
 editor's physics test (with `BL_EDITOR_VEHICLE` / `BL_EDITOR_FILE` and `BL_EDITOR_PHYSICS`); `BL_SHELLDBG=<frames>` prints the triangle-element sheets every N frames (triangles per refinement level,
 refinements, cracks, pieces, total area, a closed sheet's volume and centre, the fastest awake node with its stability
 budget); `BL_BARREL_SEG=<n>` (segments round a barrel's wall), `BL_BARREL_SHIFT=<0-2>` (its short steps),
@@ -188,8 +188,8 @@ absorbers, steering rods (hydros), orientation joints, cab triangles (collision 
 - **Tools** (left, icons; SketchUp-like): *Select* (Space: click, Shift adds, Ctrl toggles; a box left to right takes
   what is inside, right to left what it touches; drag a selected node or a gizmo arrow to move; double click: the
   connected nodes, a whole face; the **selection filter**: Properties lists what is selected by kind (nodes, beams,
-  shells, cab triangles, shocks, rods, wheels, joints), *Only* keeps one kind, x deselects it; Alt+1 - 8 and
-  Alt+Shift+1 - 8 do the same), *Line* (L: beams from click to click, a node made where a click lands off a node, on
+  shells, cab triangles, shocks, rods, wheels, joints, FEM triangles), *Only* keeps one kind, x deselects it; Alt+1 - 9
+  and Alt+Shift+1 - 9 do the same), *Line* (L: beams from click to click, a node made where a click lands off a node, on
   a beam the beam is split; the start closes a loop), *Node* (N: in any of the four views: the 3D and top views put it
   on the work plane, the front and side views at the depth of the selected node, the new node is selected),
   *Rectangle* (R: divisions, diagonal beams, cab or shell faces, in the view's plane), *Circle* (C: sides, a centre
@@ -198,7 +198,8 @@ absorbers, steering rods (hydros), orientation joints, cab triangles (collision 
   the preview and the physics test write no cockpit node, whose eight beams would lie along a flat shape's edges), *Move* (M; Ctrl at
   the first click moves a copy), *Rotate* (O: centre, reference, angle; 15 degree steps with snap), *Scale* (K; an
   arrow key: one axis), *Tape measure* (U), *Merge* (a node, then the node it goes into: its elements go along, with symmetry the twins too), *Eraser* (E:
-  click or drag), *Triangle* (T), *Shell* (Y), *Shock* (J),
+  click or drag), *Triangle* (T), *Shell* (Y), *FEM triangle* (Q: three nodes, a triangle element of the FEM frame of
+  the FEM shell chosen in the options; Rectangle, Circle and Push / Pull make them with Faces: FEM triangles), *Shock* (J),
   *Steering rod* (H), *Wheel* (B), *Joint* (frame elements: a click near a member's end joins it to its node with
   the joint chosen in the options, welded / ball / hinge_v / hinge_h / swivel / elastic; Shift+click: its preset's
   joint again; the ends are drawn as dots in the joint's colour). Points snap to nodes, beam midpoints and edges, the red / green / blue axes from the
@@ -216,8 +217,18 @@ absorbers, steering rods (hydros), orientation joints, cab triangles (collision 
   loads at which it yields; new models have "Steel tube 40x2". To turn a model of held beams (joints) into a frame:
   set its preset's type to frame element. "Apply" moves the selection's beams to
   the checked preset; the Properties tab changes their type or ends directly (a preset variant is made).
+- **FEM shells** (left, under Shell materials): the material and thickness of FEM triangles (`set_fem_shell`): the
+  list with each one's colour and count (its area and mass in the tooltip), + from ready-made ones (body steel 0.8 / 1
+  mm, floor steel 1.5 mm, reinforcement 2.5 mm, aluminium, carbon, plastic) or a copy, the window (name, frame material
+  with its modulus, yield and elongation, thickness with its kg/m2, colour), delete, "Apply to selection" (the selected
+  triangles and the triangles among selected nodes become FEM triangles of it). A triangle's Kind in Properties has
+  "FEM shell" and its shell; the utilities cover a selection with FEM triangles; the physics test shows the triangles'
+  peak load and how many yielded or tore. File > New: FEM plate and FEM box (hollow, n x n cells a face) of a steel
+  thickness.
 - **Utilities** (left, a row each with its icon and key): beams along the selection (Ctrl+B) or between all pairs
-  (Ctrl+Shift+B), a face over 3 - 4 nodes (Ctrl+F), triangulate the selection with beams, cab triangles or shells, mirror
+  (Ctrl+Shift+B), a face over 3 - 4 nodes (Ctrl+F), triangulate the selection with beams, cab triangles or shells, a
+  collision hull round the selection (the convex hull of the selected nodes as hull triangles: select a frame's outer
+  corners; a triangle's Kind in Properties is cab / shell / hull, hull triangles are amber in the views), mirror
   (Ctrl+M), duplicate and move (Ctrl+D), delete, merge the selected nodes into one (Ctrl+J: at their centre, a fixed
   one stays put; with symmetry their twins on the other side too), merge the nodes closer than a distance (a weld of the
   selection or of everything; the distance in the Merge tool's options), select connected / grow / invert, frame,
@@ -232,7 +243,7 @@ absorbers, steering rods (hydros), orientation joints, cab triangles (collision 
   drivetrain, the camera nodes; *Cockpit node*: a cinecam node above the centre on eight beams to the nearest nodes,
   off unless ticked, since it is a node and beams of its own that take a share of the dry mass: it used to be written
   for every model; a copy of a vehicle with a cinecam keeps it, an older editor file reads back without it). File > "Copy a vehicle" and File > "New from a template" (cart, box, plate, sheet,
-  cylinder, empty) open windows of their own; the checks are in Properties with nothing selected.
+  cylinder, empty, FEM plate, FEM box) open windows of their own; the checks are in Properties with nothing selected.
 - **Graphics**: a copy of any vehicle (File > "Copy a vehicle", or the game's Editor menu > "Edit the current vehicle")
   keeps its graphics: the flexbodies, the props, the cab submeshes with their texture coordinates, the managed
   materials, the mesh wheels; the model is saved in the vehicle's own folder (where its meshes are) under a name of
@@ -288,8 +299,12 @@ absorbers, steering rods (hydros), orientation joints, cab triangles (collision 
 - **Welds** (file only): `welds` lines `anchor, sheet node, radius m, strength N[, stiffness N/m[, anchor2, t]]` hold a
   sheet on a frame node (or on the point t of the way along the member to anchor2) at a point: the anchor holds the
   weighted centre of the sheet's nodes within the radius (reached across its triangles, weights (1 - d / radius)^2)
-  at its rest offset, turned with the anchor's frame node; past the strength it lets go. A vehicle whose panels are
+  at its rest offset, turned with the anchor's frame node (the pull's moment turns the node back); past the strength
+  it lets go. A vehicle whose panels are
   welded has their plane held by the membrane projection (steel's and glass's strength).
+- **Hull triangles**: cab option `h` (with `c`): a one-sided, solid collision triangle facing out (its winding), not
+  drawn on a sheet body; see Inter-body collisions. View > Collision geometry draws them amber with a tick along the
+  outward normal (torn ones are no longer drawn).
 - **Tests**: **Physics test** (Ctrl+P) simulates the model where it stands without gravity (G toggles it, Space
   pauses, R restarts): use the game's tools in any view (1 - 4: grab a node, destroy by sweeping, shoot projectiles, cut with the laser; their radius, projectile, speed, rate, range in the left panel; the grab's strength 0.05x - 20x with 0.2x / 1x / 5x buttons, or the mouse wheel while pulling); the speed of the simulation from 0.01x to 2x (the slider, - and =, Backspace: real time; paused, Step or N moves on by 10 ms), kept from one test to the next, the game's own speed back afterwards and watch it flex, the beams drawn through the
   see-through meshes (without the joints' frame axes, which looked like stray beams), frame elements in steel blue
@@ -301,9 +316,15 @@ absorbers, steering rods (hydros), orientation joints, cab triangles (collision 
   flexbodies with forsets, props, managed materials, engine, brakes, cameras, cinecam) plus the BeamLab `joints`
   (parent, child, stiffness N/m, break force N[, ref x node, ref y node]) and `shells` sections and frame elements:
   beams with the option `F` take the section of the last `set_frame_section material, shape, outer m, wall m[, joints[,
-  joint N m/rad]]` (shape tube / box / rod / bar; joints rigid / ball / hinge_v / hinge_h / swivel / elastic for both
-  ends or `a/b` for each, pinned1 / pinned2 as before) and a member's own joints after its options (`a, b, F, ball,
-  rigid`); the beam defaults a
+  joint N m/rad[, break force N[, joint damping N m s/rad]]]]` (shape tube / box / rod / bar; joints rigid / ball /
+  hinge_v / hinge_h / swivel / elastic for both ends or `a/b` for each, pinned1 / pinned2 as before; a break force makes
+  the members mounts that tear off their first node when the force at their ends stands past it for 5 ms - a bolt, a
+  hinge, a bracket; the damping makes a released joint resist turning against its node - a door's hinge, a ball joint's
+  friction; both in the frame preset's panel) and a member's own joints after its options (`a, b, F, ball,
+  rigid`), and `mounts` (node a, node b, break force N[, stiffness N/m[, turning damping N m s/rad]]: a part's frame
+  node b held on the frame at a distance, see Frame elements; the editor does not write them yet), `fem_tris` (n1, n2,
+  n3: triangle elements of the FEM frame, of the last `set_fem_shell material, thickness m[, r, g, b]` before them - a
+  triangle before any is 1 mm steel; the colour paints the vehicle's plates); the beam defaults a
   vehicle's shocks, hydros and wheels were defined under (set_beam_defaults_scale applied where the builder applies it),
   its node friction on the wheels and `enable_advanced_deformation` are kept. Layers, groups and the reference are
   comments the game's parser ignores. `tools/test_ror_parser.cpp` writes every template, the sheet car and two
@@ -349,7 +370,12 @@ absorbers, steering rods (hydros), orientation joints, cab triangles (collision 
 | Sheet Shapes | triangle-element sheets of other shapes and sizes along a lane: a 6 x 4 m steel gate (1.1 t) across it, an aluminium half-pipe (2.6 m radius, 6 m long) to drive through, panels on stands (lead disc, glass ring, plywood triangle, aluminium L), an acrylic dome 4 m across; for the car, the balls and the laser |
 | Yaris body-in-white (vehicle `yaris_biw`) | a real car body from a public crash-test finite element model, simplified for real time by `tools/import_lsdyna_car.py`: the 2010 Toyota Yaris coarse LS-DYNA model of the Center for Collision Safety and Analysis (George Mason University, sponsored by the FHWA; `assets/vehicles/yaris_biw/SOURCE.txt`). Its 137 000 structural shell elements (rails, floor, tunnel, firewall, rockers, pillars, roof rails, cross members, wheel wells, bumper beams, door / hood / boot inner panels, hinges) are clustered on a 0.3 m grid into a 266-node frame of 3000 beams (element adjacency, a 2-ring of bracing and 8 long braces per node: a single layer of clusters is a plate lattice that bends freely), the outer skins (doors, hood, fenders, body sides, roof, boot lid, bumper covers) are decimated by vertex clustering at 0.15 m into 450 triangle elements hung on the frame nodes within reach, and four wheels with a steering rack are put at the model's tyres. Frame beams yield at 8 kN (`enable_advanced_deformation`: the format raises smaller thresholds to 400 kN otherwise) so a wall crash crumples instead of bouncing. The car is in the Vehicle list, group "Crash-test FE models"; the crash test: `--scene crash --vehicle yaris_biw/yaris_biw --spawn -6,260,0 --launch 80` |
 | Sheet Car | a hatchback whose body panels are a triangle-element sheet (2 mm steel, 380 triangles) on a deformable space frame: the player's car and a parked one 130 m down a lane with a wall, poles and cones; "Launch at 80 km/h" crashes them (the bodies dent, refine and crack, the cage bends; F3 shows the mesh). The vehicle `sheet_car/sheet_car` is written by `tools/make_sheet_car.py`; it drives and steers like any other vehicle and can be picked in other scenes |
-| Frame Car | a five-door hatchback (4.0 m, 980 kg) on a welded space frame of FEM frame elements (`tools/make_frame_car.py`: chromoly tube 50 x 2.5 floor rails from crash beam to crash beam, sills and cross members, 45 x 2.5 A, B, C and D pillars, roof rails and bows, the cowl; aprons, rear rails and posts, towers; some 45 tubes, 387 members) with its panels welded on: sheet steel (roof, hood, fenders, quarters, hatch, rear panel, floor, door skins; crowned and bowed), glass (windscreen, door windows, quarter windows, the hatch's), trim (bumpers a few centimetres off the crash beams, the grille). Each panel has nodes of its own; along each tube it touches a frame node lies under every other panel node (the same point), and each panel node on a tube is a weld (`welds`, `SoftBody::Weld`, 670 of them) that holds the weighted centre of the panel's nodes round it (the pull spread, falling off with the distance) and lets go at 3.5 kN. Four doors: a frame of their own on two hinges (ball joints on a vertical line), a latch that breaks at 12 kN (then the door swings open), a check strap; skin and window welded on. Head and tail lights and the mirrors are little glass and plastic boxes on beams that tear at 1.5 kN. Double wishbones on ball joints, preloaded coil-overs with travel stops; a steering rack (a bar whose ends slide along its housing, one hydro moves it, tie rods of tube on ball joints), steering stops 4 degrees past the lock, rear toe stops. On a test pad: a lane to a concrete wall, a pole, a 15 degree ramp, a curb. Scene menu: drop it from 5 or 10 m, on the roof, a barrel roll at 50 km/h, trip it over the curb at 40 km/h, launch it at the wall at 60 km/h, at the pole at 50 km/h or off the ramp at 70 km/h, head-on into another Frame Car (50 km/h each), another into its side at 50 km/h, a 5 t concrete slab on it from 2.5 m, the giant axe (a 2 t pendulum that swings down under its weight; the sector its blade's edge sweeps is cut, `World::laser_cut`, and the car falls in two), hang it from a crane (level or tilted: the wheels hang in their travel, `tools/test_scenes.py` checks it), grab the roof; F3 shows the frame (steel blue, orange where bent for good). `python3 tools/profile_frame_car.py [scenario ...]` runs these stress tests headless and prints the physics time (mean / 95% / worst), the frame's share, splits, tears, failed solves |
+| Frame Car | a five-door hatchback (4.1 m, 1036 kg) on a welded space frame of FEM frame elements (`tools/make_frame_car.py`: chromoly tube 50 x 2.5 floor rails from crash beam to crash beam, sills and cross members, 45 x 2.5 A, B, C and D pillars, roof rails and bows, the cowl, the aprons; rear rails and posts, towers) with its panels welded on: sheet steel (roof, quarters, rear panel, floor), glass (windscreen, quarter windows), trim (the grille). Each panel has nodes of its own, the metal standing 3.5 cm off its tubes (out along its normal), the glass in its frame's plane on soft welds (its seal: 10 kN/m); along each tube it runs a frame node lies under every other panel node, and each panel node over a tube is a weld (`welds`, `SoftBody::Weld`, 848 of them; the bumpers' covers also where they run near their frame, the doors' skins on their beams) that holds the weighted centre of the panel's nodes round it at that offset and lets go at 2.5 kN; the welded panels' membrane is damped (`SoftBody::membrane_damp` 0.6: their rattle a third of what it was). The parts that come off are frames of their own with their skins welded on, held on the body at a distance by mounts (`mounts`: no member between them, see Frame elements; each part a component of the frame solved on its own) that let go past their break force held 5 ms, far below anything of the body's frame: four doors (a frame with one intrusion beam across, the skin welded to it too; two hinges on a vertical line, 20 kN, their turning damped 4 N m s/rad; a latch that breaks at 12 kN, a check strap); the hood (a frame round its skin, two ribs along under it and one across; two hinges at the cowl, 15 kN, damped; a latch at the front, 6 kN; stays to the towers: it opens 55 degrees); the tailgate alike (hinged at the roof, 75 degrees); the front fenders (a frame round each and round the wheel arch, on four bolts, 9 kN each); the bumpers (a polypropylene cover, a profile swept round the corners to the wheel arches, on a frame of plastic tube - two rails and ribs - on plastic clips 8-18 cm off the crash beam and the cross above it, 2.5 kN); the mirrors (a plastic box on a plastic arm on three feet on the front door that bends and tears off at 500 N). The latches are springs of 3e5 N/m between components (explicit: 1e6 shook a lid's light latch node loose as the car stood). Head and tail lights are little glass boxes, every node on beams to four frame nodes round the box, tearing at 2.5 kN. Engine 420 N m, all-wheel drive: 0-100 km/h in about 7 s. The engine and gearbox (140 kg) weigh on the floor rails' nodes in the engine bay, the tank and battery (40 kg) on the rear floor's, the interior (280 kg) on the body's floor-level frame nodes alike; 60 kg of dry mass is spread over the members (spread over them all, the parts' frames took their share: a hood of 35 kg). Double wishbones on ball joints (damped 3 N m s/rad: a wishbone torn loose does not swing freely), preloaded coil-overs with travel stops; a steering rack behind the axle (a bar whose ends slide along its housing, one hydro moves it - a negative factor, the rack goes right for a right turn; arms of the rack out to the wishbones' pivot line carry the tie rods' inner ball joints, so the tie rods are as long as the arms), steering stops 4 degrees past the lock, rear toe stops. A collision hull of 50 big triangles on the frame's own nodes (floor, sides, the doors on their own frames, roof, windscreen, under the hood, front, the tailgate's opening, tail: cab option `h`, a few centimetres inside the panels, not drawn) keeps two cars' frames apart. On a test pad: a lane to a concrete wall, a pole, a 15 degree ramp, a curb. Scene menu: drop it from 5 or 10 m, on the roof, a barrel roll at 50 km/h, trip it over the curb at 40 km/h, launch it at the wall at 60 km/h, at the pole at 50 km/h or off the ramp at 70 km/h, head-on into another Frame Car (50 km/h each), another into its side at 50 km/h, a 5 t concrete slab on it from 2.5 m, the giant axe (a 2 t pendulum that swings down under its weight; the sector its blade's edge sweeps is cut, `World::laser_cut`, and the car falls in two), hang it from a crane (level or tilted: the wheels hang in their travel, `tools/test_scenes.py` checks it), grab the roof; F3 shows the frame (steel blue, orange where bent for good). `python3 tools/profile_frame_car.py [scenario ...]` runs these stress tests headless and prints the physics time (mean / 95% / worst), the frame's share, splits, tears, failed solves; `BL_NOPANELS=1` draws the frame without the panels |
+| Frame Car: Head-on / Side impact / Wall / Pole / Drop 10 m / Slab / Giant axe / Barrel roll | the Frame Car's crash tests (the report's videos) as scenes of their own: the Frame Car scene with that Scene menu test started on the first frame and the free camera on it; F5 runs it again, the other tests stay in the Scene menu |
+| Buggy | an unlimited-class desert racer (a Class 1 buggy, 4.5 m, 1460 kg, 3.1 m wheelbase, 2.1 m track, 39 inch tyres; `tools/make_buggy.py` on the Frame Car's generator library `tools/fem_car.py`) on a welded chromoly cage of FEM frame elements: floor rails and sills, the main hoop braced back to the rear shock hoop, a triangulated front clip with a tube bumper (a box of rails and posts folded up as a mechanism once its joints yielded, and two of them head-on went into each other), the tail kicked up behind the transaxle (a tail at 0.64 m struck a kicker's face with the rear bottomed out). Aluminium panels welded on (roof, a 2 mm floor pan) and parts on bolts at a distance that let go: the nose (5 kN), the side panels and the engine cover (4 kN; on soft 2.5-4e5 N/m mounts: the cage flexing a few millimetres between a panel's bolts at a 5 m drop tore stiffer ones). Long-travel suspension from the linkages' kinematics: double wishbones in front (46 cm up, 21 down), trailing arms at the rear pivoting at the main hoop's foot (52 up, 26 down; the shocks leaning forward on the hoop over the floor's rear cross: a rising rate, 0.75 to 0.82), coil-overs of 1.1 and 0.95 Hz preloaded to hold the design height, damped at 0.45 of critical, their last 10 cm of wheel travel in a bump stop (spring and damping growing to 8 x the static load), hard stops and droop straps as shocks at the design length; anti-roll bars of FEM tube (a torsion tube in two bearings - a member along its axis, a swivel at the bar's end - levers and drop links to the arms; soft springs alone rolled it over at 0.8 g); the rear wheels' torque reacted on the frame over the axle (from the shock's top, 31 degrees off the vertical, the reaction's pair of forces pushed the wheel down and lifted the car 0.1-0.3 m on the throttle). V8 850 N m, four speeds, rear-wheel drive: 0-100 km/h in about 7 s (on asphalt the tyres hold it to ~0.45 g). The Frame Car's test pad with a gravel lane: ten 0.5 m whoops every 8 m and a tabletop jump (a 2.2 m kicker curving up to 12 degrees, a 16 m table, a 20 m landing); the Scene menu has the Frame Car's tests and the whoops at 80 km/h and the jump at 90 |
+| Buggy: Head-on / Side impact / Wall / Drop 10 m / Slab / Barrel roll / Whoops / Jump | the Buggy's tests as scenes of their own (the Frame Car's tests' scenes alike) |
+| FEM Shells | triangle elements of the FEM frame (see Frame elements): a 2 x 2 m sheet of 3 mm steel (16 x 16 cells) on two supports, a 1.5 x 0.5 m cantilever of 8 mm steel clamped in a block, a hollow 1 m cube of 2 mm steel (5 x 5 cells a face). Scene menu: a 40 kg steel ball on the sheet from 3 or 10 m, a 500 kg block on it from 1 m (it folds to the ground), 100 kg welded under the cantilever's tip (a box of lead: it springs) or 250 kg (past its plastic moment: it folds at the root), 1 t dropped on its tip, the cube dropped 5 m on a face or a corner, 1 t spread on its lid, a 1 t slab dropped on it, the cube thrown at the wall at 50 km/h. F3 draws the triangles (pale blue, orange where yielded; F4: by load) |
+| Shell Car | a prototype whose body is a shell of FEM triangles with no frame under it (`tools/make_shell_car.py`: the Sheet Car's outline, 316 nodes, 560 triangles; 0.9 mm steel skin, a 1.5 mm floor, 2.5 mm round the suspension's mounts; 1043 kg). Trailing arms on the floor and a coil-over to a tower braced to the side walls at each corner, 260 N m front-wheel drive. The Frame Car's test pad and Scene menu (crashes, drops, the slab). A first look: it drives and crumples, its closed shell costs ~9 ms a frame to factor |
 | Steel Barrels | 200 l steel drums (572 x 880 mm, 1.0 mm steel of 200 MPa, 16 kg; `build_barrel`): the wall and both ends one closed sheet of 480 triangle elements (a 20 x 9 grid round the wall, rings and a fan on the ends), the two rolling hoops pressed out 8 mm at a third and two thirds, the ends dished in 2 cm inside a flat band at the rim (a drum stood on another rests on the band; on a slope down to the middle it was pushed off) and every node up to 3 mm off the true surface (a flat end and a true cylinder cannot start to buckle: they held 60 times what a real drum takes and nothing dented); the membrane is projected (a quarter of steel's yield force in the plane: 9 cm triangles stand for a wall that folds in waves of a few centimetres), bending is plastic from 0.01 rad with some work hardening; the ends are shaded apart from the wall (a crease at 45 degrees). A second kind (Scene menu: "with FEM rings", green in the front row) has the chimes and hoops as rings of 8 mm frame elements too (their stretch left to the membrane: a hundredth of their axial stiffness): the ends and hoops stay round, the wall between dents. A pad with a 15 degree ramp and a wall; the Scene menu drops one on its bottom from 1 or 5 m, on its side from 2 or 10 m, on the rim from 2 m, rolls it down the ramp, kicks it into the wall, throws one at another at 8 m/s, stands one on another, drops one onto another from 1.5 or 3 m, drops a 40 kg steel ball on one from 3 or 8 m and shoots it at one against the wall at 20 m/s. Scene menu too: tip one over (a push at its top). Drops dent the chimes and pop the dished ends out, the ball dents it deep (20% of its volume from 3 m; from 8 m it tears) and rolls off (projectiles meet the drums as spheres: `SoftBody::sphere_ball`, `sphere_target`; the drums meet each other node against triangle), a ball shot at one against the wall crushes it to half; knocked over or dropped they come to rest where they land, and left alone they stay where they are. `tools/test_scenes.py` checks each by the drum's volume (`BL_SHELLDBG` prints it), the frame rings, the ball's clearance, the tip, coming to rest and the drift at rest |
 | Stress: Barrel pile | 15 steel drums on their sides in a pile (5 - 4 - 3 - 2 - 1, chocks at the bottom row), three more thrown into it one after another at 10 m/s (the sheet drums; `BL_BARREL_FEM=1`: with frame rings). `tools/test_scenes.py` checks the physics time |
 | Tape Maze | 590 m gymkhana course marked only with tape: five lanes joined by hairpins, then a chicane; 450 stakes in 60 tape sections, stage timer, autopilot |
@@ -482,6 +508,61 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     frame box leaves it as a rigid piece and comes to rest on the ground. The Frame Car (181 frame nodes, 273 members,
     579 factor blocks): about 27 us for the members' forces and 66 us for the solve per substep on an M-series core.
     `BL_FRAMEDBG=1` prints why a member splits or breaks; `BL_FRAME_THETA`, `BL_FRAME_DISS` override the step.
+  - *Components and mounts.* The frame's parts joined by members (and by the body's springs between their nodes) are
+    its components: each is ordered (minimum degree), assembled, factored and solved on its own, the components of all
+    the island's frames beside each other on the team (`FemFrame::solve_begin / solve_component / solve_end`; the
+    members' forces in chunks beside the body's other forces, `begin_forces / eval_forces / end_forces`). A part held
+    by mounts (`FemFrame::mounts`, `FrameMount`, the truck's `mounts`) is a component of its own: node b of the part
+    held on a spring with damping at the point of the body's where it stood when made, carried by node a and three
+    frame nodes round it (their positions' affine combination: no node's turning carries it - a 16 cm bracket on a
+    light node's frame spun the node), b free to turn about it (a ball joint: two on a line are a hinge); the spring
+    is explicit (on a steel part's stiff frame 1.5-2e6 N/m, else the most the nodes' masses take at the step), it
+    lets go past its break force held 5 ms, or when a member tears off one of its nodes (its seat torn: the spring on
+    a node left dangling flung it), and the two nodes' turning against each other can be damped (a hinge: implicit on
+    each side against the other's turning at the step's start). A shock on a frame node lets go likewise when that
+    node is torn down to one member or none (`Shock::seat`: the Buggy's shock towers torn off in a head-on left a top
+    of half a kilo on a single tube and the stop's 2e7 N/m, flung at 400 m/s). The Frame Car's 36 mounts made 13 components of 558
+    members (the body 233 nodes): the solve 3.1 -> 2.9 ms a frame summed, beside each other, driving 10.6 -> 9.1 ms.
+    `test_physics fembench [steps]` prints the frame's cost per substep against its members for a ladder truss, a
+    car-like cage, a cubic lattice and the cage cut into 1-13 parts (CSV).
+  - *Mounts and damped joints.* A section's break force (`FrameSection::break_force`) makes its members mounts: the
+    force at their ends (axial and shear) past it accumulates as an overload over time (the force over the break force,
+    less one, integrated; it bleeds off below), and at `FemFrame::kOverloadTime` (5 ms: twice the force for 5 ms, 1.5
+    times for 10) the member tears off its first node - on the peak alone a car dropped 5 m on its wheels rang its
+    stiff frame and lost all four doors, the hood and the fenders. A section's joint damping (`joint_damp`) makes a
+    member with one released end (a hinge, a ball joint) resist its node's turning against the member's welded end's,
+    implicitly (h c on the two nodes' rotations in the system, against each other): explicit, 2 N m s/rad on a lid's
+    light frame node spun it up and tore the lid off as the car stood. Checks: a mount at 0.8 of its force holds, a
+    peak of 4 times it for 1 ms holds, twice it lets go after 5 ms; an arm on a ball joint swings on undamped, comes to
+    rest with 0.5 N m s/rad and hardly moves with 1e5, sound.
+  - *Triangle elements (FEM shells; `FrameTri`, `ShellSection`, `phys/fem_shell.*`).* A thin shell of a frame
+    material (steel, chromoly, aluminium, titanium, carbon, wood, plastic) and a real thickness, solved in the same
+    implicit step as the members, on the same 6-dof frame nodes (a body can be all triangles: a hollow box, a car's
+    body with no frame under it). Each triangle is a flat co-rotational element: its in-plane frame fitted to its
+    corners (the rotation that best maps its rest shape onto them), membrane CST (E t / (1 - nu^2)), bending DKT (Batoz'
+    discrete Kirchhoff triangle, three points; D = E t^3 / 12 (1 - nu^2)), the corners' rotations measured against
+    their rest orientations in that frame, a weak drilling spring (5% of G t A per corner) against the element's
+    in-plane turning; the stiffness in the element's axes turned into the world's block by block, with the geometric
+    stiffness of the membrane's tension, and stiffness-proportional damping (`ShellSection::damping` 3e-4 s: 1% of
+    critical at 10 Hz; at 1e-4 a thin plate's low modes rang for seconds). Plasticity: the membrane's von Mises stress
+    past the yield is returned radially (the rest shape follows the stretch), the bending moment at the three points
+    past the plastic moment sigma_y t^2 / 4 likewise (the corners' rest rotations follow); the damage is the rest
+    shape's largest principal plastic stretch against the authored shape (a state, not a path: a panel shaken on its
+    yield surface did not tear), past the material's elongation the triangle is torn out (its collision triangle with
+    it). Splits, cuts, the destroy tool, compaction and debris handle the triangles like members. A triangle's mass
+    rho t A goes a third to each corner, its rotary inertia to the nodes. A limit: the contacts with other bodies are
+    explicit, a thin shell's node pushed as a free node of a few hundred grams against its members' forces, so a heavy
+    body resting on a thin shell keeps it trembling a little (a 1 t slab on the 2 mm cube: its nodes at a few tenths of
+    a m/s, the cube creeping a few mm a second; taking the node's compliance from the implicit step for resting
+    contacts stopped the creep but made impacts harder and the Frame Car's frames worse). `ShellMesher`
+    builds shells (nodes shared by position, grids, a two-sided collision triangle each). Checks (`test_physics only
+    fem_tri`): a rigid turn makes no force, a cantilever strip's tip across between the plate and the beam results
+    (14.9 mm: 13.9 / 15.2) and along to 0.6%, a clamped square plate's middle within 2% of Timoshenko's table, a free
+    plate spun about three axes keeps its energy (0.9%), a strip at half its first yield springs back, at 0.9 of its
+    collapse load keeps a set, at 1.3 folds, pulled at twice its yield tears; a 1 m box of 2 mm steel dropped 1 m
+    rests, silent in 4 s. The cost: a closed shell's factor grows as n^1.5 (the Shell Car's 316 nodes: 20k block
+    updates, 9 ms a frame; `BL_FACTORDBG=1` prints a frame's factor pattern); `BL_FEMDBG=n` prints every n frames each
+    body's triangles (torn, yielded, peak load, the fastest node).
 - **Wheels.** Node-ring soft tyres generated exactly like `ActorSpawner`. Drive torque is applied as tangential
   tread forces with a reaction on the suspension arm. Brakes use a one-step "stop torque" clamp.
 - **Tyre grip (not RoR).** Tread nodes use a velocity-level Coulomb model: sticking cancels the applied tangential
@@ -495,7 +576,13 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
 - **Drivetrain.** Engine torque curve, automatic clutch and gearbox, and open / locked / viscous / split
   differentials, as in RoR. The clutch capacity follows the current gear (RoR used 1st gear: a torque spike after
   every upshift), the automatic shifts early at part throttle and late at full throttle, with kick-down. A generic
-  traction assist covers mods without TractionControl (Physics menu).
+  traction assist covers mods without TractionControl (Physics menu). The engine's inertia (`engoption`) is in the
+  drivetrain's rpm units: RoR mods use 0.05 - 0.1 with a clutch force of 300 - 1000; the generated cars and the
+  editor's default had 0.35 - 0.4 and 200 (the engine revved ~5x too slowly, the clutch slipped: the Frame Car
+  reached 26 km/h in 5 s) and now use 0.08 and 1000. A body stepping in short steps (a refined sheet: 2 or 4 a
+  substep) runs its controllers once a substep for the whole substep, and its wheels keep the drivetrain's torque for
+  every short step (the short step's length and the torque zeroed after the first ran the engine, the gearbox and the
+  steering 2-4x slow and drove at a fraction of the power: a car with one dented panel crawled).
 - **Aerodynamics.** RoR's per-node drag (-0.05*|v|*v on every node, ~9 kN at 75 km/h on a 440-node car) is applied
   only to each node's velocity relative to the body, so it still damps flapping parts; the body gets real drag
   0.5*rho*CdA*|v|*v from its frontal area.
@@ -508,6 +595,18 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
   triangle touched by several nodes of a heavy body in the same substep is not corrected several times over. The broadphase is a spatial hash of contacter nodes (Teschner et al. 2003) plus a Verlet-style
   candidate list, with an adaptive rebuild interval from a velocity-based margin. Vehicles without collision cabs get
   a convex-hull shell made of their own nodes.
+  - A collision triangle is a thin two-sided surface as thick as the node's body's collision radius: its normal points
+    from the nearest point to the node, so a node pushed past its middle is pushed on through. Thin panels and the
+    frames' nodes between them let two cars go through each other (two Frame Cars head-on ended with their centres
+    0.3 m apart). **Hull triangles** (cab option `h`, `Triangle::two_sided` false) are one-sided and solid: their winding
+    faces out, and a node up to the body's `hull_depth` (0.3 m) behind one, over its face, is pushed back out along its
+    normal. Laid on a frame's own nodes as a coarse closed shell round the body, they keep two frames apart. Behind the
+    face the response only brings the node's outward speed up to the push-out speed (a fifth of the depth a step, at
+    most 2 m/s), counting the forces on both sides so far; RoR's response cancels every inward force of a node in
+    contact and, held deep in a hull for many steps, pumped a ball out by its own springs at 6.5 m/s. A body with hull
+    triangles reaches its hull depth past its box (islands, partners). Hull triangles tear when an edge is stretched
+    2.5 times, when a laser or the axe's cut crosses them (on a sheet body too: before, a sheet body's other collision
+    triangles were never cut) and with frame debris breaking off (they do not hold debris on the body).
   - Each body first gets a list of partners (bodies whose expanded boxes overlap); only nodes inside a partner's box
     enter the hash, and a body's own nodes are skipped in the scans unless it self-collides. A sheet or cloth next to
     other bodies used to scan thousands of its own nodes every rebuild.
@@ -598,6 +697,17 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     / h). The kernel does not yield such a sheet in its plane (its springs are then a small elastic part; the kernel's
     yield of an unconverged overstrain crept a stacked drum flat), and the stability budget goes to the hinges (0.5 of
     it, the edges 0.15; otherwise 0.2 and 0.45). Bending stays explicit, plastic at the plastic moment.
+    `SoftBody::membrane_damp` (0..1, the welded car bodies 0.6, `BL_MEM_DAMP`): in the projection's first sweep the rate
+    of stretch of each edge that left its band in the last 64 short steps is taken down by that part (a velocity
+    projection along the edge: stable at any step, it keeps the momentum, the angular momentum and a rigid turn; every
+    edge in a pass of its own cost 2 ms a frame on the Frame Car). Between the band's soft springs and its hard ends a
+    car's welded panels rattled for good - the floors and the door glass half a millimetre a frame as it stood, nodes at
+    up to a metre a second between frames - where the kernel's own edge, hinge and flex damping (explicit, capped by
+    the step) changed nothing; damped, a third of it (0.3: a half) for 0.4 ms a frame. Checks: `test_physics only membrane`.
+    A welded panel bends as the plate it is (D = E t^3 / 12 (1 - nu^2), t from its areal density; the stability cap
+    above it): at the cap alone a sheet of even triangles had every hinge at its limit at once and rang from step to
+    step (the Buggy's 1.2 mm aluminium eight times too stiff, 7 m/s on its skin as it stood); the Frame Car's cap is
+    below its steel's plate (a thin triangle sets it) and its trim's a little above. `BL_PLATE_BEND=<x>` scales it.
   - **Short steps of a stiff sheet** (`SoftBody::shell_min_shift`): a sheet may take 2^n short steps per substep from
     the start (not only once refined), and its hinges get the 4^n larger budget: the drum's 1.1 mm plate bends with
     its real D = E t^3 / 12 (1 - nu^2) at 4 short steps; at one, a 40 kg ball from 8 m flattened it.
@@ -648,9 +758,12 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
   - **Welds** (`SoftBody::Weld`, `welds.cpp`): a panel held on its frame at points instead of sharing nodes with
     it (a panel on a single shared node tore out round it). Each weld is a damped spring between the anchor (a frame
     node, or a point along a member: its pull shared by the member's two nodes) and the weighted centre of the
-    panel's nodes round the weld's own, its rest offset turned with the frame node; stiffness a quarter of what the
-    short step allows on the pair's effective mass, damping a third of critical; past its strength it lets go (a
-    crash tears panels off along their seams). A laser's (or the axe's) cut breaks the welds whose sheet it crosses.
+    panel's nodes round the weld's own, its rest offset turned with the frame node and the pull's moment, (q off) x f,
+    put on the node's rotation on the frame's step (without it the offset turning with the node pushed the panel
+    and the node never felt it: frames spun up to the solver's clamps); stiffness a quarter of what the short step
+    allows on the pair's effective mass, and for a weld held off its node within a tenth of what the node's
+    rotational inertia takes in a step (k |off|^2 h^2 / I: a lamp 20 cm off a tube's node rang it to pieces), damping
+    a third of critical; past its strength it lets go (a crash tears panels off along their seams). A laser's (or the axe's) cut breaks the welds whose sheet it crosses.
   - **Sheet and frame in one body.** A sheet's renumbering (`reorder_shells`) and its pieces (`detach_pieces`)
     carry the body's FEM frame along (`FemFrame::renumber`, `FemFrame::split_off`: a piece takes its members with
     their state); before, a drum with frame rings came apart into 120 pieces off a 1 m drop.
