@@ -219,6 +219,21 @@ void VehicleVisual::build(const ror::Document& d, const SoftBody& b, std::vector
                 k++;
             }
         }
+        // (tools: BL_EXPORT_FLEX=dir writes each flexbody placed in definition space as dir/<n>_<mesh>.obj)
+        if (const char* ex = getenv("BL_EXPORT_FLEX")) {
+            FILE* fo = fopen((std::string(ex) + "/" + std::to_string(fi) + "_" + fb.mesh + ".obj").c_str(), "w");
+            if (fo) {
+                for (size_t i = 0; i < total; i++) fprintf(fo, "v %.5f %.5f %.5f\n", wp[i].x, wp[i].y, wp[i].z);
+                size_t base = 1;
+                for (const auto& sm : om->submeshes) {
+                    fprintf(fo, "g %s\n", sm.material.c_str());
+                    for (size_t t = 0; t + 2 < sm.indices.size(); t += 3)
+                        fprintf(fo, "f %zu %zu %zu\n", base + sm.indices[t], base + sm.indices[t + 1], base + sm.indices[t + 2]);
+                    base += sm.vertices.size();
+                }
+                fclose(fo);
+            }
+        }
         // bind each vertex to (ref, nx, ny) nodes (RoR FlexBody locator search)
         const float cos_lim = 0.70710678f;
         JobSystem::get().parallel_for((int)total, 256, [&](int b0, int b1, int) {

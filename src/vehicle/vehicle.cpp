@@ -317,13 +317,20 @@ void Vehicle::update_visuals() {
         if (!m_frame) {
             m_frame = std::make_unique<FrameVisual>();
             m_frame->mat = frame_tube_material();
-            if (!body->fem.tris.empty()) { // (the triangle elements' plates: the shell's colour, else a red paint)
+            if (!body->fem.tris.empty()) { // (the triangle elements' plates: the shell's colour, else the paint of a car's sheets)
                 auto m = std::make_shared<Material>(*frame_plate_material());
                 m->name = name + " plates";
-                const vec3 c = !m_def.fem_shells.empty() && m_def.fem_shells[0].color.x >= 0 ? m_def.fem_shells[0].color : vec3(0.78f, 0.12f, 0.10f);
+                const vec3 c = !m_def.fem_shells.empty() && m_def.fem_shells[0].color.x >= 0 ? m_def.fem_shells[0].color
+                               : is_player                                                    ? vec3(0.85f, 0.15f, 0.12f)
+                                                                                              : vec3(0.2f, 0.45f, 0.85f);
                 m->color = vec4(c, 1.0f);
                 m->specular = 0.7f, m->gloss = 60.0f;
                 m_frame->plate_mat = m;
+                // (a body of triangles and members - pillars, sills, rails: the members in its paint too)
+                auto t = std::make_shared<Material>(*frame_tube_material());
+                t->name = name + " members";
+                t->color = vec4(c * 0.92f, 1.0f);
+                m_frame->mat = t;
             }
         }
         m_frame->update(*body);

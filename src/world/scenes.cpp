@@ -1915,13 +1915,34 @@ static void pad_dirt_lane(phys::Heightfield& hf, float x0, float half) {
         }
 }
 
+// A rough field on the dirt pad, x -84..-40, z 105..195, and an earth bank beyond it along the terrain's edge (a car
+// in figure eights wandered off the edge): ground rolling in 3-9 m
+// waves up to half a metre (sums of sines at fixed phases) with smaller bumps on them, dirt, 3 m shoulders to the flat
+const vec3 kRoughField(-62.0f, 0.0f, 150.0f);
+static void pad_rough_field(phys::Heightfield& hf) {
+    for (int iz = 0; iz < hf.nz(); iz++)
+        for (int ix = 0; ix < hf.nx(); ix++) {
+            const vec2 w = hf.origin() + vec2((float)ix, (float)iz) * hf.cell();
+            const float dx = std::fabs(w.x - kRoughField.x) - 22.0f, dz = std::fabs(w.y - kRoughField.z) - 45.0f;
+            const float d = std::max(dx, dz);
+            if (w.x < -104.0f && w.y > 60.0f && w.y < 240.0f) hf.h(ix, iz) += 2.0f * std::min(1.0f, (-104.0f - w.x) / 8.0f); // (the bank)
+            if (d > 3.0f) continue;
+            const float edge = d < 0 ? 1.0f : 0.5f + 0.5f * std::cos(kPi * d / 3.0f);
+            const float x = w.x, z = w.y;
+            float h = 0.16f * std::sin(x * 0.71f + 1.3f) * std::sin(z * 0.83f + 0.4f) + 0.12f * std::sin(x * 0.37f - z * 0.29f + 2.1f) +
+                      0.10f * std::sin(x * 1.13f + z * 0.97f + 0.7f) + 0.07f * std::sin(x * 1.9f - 0.5f) * std::sin(z * 2.3f + 1.1f);
+            hf.h(ix, iz) += (h + 0.2f) * edge;
+            hf.surf(ix, iz) = SURF_DIRT;
+        }
+}
+
 static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt) {
     s_pad.id = vid, s_pad.name = name;
     auto& A = SharedAssets::get();
     g.create_terrain(241, 401, 1.0f, vec2(-120, -100));
     auto& hf = g.world.statics.terrain;
     te::flatten_rect(hf, vec2(0, 100), vec2(116, 196), 0, 0.0f, 3, SURF_ASPHALT);
-    if (dirt) pad_dirt_lane(hf, 80, 5);
+    if (dirt) pad_dirt_lane(hf, 80, 5), pad_rough_field(hf);
     g.finish_terrain();
     // the wall across the main lane, a 15 degree ramp 1.5 m high on the right lane, a curb along the left lane
     g.add_static_box(vec3(0, 1.5f, 150), vec3(4, 1.5f, 0.6f), quat(), SURF_CONCRETE, A.concrete);
@@ -2044,7 +2065,14 @@ static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt)
         g.scene_actions.push_back({"Over the jump at 90 km/h", [kmh](Game& gg) {
                                        frame_car_clear(gg), frame_car_stunt(gg, vec3(80, 0, 115), 0, 0.0f, quat(), vec3(0, 0, 90 * kmh), vec3(0));
                                    }});
+        g.scene_actions.push_back({"To the rough field", [](Game& gg) {
+                                       frame_car_clear(gg), frame_car_stunt(gg, kRoughField + vec3(0, 0.6f, -40), 0, 0.0f, quat(), vec3(0), vec3(0));
+                                   }});
     }
+    if (std::string(vid).find("shell_car") != std::string::npos)
+        g.scene_actions.push_back({"Let the latches go (hood, trunk lid, doors)", [](Game& gg) {
+                                       if (Vehicle* car = gg.player_vehicle()) car->body->fem.release_latches(*car->body);
+                                   }});
     g.scene_actions.push_back({"Hang it from a crane (1 m up)", [](Game& gg) {
                                    if (Vehicle* car = gg.player_vehicle()) car->reset(vec3(0, 0, 20), 0), gg.crane_vehicle(car, 1.0f);
                                }});
@@ -2063,14 +2091,16 @@ static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt)
                           "frame, orange where bent for good. Scene menu: drop it, turn it over, trip it on the curb, launch it at the wall or off "
                           "the ramp. R resets it.";
     if (std::string(vid).find("shell_car") != std::string::npos)
-        g.scene_hint = "A prototype whose body is a shell of FEM triangle elements (no frame: the body is the structure), trailing arms and "
-                       "coil-overs on its floor. F3: the elements, orange where the steel has yielded. Scene menu: drop it, turn it over, "
-                       "launch it at the wall. R resets it.";
+        g.scene_hint = "A saloon on the BMW E36's lines: its body-in-white FEM members (sills, pillars, rails) with sheets of FEM "
+                       "triangles between them (floor, roof, firewall, aprons, quarters), the hood and fenders FEM triangles, the doors, "
+                       "trunk lid and bumpers sheet metal on FEM inner shells - on hinges, latches, clamped bolts, buffers and stays that "
+                       "let go; the Frame Car's suspension. F3: the elements, orange where the steel has yielded. Scene menu: crashes, "
+                       "drops, rolls, the whoops, the jump, the rough field, the latches. R resets it.";
 }
 
 void scene_frame_car(Game& g) { scene_fem_pad(g, "frame_car/frame_car", "Frame Car", false); }
 void scene_buggy(Game& g) { scene_fem_pad(g, "buggy/buggy", "Buggy", true); }
-void scene_shell_car(Game& g) { scene_fem_pad(g, "shell_car/shell_car", "Shell Car", false); }
+void scene_shell_car(Game& g) { scene_fem_pad(g, "shell_car/shell_car", "Shell Car", true); } // (the dirt lane and the rough field: its offroad tests)
 
 
 
@@ -2749,79 +2779,79 @@ const std::vector<SceneInfo>& scene_registry() {
     static std::vector<SceneInfo> s = {
         {"proving", "Proving Ground", "Driving", "Vehicle handling test course", scene_proving_ground},
         {"forest", "Forest", "Driving", "Hills with trees and bushes", scene_forest},
-        {"canyon", "Canyon Bridges", "Driving", "Breakable beam bridges over a chasm", scene_canyon},
         {"offroad", "Offroad Trail", "Driving", "Rocks, mud, sand, logs", scene_offroad},
-        {"rally", "Rally Stage", "Driving", "Gravel stage: trees, tape, hay bales, crests, timer", scene_rally},
-        {"materials", "Materials Lab", "Physics", "Sheets, shapes and bars of 10 materials: drop, press and bending tests, drive-through panels",
-         scene_materials},
-        {"sheet_run", "Sheet Run", "Physics", "Drive through three lead sheets clamped in gates (profiling of sheet fracture)", scene_sheet_run},
-        {"sheet_shapes", "Sheet Shapes", "Physics", "Sheets of other shapes and sizes: steel gate 6 x 4 m, half-pipe, disc, ring, triangle, L, dome",
-         scene_sheet_shapes},
+        {"canyon", "Canyon Bridges", "Driving", "Breakable beam bridges over a chasm", scene_canyon},
         {"tape_maze", "Tape Maze", "Driving", "Gymkhana course marked with tape: lanes, hairpins, chicane, timer", scene_tape_maze},
-        {"rbr_verkiai", "RBR: Verkiai SSS", "Driving", "RBR community stage (RALLY Guru): Lithuanian super special in a park",
+        {"rally", "Rally Stage", "Rally", "Gravel stage: trees, tape, hay bales, crests, timer", scene_rally},
+        {"rbr_verkiai", "RBR: Verkiai SSS", "Rally", "RBR community stage (RALLY Guru): Lithuanian super special in a park",
          [](Game& g) { scene_rbr_stage(g, "verkiai_sss"); }},
-        {"rbr_undva", "RBR: Undva", "Driving", "RBR community stage (RALLY Guru): narrow fast Estonian gravel through forest",
+        {"rbr_undva", "RBR: Undva", "Rally", "RBR community stage (RALLY Guru): narrow fast Estonian gravel through forest",
          [](Game& g) { scene_rbr_stage(g, "undva"); }},
-        {"rbr_travanca", "RBR: Travanca do Monte", "Driving", "RBR community stage (RALLY Guru): Portuguese gravel in wooded hills",
+        {"rbr_travanca", "RBR: Travanca do Monte", "Rally", "RBR community stage (RALLY Guru): Portuguese gravel in wooded hills",
          [](Game& g) { scene_rbr_stage(g, "travanca"); }},
-        {"rbr_fernet", "RBR: Fernet Branca", "Driving", "RBR community stage (RALLY Guru): Argentine gravel through the hills",
+        {"rbr_fernet", "RBR: Fernet Branca", "Rally", "RBR community stage (RALLY Guru): Argentine gravel through the hills",
          [](Game& g) { scene_rbr_stage(g, "fernet_branca"); }},
-        {"crash", "Crash Test", "Driving", "Wall, barrier, poles", scene_crash},
-        {"editor", "Model Editor", "Tools", "The model editor's stage: a flat square, a neutral background (Editor menu, Ctrl+E)", scene_editor},
-        {"sheet_car", "Sheet Car", "Physics", "A car whose body panels are a steel sheet of triangle elements: crash it into a parked one, poles or a wall",
-         scene_sheet_car},
-        {"barrels", "Steel Barrels", "Physics", "200 l steel drums of triangle elements: drop, roll, stack and crash them", scene_barrels},
-        {"frame_car", "Frame Car", "Physics", "A car on a welded space frame of FEM tubes with sheet panels: drive it, drop it, roll it, crash it",
+        {"crash", "Crash Test", "Crash", "Wall, barrier, poles", scene_crash},
+        {"vehicle_crash", "Vehicle vs Vehicle", "Crash", "Configurable crash of two vehicles (Scene menu)", scene_vehicle_crash},
+        {"frame_car", "Frame Car", "Test cars/Frame Car", "A car on a welded space frame of FEM tubes with sheet panels: drive it, drop it, roll it, crash it",
          scene_frame_car},
-        {"fc_headon", "Frame Car: Head-on", "Frame Car tests", "Two Frame Cars head-on at 50 km/h each",
+        {"fc_headon", "Frame Car: Head-on", "Test cars/Frame Car", "Two Frame Cars head-on at 50 km/h each",
          [](Game& g) { scene_frame_car_test(g, "Head-on into another", vec3(4.6f, 1.9f, 57.5f), vec3(0, 0.6f, 62.5f), "Two Frame Cars meet head-on at 50 km/h each."); }},
-        {"fc_side", "Frame Car: Side impact", "Frame Car tests", "Another Frame Car into its side at 50 km/h",
+        {"fc_side", "Frame Car: Side impact", "Test cars/Frame Car", "Another Frame Car into its side at 50 km/h",
          [](Game& g) {
              scene_frame_car_test(g, "into its side", vec3(6.5f, 2.8f, 53.5f), vec3(-1.5f, 0.7f, 60), "A second Frame Car hits the standing one in the side at 50 km/h.");
          }},
-        {"fc_wall", "Frame Car: Wall", "Frame Car tests", "Into a concrete wall at 60 km/h",
+        {"fc_wall", "Frame Car: Wall", "Test cars/Frame Car", "Into a concrete wall at 60 km/h",
          [](Game& g) { scene_frame_car_test(g, "Launch at the wall", vec3(6.5f, 2.4f, 139.5f), vec3(0, 0.7f, 146), "The Frame Car into a concrete wall at 60 km/h."); }},
-        {"fc_pole", "Frame Car: Pole", "Frame Car tests", "Into a concrete pole at 50 km/h",
+        {"fc_pole", "Frame Car: Pole", "Test cars/Frame Car", "Into a concrete pole at 50 km/h",
          [](Game& g) { scene_frame_car_test(g, "Launch at the pole", vec3(22, 2.4f, 141), vec3(16, 0.7f, 147), "The Frame Car into a concrete pole at 50 km/h."); }},
-        {"fc_drop", "Frame Car: Drop 10 m", "Frame Car tests", "Dropped on its wheels from 10 m",
+        {"fc_drop", "Frame Car: Drop 10 m", "Test cars/Frame Car", "Dropped on its wheels from 10 m",
          [](Game& g) { scene_frame_car_test(g, "Drop from 10", vec3(8, 4.5f, 12), vec3(0, 1.8f, 20), "The Frame Car dropped on its wheels from 10 m."); }},
-        {"fc_slab", "Frame Car: Slab", "Frame Car tests", "A 5 t concrete slab dropped on it from 2.5 m",
+        {"fc_slab", "Frame Car: Slab", "Test cars/Frame Car", "A 5 t concrete slab dropped on it from 2.5 m",
          [](Game& g) { scene_frame_car_test(g, "Drop a 5 t concrete slab", vec3(6, 3.6f, 14.5f), vec3(0, 1.2f, 20), "A 5 t concrete slab falls on the roof from 2.5 m."); }},
-        {"fc_axe", "Frame Car: Giant axe", "Frame Car tests", "A 2 t pendulum axe swings down and cuts it in two",
+        {"fc_axe", "Frame Car: Giant axe", "Test cars/Frame Car", "A 2 t pendulum axe swings down and cuts it in two",
          [](Game& g) { scene_frame_car_test(g, "The giant axe", vec3(-15.5f, 5.0f, 110.5f), vec3(-25, 3.0f, 120), "A 2 t axe on a pendulum swings down and cuts the car in two."); }},
-        {"fc_roll", "Frame Car: Barrel roll", "Frame Car tests", "Thrown up and spun at 50 km/h: it rolls over",
+        {"fc_roll", "Frame Car: Barrel roll", "Test cars/Frame Car", "Thrown up and spun at 50 km/h: it rolls over",
          [](Game& g) { scene_frame_car_test(g, "Barrel roll", vec3(9, 4, 18), vec3(0, 1, 32), "Thrown up and spun at 50 km/h: the Frame Car rolls over."); }},
-        {"buggy", "Buggy", "Physics", "A desert racer on a welded tube cage (FEM) with aluminium panels: whoops, a jump, drops, rolls, crashes",
+        {"buggy", "Buggy", "Test cars/Buggy", "A desert racer on a welded tube cage (FEM) with aluminium panels: whoops, a jump, drops, rolls, crashes",
          scene_buggy},
-        {"bg_headon", "Buggy: Head-on", "Buggy tests", "Two Buggies head-on at 50 km/h each",
+        {"bg_headon", "Buggy: Head-on", "Test cars/Buggy", "Two Buggies head-on at 50 km/h each",
          [](Game& g) { scene_frame_car_test(g, "Head-on into another", vec3(4.6f, 1.9f, 57.5f), vec3(0, 0.6f, 62.5f), "Two Buggies meet head-on at 50 km/h each.", scene_buggy); }},
-        {"bg_side", "Buggy: Side impact", "Buggy tests", "Another Buggy into its side at 50 km/h",
+        {"bg_side", "Buggy: Side impact", "Test cars/Buggy", "Another Buggy into its side at 50 km/h",
          [](Game& g) {
              scene_frame_car_test(g, "into its side", vec3(6.5f, 2.8f, 53.5f), vec3(-1.5f, 0.7f, 60), "A second Buggy hits the standing one in the side at 50 km/h.", scene_buggy);
          }},
-        {"bg_wall", "Buggy: Wall", "Buggy tests", "Into a concrete wall at 60 km/h",
+        {"bg_wall", "Buggy: Wall", "Test cars/Buggy", "Into a concrete wall at 60 km/h",
          [](Game& g) { scene_frame_car_test(g, "Launch at the wall", vec3(6.5f, 2.4f, 139.5f), vec3(0, 0.7f, 146), "The Buggy into a concrete wall at 60 km/h.", scene_buggy); }},
-        {"bg_drop", "Buggy: Drop 10 m", "Buggy tests", "Dropped on its wheels from 10 m",
+        {"bg_drop", "Buggy: Drop 10 m", "Test cars/Buggy", "Dropped on its wheels from 10 m",
          [](Game& g) { scene_frame_car_test(g, "Drop from 10", vec3(8, 4.5f, 12), vec3(0, 1.8f, 20), "The Buggy dropped on its wheels from 10 m.", scene_buggy); }},
-        {"bg_slab", "Buggy: Slab", "Buggy tests", "A 5 t concrete slab dropped on it from 2.5 m",
+        {"bg_slab", "Buggy: Slab", "Test cars/Buggy", "A 5 t concrete slab dropped on it from 2.5 m",
          [](Game& g) { scene_frame_car_test(g, "Drop a 5 t concrete slab", vec3(6, 3.9f, 14.5f), vec3(0, 1.4f, 20), "A 5 t concrete slab falls on the cage from 2.5 m.", scene_buggy); }},
-        {"bg_roll", "Buggy: Barrel roll", "Buggy tests", "Thrown up and spun at 50 km/h: it rolls over",
+        {"bg_roll", "Buggy: Barrel roll", "Test cars/Buggy", "Thrown up and spun at 50 km/h: it rolls over",
          [](Game& g) { scene_frame_car_test(g, "Barrel roll", vec3(9, 4, 18), vec3(0, 1, 32), "Thrown up and spun at 50 km/h: the Buggy rolls over.", scene_buggy); }},
-        {"bg_whoops", "Buggy: Whoops", "Buggy tests", "Through the whoops at 80 km/h",
+        {"bg_whoops", "Buggy: Whoops", "Test cars/Buggy", "Through the whoops at 80 km/h",
          [](Game& g) { scene_frame_car_test(g, "whoops", vec3(88, 2.5f, 30), vec3(80, 0.8f, 45), "Through ten 0.5 m whoops at 80 km/h.", scene_buggy); }},
-        {"bg_jump", "Buggy: Jump", "Buggy tests", "Over the tabletop jump at 90 km/h",
+        {"bg_jump", "Buggy: Jump", "Test cars/Buggy", "Over the tabletop jump at 90 km/h",
          [](Game& g) { scene_frame_car_test(g, "jump", vec3(95, 4.0f, 160), vec3(80, 2.2f, 172), "Over the 2.2 m tabletop at 90 km/h.", scene_buggy); }},
-        {"shell_car", "Shell Car", "Physics", "A prototype car whose body is a shell of FEM triangle elements (no frame): drive it, crash it",
+        {"shell_car", "Shell Car", "Test cars", "A saloon on the BMW E36's lines: a body-in-white of FEM members and sheets, parts on hinges, bolts, buffers",
          scene_shell_car},
-        {"fem_shells", "FEM Shells", "Physics", "Triangle elements of the FEM frame: a steel sheet, a cantilever and a hollow cube", scene_fem_shells},
-        {"vehicle_crash", "Vehicle vs Vehicle", "Driving", "Configurable crash of two vehicles (Scene menu)", scene_vehicle_crash},
-        {"lab", "Physics Lab", "Physics", "Primitive tests: collisions, deformation, breaking, joints", scene_lab},
+        {"sheet_car", "Sheet Car", "Test cars", "A car whose body panels are a steel sheet of triangle elements: crash it into a parked one, poles or a wall",
+         scene_sheet_car},
+        {"lab", "Primitives", "Physics lab", "Primitive tests: collisions, deformation, breaking, joints", scene_lab},
+        {"materials", "Materials Lab", "Physics lab", "Sheets, shapes and bars of 10 materials: drop, press and bending tests, drive-through panels",
+         scene_materials},
+        {"sheet_shapes", "Sheet Shapes", "Physics lab", "Sheets of other shapes and sizes: steel gate 6 x 4 m, half-pipe, disc, ring, triangle, L, dome",
+         scene_sheet_shapes},
+        {"sheet_run", "Sheet Run", "Physics lab", "Drive through three lead sheets clamped in gates (profiling of sheet fracture)", scene_sheet_run},
+        {"barrels", "Steel Barrels", "Physics lab", "200 l steel drums of triangle elements: drop, roll, stack and crash them", scene_barrels},
+        {"fem_shells", "FEM Shells", "Physics lab", "Triangle elements of the FEM frame: a steel sheet, a cantilever and a hollow cube", scene_fem_shells},
         {"stress_vehicles", "Stress: 16 vehicles", "Stress", "Many AI vehicles", scene_stress_vehicles},
         {"stress_derby", "Stress: Demolition derby", "Stress", "12 AI vehicles colliding", scene_stress_derby},
         {"stress_crates", "Stress: 512 crates", "Stress", "Pile of soft boxes", scene_stress_crates},
         {"stress_forest", "Stress: Windy forest", "Stress", "400 trees in wind", scene_stress_forest},
         {"stress_bridge", "Stress: Bridge convoy", "Stress", "Heavy trucks break the bridge", scene_stress_bridge},
         {"stress_barrels", "Stress: Barrel pile", "Stress", "15 steel barrels in a pile, three more thrown into it", scene_stress_barrels},
+        {"editor", "Model Editor", "Tools", "The model editor's stage: a flat square, a neutral background (Editor menu, Ctrl+E)", scene_editor},
     };
     return s;
 }

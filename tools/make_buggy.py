@@ -73,11 +73,15 @@ SECTIONS = {  # name: (material, shape, outer, wall, joints[, break force N[, th
     "panel": ("Aluminium", "tube", 0.022, 0.0020, "rigid"),   # the nose's, the side panels' and the engine cover's frames
     "arm": ("Chromoly", "tube", 0.045, 0.0035, "rigid", 0.0, 3.0),   # the front wishbones
     "tarm": ("Chromoly", "tube", 0.055, 0.0040, "rigid", 0.0, 3.0),  # the trailing arms
+    "brace": ("Chromoly", "tube", 0.038, 0.0030, "rigid"),     # the arms' and the hub carriers' triangulating braces (in tension
+                                                               # and compression: a light tube)
+    "pivot": ("Chromoly", "tube", 0.045, 0.0035, "rigid"),     # the front arms' pivot rails and posts, the anti-roll bars' bearings
+    "pickup": ("Chromoly", "tube", 0.050, 0.0040, "rigid"),    # the front lower rail between the lower wishbone's pivots
     "hub": ("Steel", "tube", 0.060, 0.0080, "rigid", 0.0, 3.0),      # uprights and hubs
     "tierod": ("Chromoly", "tube", 0.032, 0.0050, "ball"),
     "rack": ("Steel", "tube", 0.035, 0.0050, "rigid"),
-    "arbf": ("Chromoly", "tube", 0.030, 0.0040, "rigid"),     # the anti-roll bars' torsion tubes, front and rear
-    "arbr": ("Chromoly", "tube", 0.026, 0.0040, "rigid"),
+    "arbf": ("SpringSteel", "tube", 0.030, 0.0040, "rigid"),  # the anti-roll bars' torsion tubes, front and rear (spring steel:
+    "arbr": ("SpringSteel", "tube", 0.030, 0.0040, "rigid"),  # chromoly ones took a set in the ruts; 26 mm at the rear: with the hubs triangulated it rolled on the circle instead of spinning)
 }
 # the panels on the cage at a distance (`mounts`): (break force N, stiffness N/m (0: the step's), turning damping, the
 # part node's hardware kg)
@@ -150,18 +154,24 @@ for s in (1, -1):
 
 # ------------------------------------------------------------------------------------------------ the cage's tubes
 for s in (1, -1):
-    tube([(X_FW, Y0, s * ZC), (1.20, Y0, s * ZF), (1.80, Y0, s * ZF), NB(s)], "main")            # front lower rail
+    tube([(X_FW, Y0, s * ZC), (1.20, Y0, s * ZF)], "main")                                    # front lower rail
+    tube([(1.20, Y0, s * ZF), (1.80, Y0, s * ZF)], "pickup")                                 # (the lower wishbone's pivots on it)
+    tube([(1.80, Y0, s * ZF), NB(s)], "main")
+    tube([(1.36, Y0, s * ZF), (1.20, Y_UP, s * ZF)], "pivot")                                # the pivot box braced across: the
+    tube([(1.64, Y0, s * ZF), (1.80, Y_UP, s * ZF)], "pivot")                                # rail bent between the pivots
     tube([(X_FW, Y0, s * ZC), (X_MH, Y0, s * ZC)], "main")                                    # sill
     tube([(X_MH, Y0, s * ZC), TRB(s), TL(s)], "main")                                                           # rear lower rail
     tube([(X_FW, Y0, s * ZC), D(s), RF(s)], "main")                                           # firewall post, A pillar
     tube([MH(s, Y0), RR(s)], "main")                                                          # main hoop
     tube([RF(s), RR(s)], "main")                                                              # roof rail
-    tube([D(s), T(s), N(s)], "cage")                                                          # front upper rail
-    tube([(AX_F, Y0, s * ZF), T(s)], "cage")                                                  # front shock tower
+    tube([D(s), T(s), N(s)], "main")                                                          # front upper rail
+    tube([(AX_F, Y0, s * ZF), T(s)], "pickup")                                                # front shock tower (the shock's top)
     tube([N(s), NB(s)], "cage")                                                               # the nose's post
-    tube([(1.20, Y_UP, s * ZF), (1.80, Y_UP, s * ZF)], "cage")                                # the upper arms' pivot rail
-    tube([(1.20, Y0, s * ZF), (1.20, Y_RACK, s * ZF), (1.20, Y_UP, s * ZF)], "cage")         # its posts (the rear one carries the rack)
-    tube([(1.80, Y0, s * ZF), (1.80, Y_UP, s * ZF)], "cage")
+    # the upper arms' pivot rail and its posts (the rear one carries the rack): the arms' loads in bending between the
+    # pivots (a 38 x 2.5 rail took a set on a rough field)
+    tube([(1.20, Y_UP, s * ZF), (1.80, Y_UP, s * ZF)], "pivot")
+    tube([(1.20, Y0, s * ZF), (1.20, Y_RACK, s * ZF), (1.20, Y_UP, s * ZF)], "pivot")
+    tube([(1.80, Y0, s * ZF), (1.80, Y_UP, s * ZF)], "pivot")
     tube([(1.80, Y_UP, s * ZF), N(s)], "light")                                               # (the nose braced to it)
     # the front clip triangulated (a box of posts and rails folded up as a mechanism once its joints yielded: two cars
     # head-on went into each other): its sides, and the bumper ahead of the nose
@@ -275,6 +285,8 @@ for sp in SUSP:
                 pa = ARB[True].setdefault("pn", {})[s] = fem_node(ARB[True]["P"](s))
                 member(fem_get(p, 0.002), pa, "arm", ja="ball")
                 member(pa, bl, "arm")
+                # (the drop link's point in the leg's middle braced to the other pivot: the leg bent there)
+                member(fem_get([q for q in sp["lower"] if q[0] <= AX_F][0], 0.002), pa, "brace", ja="ball")
             else:
                 member(fem_get(p, 0.002), bl, "arm", ja="ball")
         for p in sp["upper"]:
@@ -282,6 +294,11 @@ for sp in SUSP:
         member(bl, n1, "hub", ja="ball")
         member(n1, bu, "hub", jb="ball")
         member(n1, sa, "hub")
+        # (the upright to the axle's outer node too: its camber held by a triangle, not by the upright's bending at
+        # one node - on the axle's line, the kingpin free)
+        member(bl, n2, "brace", ja="ball")
+        member(n2, bu, "brace", jb="ball")
+        member(n2, sa, "brace")   # (the steering arm triangulated: on n1 alone the tie rod bent it)
         shocks.append((bl, fem_get(sp["top"], 0.002), True))
         wheels.append((n1, n2, fem_get(sp["top"], 0.002), True))
         re = new_node((RACK_X, Y_RACK, s * 0.28), "plain", 3.0)
@@ -302,8 +319,10 @@ for sp in SUSP:
         stops.append((sa, fem_get(end, 0.002), (L0 - min(ds)) / L0, (max(ds) - L0) / L0))
     else:
         sm = fem_node(sp["sm"])
+        pvs = []
         for p in sp["piv"]:
             pv = fem_get(p, 0.002)
+            pvs.append(pv)
             if abs(p[2]) > 0.5:   # (the outer member: through the anti-roll bar's drop link's point)
                 pa = ARB[False].setdefault("pn", {})[s] = fem_node(ARB[False]["P"](s))
                 member(pv, pa, "tarm", ja="ball")
@@ -312,6 +331,14 @@ for sp in SUSP:
                 member(pv, n1, "tarm", ja="ball")
             member(pv, sm, "tarm", ja="ball")
         member(sm, n1, "tarm")
+        # (the hub carrier to the axle's outer node too: the wheel's camber held by triangles through the arm - on one
+        # node, the arm's three tubes took the side force's moment in bending and twist and turned the wheel flat)
+        member(sm, n2, "brace")
+        member(ARB[False]["pn"][s], n2, "brace")
+        # (and the arm a rigid truss on its two pivots: pin-jointed it had two ways to fold besides its swing, held by
+        # its joints' bending alone - on a rough field it folded in 30 cm and laid the wheel flat)
+        member(pvs[1], n1, "brace", ja="ball")
+        member(pvs[0], ARB[False]["pn"][s], "brace", ja="ball")
         shocks.append((sm, fem_get(sp["top"], 0.002), False))
         # (the wheel's torque reacted on the frame over its axle - the cover's bolt node on the rear upper rail, 10 cm
         # behind it: the pair of forces the reaction is made of then runs along the car, through the arm's pivots; from
@@ -322,7 +349,9 @@ for front, ab in ARB.items():   # the anti-roll bars: bearings, the torsion tube
     ends = {}
     for s in (1, -1):
         b, a = fem_node(ab["B"](s)), fem_node(ab["A"](s))
-        member(fem_get(ab["F"](s), 0.002), b, "cage", jb="swivel")
+        member(fem_get(ab["F"](s), 0.002), b, "pivot", jb="swivel")
+        if not front:   # (the rear bearing 38 cm out from the shock hoop's post: braced down to the rail's foot - on a ball at
+            member(fem_get(TRB(s), 0.002), b, "pivot", jb="ball")   # the bearing: welded to it the brace held the bar from turning)
         member(b, a, "arm")
         member(a, ab["pn"][s], "tierod", ja="ball", jb="ball")
         ends[s] = b

@@ -16,7 +16,8 @@ them without sticking, nothing tears; tipped over or dropped they come to rest w
 the pile of 15 with three thrown in within a 30 FPS frame; the editor's drum from a circle lands and rests;
 buggy: the Frame Car's tests on the desert racer, through the whoops and over the jump, the offroad hills;
 FEM shells: the sheet, the cantilever and the hollow cube of triangle elements under their loads yield where they should
-and come to rest; shell car: stands, steers, accelerates, drives round and through the crash tests stable;
+and come to rest; shell car: stands, steers, accelerates, drives round and over the rough field, through the crash tests
+stable, the axe cuts it;
 rally: the autopilot finishes in the usual time; all scenes: no numerical instability.
 """
 import os, re, subprocess, sys, csv, tempfile
@@ -389,28 +390,54 @@ for action, what, ok in fem_cases:
           "; ".join("%s %d dented, %d torn, fastest %.2f m/s, lowest %.2f m" % (k[4:], x["dented"], x["torn"], x["fast"], x["low"]) for k, x in o.items()) +
           ", %d warnings" % unstable(out))
 
-# ---- shell car (its body of FEM triangles, no frame): it stands, steers the right way, accelerates, drives round and
-# through the crash tests stable, no solve failing; standing and driving nothing yields
+# ---- shell car (a saloon on the BMW E36's lines: a body-in-white of FEM triangles, sheet panels welded on FEM inner
+# shells on mounts): it stands, steers the right way, accelerates, drives round and over the rough field with nothing
+# yielding and nothing coming off; through the crash tests stable, no solve failing; the axe cuts it in two
 def shell_line(out):
-    m = re.findall(r"(\d+) failed solves, \d+ clamps \| tris (\d+), (\d+) torn, (\d+) dented", out)
-    return tuple(int(x) for x in m[-1]) if m else None
+    m = re.findall(r"(\d+) failed solves, \d+ clamps \| tris (\d+), (\d+) torn, (\d+) dented(?:, mounts (\d+) of \d+ let go)?(?: \| welds: (\d+) of)?", out)
+    return tuple(int(x or 0) for x in m[-1]) if m else None
+def shell_text(sl):
+    return "%d failed, %d torn, %d dented, %d mounts let go, %d welds broken" % (sl[0], sl[2], sl[3], sl[4], sl[5]) if sl else "no line"
+out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--drive", "0,0", "--screenshot", os.path.join(TMP, "sc0.png")])
+sl = shell_line(out)
+check("shell car: standing, nothing yields or comes off", bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[3] == 0 and sl[4] == 0 and sl[5] == 0 and unstable(out) == 0,
+      shell_text(sl))
 out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "420", "--hidden", "--novsync", "--drive", "1.0,0", "--screenshot", os.path.join(TMP, "sc1.png")])
 sl, sp = shell_line(out), speeds_at(out)
 check("shell car: accelerates, nothing yields", bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[3] == 0 and sp.get(6.0, (0,))[0] > 50 and unstable(out) == 0,
-      "%.1f km/h at 6 s, %s" % (sp.get(6.0, (0,))[0], "%d failed, %d torn, %d dented" % (sl[0], sl[2], sl[3]) if sl else "no line"))
+      "%.1f km/h at 6 s, %s" % (sp.get(6.0, (0,))[0], shell_text(sl)))
 out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--drive", "0.3,0.5", "--screenshot", os.path.join(TMP, "sc2.png")])
 pos = re.findall(r"pos \(([-\d.]+) ([-\d.]+) ([-\d.]+)\)", out)
 check("shell car: steering right turns right", bool(pos) and float(pos[-1][0]) < -1.5, "position %s after 5 s at half right lock" % (pos[-1] if pos else "?",))
 out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "900", "--hidden", "--novsync", "--drive", "0.6,0.35", "--screenshot", os.path.join(TMP, "sc3.png")])
 sl = shell_line(out)
-check("shell car: driving round, next to nothing yields", bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[3] < 5 and unstable(out) == 0,
-      "%d failed, %d torn, %d dented" % (sl[0], sl[2], sl[3]) if sl else "no line")
-for action, frames in (("Head-on into another", 300), ("into its side", 300), ("Drop from 5", 300), ("Launch at the wall", 400), ("slab", 400), ("Barrel roll", 400)):
-    out = run(["--scene", "shell_car", "--size", "640x360", "--frames", str(frames), "--hidden", "--novsync", "--action", action,
+check("shell car: driving round, next to nothing yields, nothing comes off", bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[3] < 5 and sl[4] == 0 and sl[5] == 0 and unstable(out) == 0,
+      shell_text(sl))
+# the rough field (0.2 m bumps) in circles at up to 35 km/h: the suspension reaches its bump stops, the body holds (a
+# few triangles round the mounts yield a little, 0.2% at most), no part comes off
+out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "1200", "--hidden", "--novsync", "--action", "To the rough field", "--drive", "1.0,0",
+           "--screenshot", os.path.join(TMP, "sc5.png")], {"BL_ORBIT": "-62,150,15,0,35"})
+sl = shell_line(out)
+check("shell car: rough field at 35 km/h, the body holds", bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[3] < 60 and sl[4] == 0 and sl[5] < 10 and unstable(out) == 0,
+      shell_text(sl))
+# the latches let go (the hood's, the lid's, the doors'), then the rough field: the hood rests on its buffers, the lid
+# and the doors swing to their stays - only the six latches come off
+out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "900", "--hidden", "--novsync", "--action", "To the rough field@5;Let the latches@10",
+           "--drive", "1.0,0", "--screenshot", os.path.join(TMP, "sc7.png")], {"BL_ORBIT": "-62,150,15,0,30"})
+sl = shell_line(out)
+check("shell car: the latches let go, the rough field: nothing else comes off", bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[4] == 6 and unstable(out) == 0,
+      shell_text(sl))
+for action, frames in (("Head-on into another", 300), ("into its side", 300), ("Drop from 5", 300), ("Launch at the wall", 400), ("Launch at the pole", 400),
+                       ("slab", 400), ("Barrel roll", 400), ("Drop on the roof", 300)):
+    out = run(["--scene", "shell_car", "--size", "640x360", "--frames", str(frames), "--hidden", "--novsync", "--drive", "0,0", "--action", action,
                "--screenshot", os.path.join(TMP, "sc4.png")])
     sl = shell_line(out)
-    check("shell car: %s, stable" % action.lower(), bool(sl) and sl[0] == 0 and sl[2] < 150 and unstable(out) == 0,
-          "%d failed, %d torn, %d dented, %d warnings" % (sl[0], sl[2], sl[3], unstable(out)) if sl else "no line")
+    check("shell car: %s, stable" % action.lower(), bool(sl) and sl[0] == 0 and sl[2] < 150 and unstable(out) == 0 and (action[:4] != "Head" or sl[4] > 0),
+          shell_text(sl) + ", %d warnings" % unstable(out))
+out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "400", "--hidden", "--novsync", "--drive", "0,0", "--action", "The giant axe",
+           "--screenshot", os.path.join(TMP, "sc6.png")])
+sl = shell_line(out)
+check("shell car: the axe cuts it in two", bool(sl) and sl[0] == 0 and sl[2] > 20 and unstable(out) == 0, shell_text(sl))
 
 # ---- steel barrels (a closed sheet: its volume in the BL_SHELLDBG block, 100% = 0.2232 m3): dropped on its bottom, side and
 # rim, rolled down the ramp, thrown at another and stacked it dents but keeps its shape (a few percent); the 40 kg ball
