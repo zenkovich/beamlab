@@ -1813,6 +1813,7 @@ void frame_car_grab(Game& g, float lift, float strength) {
     g.grab_body = &b;
     g.grab_node = best;
     g.grab_depth = 3.0f + lift;
+    g.grab_bodies = {&b};
     b.grab_node = best;
     b.grab_target = b.nodes[best].p + vec3(0, lift, 0);
     b.grab_k = std::max(2000.0f, 60000.0f * std::pow(std::max(b.total_mass(), 50.0f) / 3000.0f, 0.75f));

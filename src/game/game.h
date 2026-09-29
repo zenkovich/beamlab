@@ -9,6 +9,7 @@
 #include "world/stage.h"
 #include "world/terrain.h"
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <memory>
@@ -156,6 +157,9 @@ public:
     int grab_node = -1;
     float grab_depth = 0;
     float grab_strength = 1.0f;   // the grab tool's pull: a multiplier of the automatic strength (from the body's mass)
+    float grab_radius = 0.3f;     // the grab tool's sphere: the nodes of every body within it are pulled, less towards its edge (0: one node)
+    std::vector<phys::SoftBody*> grab_bodies; // (the bodies it holds: grab_body, the picked one, and the others in its sphere)
+    bool grab_holds(const phys::SoftBody* b) const { return std::find(grab_bodies.begin(), grab_bodies.end(), b) != grab_bodies.end(); }
     void grab_begin(vec3 ray_o, vec3 ray_d);
     void grab_update(vec3 ray_o, vec3 ray_d);
     void grab_end();

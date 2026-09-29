@@ -136,6 +136,7 @@ bool App::init(const AppOptions& opt) {
         }
     }
     if (getenv("BL_COLLISION")) m_game.debug.collision = true;
+    if (getenv("BL_HIDEMESHES")) m_game.debug.hide_meshes = true; // (screenshots: the collision view alone)
     if (getenv("BL_SKELETON")) {
         m_game.debug.beams = m_game.debug.nodes = m_game.debug.hide_meshes = true;
     }
@@ -208,6 +209,11 @@ void App::gather_input(float dt, VehicleInput& vin, CameraInput& cin) {
     bool mouse_free = !io.WantCaptureMouse;
     bool rmb = glfwGetMouseButton(m_win, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
     bool lmb = glfwGetMouseButton(m_win, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    static const bool scripted = getenv("BL_INPUT_SCRIPT") != nullptr;
+    if (scripted) { // (a scripted run: the mouse the script moves, as the UI's - the tools' headless checks)
+        mx = io.MousePos.x, my = io.MousePos.y;
+        lmb = io.MouseDown[0], rmb = io.MouseDown[1];
+    }
     if (rmb && !m_rmb && !mouse_free) rmb = false;
     m_rmb = rmb;
     cin.mouse_delta = md;
@@ -860,6 +866,36 @@ void App::frame(float dt) {
                     if (e.damage > 2e-3f) worst.push_back({e.damage, ei});
                 }
                 printf(" | up %.2f | wheels: %d beams bent >1%%, most %.1f%% | frame: %d members bent (most %.3f rad)", v->up().y, wbent, wmax * 100.0f, bent, dmax);
+                // (the suspension's members: those at the wheels' axle nodes or one member from them - the uprights,
+                // the wishbones, the tie rods and toe links - bent for good or torn)
+                {
+                    std::vector<char> near(b.fem.node.size(), 0);
+                    for (const auto& w : b.wheels)
+                        for (uint32_t an : {w.axle0, w.axle1})
+                            if (const int sl = b.fem.slot(an); sl >= 0) near[sl] = 2;
+                    for (const phys::FrameElement& e : b.fem.elems)
+                        if (near[e.a] == 2 || near[e.b] == 2) near[e.a] = std::max<char>(near[e.a], 1), near[e.b] = std::max<char>(near[e.b], 1);
+                    int sb = 0, st = 0;
+                    float sm = 0;
+                    size_t si = 0;
+                    for (size_t ei = 0; ei < b.fem.elems.size(); ei++) {
+                        const phys::FrameElement& e = b.fem.elems[ei];
+                        if (!near[e.a] && !near[e.b]) continue;
+                        if (e.broken) {
+                            st++;
+                            continue;
+                        }
+                        sb += e.damage > 2e-3f;
+                        if (e.damage > sm) sm = e.damage, si = ei;
+                    }
+                    printf(" | susp: %d bent (most %.3f rad), %d torn", sb, sm, st);
+                    if (sm > 2e-3f) { // (the worst: its plastic moment, where in the car's axes: forward, up, left)
+                        const phys::FrameElement& e = b.fem.elems[si];
+                        const vec3 fw = v->forward(), upv = v->up(), lf = normalize_or(cross(upv, fw), vec3(1, 0, 0)), o = v->position();
+                        const vec3 m = (b.nodes[b.fem.node[e.a]].p + b.nodes[b.fem.node[e.b]].p) * 0.5f - o;
+                        printf(" [Mp %.0f at %.2f %.2f %.2f]", b.fem.sections[e.section].Mp, dot(m, fw), dot(m, upv), dot(m, lf));
+                    }
+                }
                 // (the worst: their section's plastic moment and where, in the car's axes: forward, up, left)
                 std::sort(worst.rbegin(), worst.rend());
                 const vec3 fw = v->forward(), upv = v->up(), lf = normalize_or(cross(upv, fw), vec3(1, 0, 0)), o = v->position();
@@ -874,6 +910,11 @@ void App::frame(float dt) {
                 for (const phys::FrameTri& t : f.tris) dented += !t.broken && t.dmg > 0;
                 printf(" | tris %zu, %d torn, %d dented", f.tris.size(), f.tris_torn, dented);
                 if (!f.mounts.empty()) printf(", mounts %d of %zu let go", f.mounts_broken, f.mounts.size());
+            }
+            if (!v->body->volumes.empty()) { // (its collision volumes: their contacts so far, the largest force, off)
+                printf(" | volumes:");
+                for (const phys::CollisionVolume& cv : v->body->volumes)
+                    printf(" %s %d (%.0f kN)%s", cv.name.c_str(), cv.hits, cv.peak / 1000.0f, cv.broken ? " off" : "");
             }
             if (!v->body->welds.empty()) {
                 // (and how the panels shake on their welds: the welded nodes' centre against the frame's point, rms and most)

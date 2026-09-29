@@ -102,7 +102,7 @@ Vehicle* Game::spawn_vehicle(const std::string& vid, vec3 pos, float yaw, bool m
 void Game::remove_vehicle(Vehicle* v) {
     for (size_t i = 0; i < vehicles.size(); i++)
         if (vehicles[i].get() == v) {
-            if (grab_body == v->body) grab_end();
+            if (grab_holds(v->body)) grab_end();
             world.remove_body(v->body);
             vehicles.erase(vehicles.begin() + i);
             if (player == (int)i) player = -1;
@@ -288,6 +288,33 @@ void Game::draw_debug(Renderer& r) {
         r.line(muzzle + vec3(0, 0.004f, 0), end, Renderer::rgba(1.0f, 0.55f, 0.45f, 0.6f));
         r.point(end, Renderer::rgba(1.0f, 0.9f, 0.7f));
     }
+    // a wire sphere: three circles round p
+    auto sphere = [&](vec3 p, float rad, uint32_t col) {
+        const int seg = 32;
+        for (int axis = 0; axis < 3; axis++)
+            for (int i = 0; i < seg; i++) {
+                float a0 = 2 * kPi * i / seg, a1 = 2 * kPi * (i + 1) / seg;
+                auto pt = [&](float a) {
+                    vec3 o(std::cos(a), std::sin(a), 0);
+                    if (axis == 1) o = vec3(o.x, 0, o.y);
+                    if (axis == 2) o = vec3(0, o.x, o.y);
+                    return p + o * rad;
+                };
+                r.line(pt(a0), pt(a1), col);
+            }
+    };
+    // the grab: its line, the sphere it holds at the target and its nodes, brighter the harder they are pulled (the
+    // pull falls off to the sphere's edge); not pulling, its sphere under the cursor
+    if (grab_active && grab_body && grab_body->grab_node >= 0 && grab_body->grab_node < (int)grab_body->nodes.size()) {
+        r.line(grab_body->nodes[grab_body->grab_node].p, grab_body->grab_target, Renderer::rgba(1, 1, 0.2f));
+        r.point(grab_body->grab_target, Renderer::rgba(1, 1, 0.2f));
+        for (const phys::SoftBody* b : grab_bodies)
+            for (size_t j = 0; j < b->grab_nodes.size() && j < b->grab_w.size(); j++)
+                if (b->grab_nodes[j] < b->nodes.size()) r.point(b->nodes[b->grab_nodes[j]].p, Renderer::rgba(1, 1, 0.2f, 0.15f + 0.85f * b->grab_w[j]));
+        if (grab_radius > 0.01f) sphere(grab_body->grab_target, grab_radius, Renderer::rgba(1, 1, 0.2f, 0.6f));
+    } else if (tool == Tool::Grab && cursor_valid && grab_radius > 0.01f) {
+        sphere(cursor_point, grab_radius, Renderer::rgba(1, 1, 0.2f, 0.5f));
+    }
     if (cursor_valid && tool != Tool::Grab) {
         vec3 p = cursor_point;
         if (tool == Tool::Laser) {
@@ -296,19 +323,7 @@ void Game::draw_debug(Renderer& r) {
             r.line(p - vec3(s, 0, 0), p + vec3(s, 0, 0), col);
             r.line(p - vec3(0, s, 0), p + vec3(0, s, 0), col);
         } else if (tool == Tool::Destroy) {
-            const int seg = 32;
-            uint32_t col = Renderer::rgba(1.0f, 0.35f, 0.2f, 0.9f);
-            for (int axis = 0; axis < 3; axis++)
-                for (int i = 0; i < seg; i++) {
-                    float a0 = 2 * kPi * i / seg, a1 = 2 * kPi * (i + 1) / seg;
-                    auto pt = [&](float a) {
-                        vec3 o(std::cos(a), std::sin(a), 0);
-                        if (axis == 1) o = vec3(o.x, 0, o.y);
-                        if (axis == 2) o = vec3(0, o.x, o.y);
-                        return p + o * destroy_radius;
-                    };
-                    r.line(pt(a0), pt(a1), col);
-                }
+            sphere(p, destroy_radius, Renderer::rgba(1.0f, 0.35f, 0.2f, 0.9f));
         } else {
             float s = 0.15f + 0.01f * length(p - m_last_cam.pos);
             uint32_t col = Renderer::rgba(0.3f, 1.0f, 0.4f, 0.9f);
@@ -506,34 +521,68 @@ void Game::draw_debug(Renderer& r) {
             mat4 m = mat4::from_mat3(bx.rot, bx.center);
             r.box_wire(m, bx.half, Renderer::rgba(1, 0.6f, 0.1f, 0.7f));
         }
-    }
-    if (grab_active && grab_body && grab_body->grab_node >= 0 && grab_body->grab_node < (int)grab_body->nodes.size()) {
-        r.line(grab_body->nodes[grab_body->grab_node].p, grab_body->grab_target, Renderer::rgba(1, 1, 0.2f));
-        r.point(grab_body->grab_target, Renderer::rgba(1, 1, 0.2f));
+        // the bodies' collision volumes (a car's engine, cabin, trunk): their hulls' faces
+        for (const auto& bp : world.bodies())
+            for (const phys::CollisionVolume& cv : bp->volumes) {
+                if (!cv.placed || cv.wverts.size() != cv.verts.size()) continue;
+                const uint32_t col = Renderer::rgba(1.0f, 0.25f, 0.85f, 0.95f);
+                for (const auto& f : cv.faces)
+                    for (size_t k = 0; k < f.size(); k++) r.thick_line(cv.wverts[f[k]], cv.wverts[f[(k + 1) % f.size()]], col, 2.5f);
+            }
     }
 }
 
 void Game::grab_begin(vec3 o, vec3 d) {
     phys::RayHit h = world.pick_node(o, d, 300.0f, 0.35f);
     if (!h.body) return;
+    grab_end();
     grab_active = true;
     grab_body = h.body;
     grab_node = h.node;
     grab_depth = h.t;
-    grab_body->grab_node = h.node;
-    grab_body->grab_target = grab_body->nodes[h.node].p;
-    float m = grab_body->total_mass();
-    // pull strength scales with the body's mass (RoR: (m/3000)^0.75)
-    grab_body->grab_k = std::max(2000.0f, 60000.0f * std::pow(std::max(m, 50.0f) / 3000.0f, 0.75f));
-    grab_body->grab_scale = grab_strength;
-    grab_body->wake();
+    const vec3 c = h.body->nodes[h.node].p;
+    // a body taken: its pull from its mass (RoR: (m/3000)^0.75), node its nearest (the line drawn from it)
+    auto take = [&](phys::SoftBody& b, int node) {
+        b.grab_node = node;
+        b.grab_target = c;
+        b.grab_k = std::max(2000.0f, 60000.0f * std::pow(std::max(b.total_mass(), 50.0f) / 3000.0f, 0.75f));
+        b.grab_scale = grab_strength;
+        b.wake();
+        grab_bodies.push_back(&b);
+    };
+    if (grab_radius <= 0.01f) {
+        take(*h.body, h.node);
+        return;
+    }
+    // the grab's sphere round the picked node: the nodes of every body in it, each pulled to the target and its offset
+    // from the centre (the region keeps its shape), weighted (1 - (r/R)^2)^2 - all of it at the centre, none at the edge
+    const float R = grab_radius, R2 = R * R;
+    for (const auto& bp : world.bodies()) {
+        phys::SoftBody& b = *bp;
+        if (c.x < b.aabb.mn.x - R || c.x > b.aabb.mx.x + R || c.y < b.aabb.mn.y - R || c.y > b.aabb.mx.y + R || c.z < b.aabb.mn.z - R || c.z > b.aabb.mx.z + R) continue;
+        b.grab_nodes.clear(), b.grab_offsets.clear(), b.grab_w.clear();
+        int nearest = -1;
+        float nd = 1e30f;
+        for (uint32_t i = 0; i < (uint32_t)b.nodes.size(); i++) {
+            const phys::Node& x = b.nodes[i];
+            const float r2 = length2(x.p - c);
+            if (x.inv_mass <= 0 || (b.info[i].flags & phys::NF_NO_MOUSE) || r2 > R2) continue;
+            const float q = 1.0f - r2 / R2;
+            b.grab_nodes.push_back(i), b.grab_offsets.push_back(x.p - c), b.grab_w.push_back(q * q);
+            if (r2 < nd) nd = r2, nearest = (int)i;
+        }
+        if (&b == h.body) nearest = h.node;
+        if (nearest >= 0) take(b, nearest);
+    }
 }
 
 void Game::grab_update(vec3 o, vec3 d) {
-    if (!grab_active || !grab_body) return;
-    grab_body->grab_target = o + d * grab_depth;
-    grab_body->grab_scale = grab_strength; // (changed while pulling: at once)
-    grab_body->wake();
+    if (!grab_active || grab_bodies.empty()) return;
+    for (phys::SoftBody* b : grab_bodies) {
+        b->grab_target = o + d * grab_depth;
+        b->grab_scale = grab_strength; // (changed while pulling: at once)
+        b->wake();
+    }
 }
 
 void Game::crane_vehicle(Vehicle* v, float lift, float roll_deg, float pitch_deg) {
@@ -580,7 +629,8 @@ void Game::crane_release() {
 }
 
 void Game::grab_end() {
-    if (grab_body) grab_body->grab_node = -1;
+    for (phys::SoftBody* b : grab_bodies) b->grab_node = -1, b->grab_nodes.clear(), b->grab_offsets.clear(), b->grab_w.clear();
+    grab_bodies.clear();
     grab_active = false;
     grab_body = nullptr;
     grab_node = -1;
@@ -598,7 +648,7 @@ const char* CrashConfig::layout_name(int i) {
 
 void Game::remove_object(DynamicObject* o) {
     if (!o) return;
-    if (grab_body == o->body) grab_end();
+    if (grab_holds(o->body)) grab_end();
     for (size_t i = 0; i < objects.size(); i++)
         if (objects[i].get() == o) {
             world.remove_body(o->body);
@@ -655,26 +705,25 @@ void Game::shoot(vec3 origin, vec3 dir) {
     std::unique_ptr<DynamicObject> o;
     Rng rng((uint64_t)m_object_counter * 7919 + 3);
     switch (projectile_kind) {
-    case 0: { // steel ball: stiff, heavy
-        SoftSphereDesc d;
+    case 0: { // steel ball: one sphere, heavy
+        BallDesc d;
         d.center = at;
         d.radius = 0.22f;
-        d.subdiv = 1;
         d.mass = 40;
+        d.bounce = 0.25f;
         d.mat = A.metal;
-        d.beams = {4e6f, 1500, 1e12f, 1e12f, 0};
-        o = build_soft_sphere(world, d, name);
+        o = build_ball(world, d, name);
         break;
     }
     case 1: { // rubber ball: bouncy
-        SoftSphereDesc d;
+        BallDesc d;
         d.center = at;
         d.radius = 0.35f;
-        d.subdiv = 1;
         d.mass = 8;
+        d.bounce = 0.75f;
+        d.friction = 0.9f;
         d.mat = A.red;
-        d.beams = {1.5e5f, 20, 1e12f, 1e12f, 0};
-        o = build_soft_sphere(world, d, name);
+        o = build_ball(world, d, name);
         break;
     }
     case 2: { // crate
@@ -690,15 +739,14 @@ void Game::shoot(vec3 origin, vec3 dir) {
         break;
     }
     case 3: { // cannonball: very heavy
-        SoftSphereDesc d;
+        BallDesc d;
         d.center = at;
         d.radius = 0.3f;
-        d.subdiv = 1;
         d.mass = 400;
+        d.bounce = 0.1f;
         d.mat = std::make_shared<Material>(*A.metal);
         d.mat->color = vec4(0.18f, 0.18f, 0.2f, 1);
-        d.beams = {2e7f, 5000, 1e12f, 1e12f, 0};
-        o = build_soft_sphere(world, d, name);
+        o = build_ball(world, d, name);
         break;
     }
     default: { // plank, flies lengthwise
@@ -716,12 +764,11 @@ void Game::shoot(vec3 origin, vec3 dir) {
         break;
     }
     }
-    // the balls meet sphere-contact sheets (the barrels) as the spheres they are (phys/sphere_contacts.cpp)
-    if (projectile_kind == 0 || projectile_kind == 1 || projectile_kind == 3)
-        o->body->sphere_ball = projectile_kind == 0 ? 0.22f : projectile_kind == 1 ? 0.35f : 0.3f;
-    // thicker contact band for fast projectiles so they don't tunnel through thin sheets
-    o->body->collision_radius = std::max(o->body->collision_radius, projectile_speed * world.settings.dt * 1.6f);
-    o->body->collision_radius = std::min(o->body->collision_radius, 0.12f);
+    // thicker contact band for fast projectiles so they don't tunnel through thin sheets (a ball: its sphere reaches)
+    if (o->body->capsules.empty()) {
+        o->body->collision_radius = std::max(o->body->collision_radius, projectile_speed * world.settings.dt * 1.6f);
+        o->body->collision_radius = std::min(o->body->collision_radius, 0.12f);
+    }
     o->body->set_velocity(dir * projectile_speed);
     o->body->max_speed = projectile_speed;
     DynamicObject* ptr = add_object(std::move(o));

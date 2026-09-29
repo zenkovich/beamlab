@@ -383,6 +383,9 @@ void App::ui_main_menu() {
         ImGui::RadioButton("Shoot projectiles  (B)", &t, 2);
         ImGui::RadioButton("Laser: cut along the cursor, hold  (L)", &t, 3);
         m_game.tool = (Tool)t;
+        ImGui::SeparatorText("Grab");
+        ImGui::SliderFloat("Strength", &m_game.grab_strength, 0.05f, 50.0f, "%.2gx", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("Grab radius", &m_game.grab_radius, 0.0f, 3.0f, "%.2f m");
         ImGui::SeparatorText("Destroy");
         ImGui::SliderFloat("Radius", &m_game.destroy_radius, 0.1f, 3.0f, "%.2f m");
         ImGui::Checkbox("Blast impulse", &m_game.destroy_blast);
@@ -623,8 +626,10 @@ void App::ui_tools() {
     }
     ImGui::PushItemWidth(254);
     if (m_game.tool == Tool::Grab) {
-        ImGui::SliderFloat("##gstr", &m_game.grab_strength, 0.05f, 20.0f, "strength %.2gx  (hold LMB on a node)", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("##gstr", &m_game.grab_strength, 0.05f, 50.0f, "strength %.2gx  (hold LMB on a node)", ImGuiSliderFlags_Logarithmic);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("How hard the grab pulls (1x: from the body's mass); it changes at once, also while pulling");
+        ImGui::SliderFloat("##grad", &m_game.grab_radius, 0.0f, 3.0f, "radius %.2f m  (0: one node)");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A sphere round the picked node: every body's nodes in it are pulled together, keeping their places, the pull falling off to its edge");
     } else if (m_game.tool == Tool::Destroy) {
         ImGui::SliderFloat("##rad", &m_game.destroy_radius, 0.1f, 3.0f, "radius %.2f m  (hold LMB)");
         ImGui::Checkbox("blast", &m_game.destroy_blast);

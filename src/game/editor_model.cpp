@@ -135,6 +135,16 @@ void remap_elements(Model& m, const std::vector<int>& map) {
             mounts.push_back(mt);
         }
     m.mounts.swap(mounts);
+    std::vector<Volume> volumes;
+    for (Volume v : m.volumes) {
+        std::vector<int> an;
+        for (int a : v.anchors)
+            if (ok(a)) an.push_back(map[a]);
+        if (an.size() < 3) continue; // (too few anchors left: the volume goes)
+        v.anchors = an;
+        volumes.push_back(v);
+    }
+    m.volumes.swap(volumes);
     std::vector<SlideNode> slides;
     for (SlideNode sn : m.slidenodes) {
         if (!ok(sn.node)) continue;
@@ -208,6 +218,7 @@ int Model::node_uses(int n) const {
     for (const Joint& j : joints) c += (j.parent == n || j.child == n);
     for (const Weld& w : welds) c += (w.anchor == n || w.node == n || w.anchor2 == n);
     for (const Mount& mt : mounts) c += (mt.a == n || mt.b == n || (mt.kind == 'h' && mt.b2 == n));
+    for (const Volume& v : volumes) c += (int)std::count(v.anchors.begin(), v.anchors.end(), n);
     for (const SlideNode& sn : slidenodes) c += sn.node == n || std::find(sn.rail.begin(), sn.rail.end(), n) != sn.rail.end();
     for (const Flexbody& f : flexbodies) c += (f.ref == n || f.x == n || f.y == n);
     for (const Prop& p : props) c += (p.ref == n || p.x == n || p.y == n);
@@ -1403,6 +1414,16 @@ std::string write_truck(const Model& m, bool preview) {
             o += "\n";
         }
     }
+    if (!m.volumes.empty()) {
+        o += "collision_volumes\n;(BeamLab) volume name, break rms (m); its anchors (frame nodes); its hull's points (x, y, z)\n";
+        section();
+        for (const Volume& v : m.volumes) {
+            o += "volume " + (v.name.empty() ? std::string("volume") : v.name) + ", " + num(v.break_rms) + "\nanchors ";
+            for (size_t i = 0; i < v.anchors.size(); i++) o += (i ? ", " : "") + fmt("%d", v.anchors[i]);
+            o += "\n";
+            for (const vec3& p : v.verts) o += "vertex " + num(p.x) + ", " + num(p.y) + ", " + num(p.z) + "\n";
+        }
+    }
     if (!m.slidenodes.empty()) {
         o += "slidenodes\n;node, rail nodes..., S spring, B break, T tolerance, R attach rate, D attach distance\n";
         section();
@@ -1680,6 +1701,17 @@ bool import_document(const ror::Document& d, Model& m, std::vector<std::string>&
         x.a = map[mt.a], x.b = map[mt.b], x.brk = mt.brk, x.k = mt.k, x.damp = mt.damp;
         x.kind = mt.kind, x.param = mt.param, x.b2 = mt.kind == 'h' ? map[mt.b2] : -1;
         m.mounts.push_back(x);
+    }
+    for (const auto& v : d.volumes) {
+        Volume x;
+        x.name = v.name, x.break_rms = v.break_rms, x.verts = v.verts;
+        for (int a : v.anchors)
+            if (ok(a)) x.anchors.push_back(map[a]);
+        if (x.anchors.size() < 3) {
+            dropped++;
+            continue;
+        }
+        m.volumes.push_back(x);
     }
     for (const auto& sn : d.slidenodes) {
         SlideNode x;

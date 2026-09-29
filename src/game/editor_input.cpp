@@ -1298,7 +1298,7 @@ void ModelEditor::physics_input(float dt) {
         }
         if (m_drag == Drag::Grab) {
             if (io.MouseWheel != 0) {
-                m_game.grab_strength = clampf(m_game.grab_strength * std::pow(1.25f, io.MouseWheel), 0.05f, 20.0f);
+                m_game.grab_strength = clampf(m_game.grab_strength * std::pow(1.25f, io.MouseWheel), 0.05f, 50.0f);
                 m_status = format("Grab strength %.2gx (the wheel while pulling)", m_game.grab_strength);
             }
             m_game.grab_update(ro, rd);

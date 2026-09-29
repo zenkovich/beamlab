@@ -1186,7 +1186,9 @@ void ModelEditor::ui_physics_panel() {
         switch (m_phys_tool) {
         case 0: {
             prop("Strength", "How hard the grab pulls the node toward the mouse (1x: from the body's mass; weaker: it lags and sags, stronger: it follows at once). It changes at once, also while pulling");
-            ImGui::SliderFloat("##gstr", &m_game.grab_strength, 0.05f, 20.0f, "%.2gx", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("##gstr", &m_game.grab_strength, 0.05f, 50.0f, "%.2gx", ImGuiSliderFlags_Logarithmic);
+            prop("Radius", "The body's nodes within it round the picked one are pulled with it, keeping their places (0: the node alone)");
+            ImGui::SliderFloat("##grad", &m_game.grab_radius, 0.0f, 3.0f, "%.2f m");
             prop("");
             const float presets[] = {0.2f, 1.0f, 5.0f};
             const char* names[] = {"0.2x", "1x", "5x"};

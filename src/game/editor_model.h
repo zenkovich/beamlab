@@ -148,6 +148,15 @@ struct Mount {
     int b2 = -1;                    // a hinge's second node
 };
 
+// (BeamLab) a collision volume (the truck's `collision_volumes`, phys::CollisionVolume): a convex hull of points riding
+// on anchor nodes of the frame - a car's engine, its cabin's seats, its trunk's load
+struct Volume {
+    std::string name;
+    float break_rms = 0.12f;
+    std::vector<int> anchors;
+    std::vector<vec3> verts;        // (the hull's points, in the model's space)
+};
+
 // a node that slides along a rail of nodes (the truck's `slidenodes`: a steering rack's ends in its housing)
 struct SlideNode {
     int node = 0;
@@ -268,6 +277,7 @@ struct Model {
     std::vector<Joint> joints;
     std::vector<Weld> welds;
     std::vector<Mount> mounts;
+    std::vector<Volume> volumes;
     std::vector<SlideNode> slidenodes;
     std::vector<Flexbody> flexbodies;
     std::vector<Prop> props;

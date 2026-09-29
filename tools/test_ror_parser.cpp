@@ -613,6 +613,29 @@ void test_editor_models() {
         CHECK(same, "mount kinds: the editor's round trip changed them");
         printf("  mount kinds: ok\n");
     }
+    // collision volumes (`collision_volumes`: "volume name, break rms", "anchors ...", "vertex x, y, z"); the editor writes
+    // them back as it read them
+    {
+        const std::string text = "Volumes\nglobals\n100, 0\nnodes\n0, 0, 0, 0\n1, 1, 0, 0\n2, 0, 1, 0\n3, 0, 0, 1\nbeams\n0, 1\n0, 2\n0, 3\n"
+                                 "collision_volumes\nvolume engine, 0.1\nanchors 0, 1, 2, 3\nvertex 0.1, 0.1, 0.1\nvertex 0.5, 0.1, 0.1\n"
+                                 "vertex 0.1, 0.5, 0.1\nvertex 0.1, 0.1, 0.5\nvolume cabin\nanchors 1, 2, 3\nvertex 0, 0, 0\nvertex 1, 0, 0\nvertex 0, 1, 0\nvertex 0, 0, 1\nend\n";
+        Document d;
+        CHECK(parse_truck_file(temp_file("bl_volumes.truck", text), d) && d.warnings.empty(), "collision_volumes parse (%zu warnings)", d.warnings.size());
+        const bool read_ok = d.volumes.size() == 2 && d.volumes[0].name == "engine" && d.volumes[0].break_rms == 0.1f && d.volumes[0].anchors.size() == 4 &&
+                             d.volumes[0].verts.size() == 4 && d.volumes[0].verts[1].x == 0.5f && d.volumes[1].name == "cabin" && d.volumes[1].break_rms == 0.12f &&
+                             d.volumes[1].anchors.size() == 3 && d.volumes[1].anchors[2] == 3;
+        CHECK(read_ok, "collision volumes read: %zu", d.volumes.size());
+        bl::edit::Model m;
+        std::vector<std::string> notes;
+        Document d2;
+        const bool back = bl::edit::import_document(d, m, notes) && parse_truck_file(temp_file("bl_volumes2.truck", bl::edit::write_truck(m)), d2);
+        bool same = back && d2.volumes.size() == d.volumes.size();
+        for (size_t i = 0; same && i < d.volumes.size(); i++)
+            same = d2.volumes[i].name == d.volumes[i].name && d2.volumes[i].break_rms == d.volumes[i].break_rms && d2.volumes[i].anchors == d.volumes[i].anchors &&
+                   d2.volumes[i].verts.size() == d.volumes[i].verts.size() && length(d2.volumes[i].verts.back() - d.volumes[i].verts.back()) < 1e-5f;
+        CHECK(same, "collision volumes: the editor's round trip changed them");
+        printf("  collision volumes: ok\n");
+    }
     // FEM triangles: `fem_tris` with `set_fem_shell material, thickness[, r, g, b]` before its triangles (a triangle
     // before any: the default, 1 mm steel); the editor writes them back as it read them
     {
