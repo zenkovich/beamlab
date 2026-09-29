@@ -6,7 +6,7 @@
 namespace bl::phys {
 
 vec3 primitive_collision(vec3 F, vec3 vel, float mass, vec3 normal, float dt, const GroundModel& gm, float pen, float friction_coef, float push_max,
-                         float slop) {
+                         float slop, float restitution) {
     vec3 out(0);
     float Vn = dot(vel, normal);
     float Fn = dot(F, normal);
@@ -25,7 +25,8 @@ vec3 primitive_collision(vec3 F, vec3 vel, float mass, vec3 normal, float dt, co
         // RoR: remove 80% of the approach speed and 20% of the penetration per step. The penetration
         // term is capped at 2 m/s so that nodes appearing deep inside a contact zone are not launched.
         // (push_max, slop: a body's own; see SoftBody::contact_push_max)
-        if (Vn < 0) R -= (0.8f * Vn - std::min(0.2f * std::max(0.0f, pen - sgl - slop) / dt, push_max)) * mass / dt;
+        const float take = restitution >= 0 ? 1.0f + std::min(restitution, 0.95f) : 0.8f;
+        if (Vn < 0) R -= (take * Vn - std::min(0.2f * std::max(0.0f, pen - sgl - slop) / dt, push_max)) * mass / dt;
         if (R > 0) {
             vec3 slipF = F - normal * Fn;
             vec3 slip = vel - normal * Vn;

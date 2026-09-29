@@ -185,6 +185,7 @@ private:
     void refresh_fast_pairs(Island& isl);
     void near_pairs(Island& isl);
     void collide_pairs(Island& isl);
+    void collide_volumes(Island& isl, float dt, bool bodies); // (the bodies' collision volumes: SoftBody::volumes)
     void inherit_pairs(Island& isl, int body);
     void collide_static(SoftBody& b, size_t n0, size_t n1, const std::vector<int>& box_ids, const std::vector<int>& cyl_ids, float terrain_max_h, float dt,
                         int& contacts);

@@ -194,6 +194,49 @@ struct Capsule {
     int32_t joint = -1; // joint that forms this capsule (broken joint => capsule disabled)
 };
 
+// A collision volume (SoftBody::volumes): a heuristic for what fills a car - the engine and gearbox in the engine bay,
+// the seats and the occupants in the cabin, the load in the trunk. A convex hull (its vertices given in the vehicle's
+// space) riding on anchor nodes of the frame: placed every substep by their best rigid fit (the rotation by Mueller's
+// iteration from the last one). Other bodies' nodes, balls and volumes inside it are pushed out, so are the nodes of
+// the body's own parts on mounts (the hood, doors, lid, fenders, bumpers: `parts`) but not the frame it rides on, and it
+// out of the static world (its vertices; a pole through its faces); what it takes goes to its anchors as the force and
+// the moment it makes (spread over them as over a rigid body). Once its anchors are crushed or torn out of their shape
+// past break_rms (their fit's residual) it is off for good: a cut car's halves are left to their own shells.
+struct CollisionVolume {
+    std::string name;
+    std::vector<uint32_t> anchors;
+    std::vector<vec3> rest;                  // the anchors from their centre at rest
+    std::vector<vec3> verts;                 // the hull's vertices from the anchors' centre at rest
+    std::vector<vec4> planes;                // its faces at rest: n (outwards), w = d; inside n . x <= d
+    std::vector<std::vector<uint8_t>> faces; // (each face's vertices in order round it: the debug view)
+    float break_rms = 0.12f;
+    bool broken = false;
+    std::vector<uint32_t> parts;             // the body's own nodes it holds off (SoftBody::find_volume_parts)
+    // placed (SoftBody::place_volumes)
+    bool placed = false;
+    quat q;
+    vec3 c, v, w;                            // centre, its velocity, the angular velocity (world)
+    float mass = 0, rms = 0;
+    int hits = 0;                            // (contacts so far, substeps x points: the diagnostics)
+    float peak = 0;                          // (the largest force it took at a point, N)
+    mat3 Jinv;                               // (the anchors' spread about the centre, inverted: the moment's share)
+    std::vector<vec3> cur;                   // the anchors from the centre now
+    std::vector<vec3> wverts;
+    std::vector<vec4> wplanes;
+    vec3 mn, mx;
+    vec3 vel_at(vec3 p) const { return v + cross(w, p - c); }
+    // how far p is outside it: the largest n . p - d over its faces (negative inside), face its index
+    float depth(vec3 p, int& face) const {
+        float best = -1e30f;
+        face = 0;
+        for (size_t k = 0; k < wplanes.size(); k++) {
+            const float s = wplanes[k].x * p.x + wplanes[k].y * p.y + wplanes[k].z * p.z - wplanes[k].w;
+            if (s > best) best = s, face = (int)k;
+        }
+        return best;
+    }
+};
+
 // Triangle element (sheets): three nodes held by the triangle's own three edge springs (solved like beams, with
 // plastic yield), bending hinges to the neighbours across its edges, drawn and collided as one face. It never
 // breaks as a whole:
@@ -473,6 +516,20 @@ public:
     std::vector<float> weld_w;
     std::vector<Triangle> tris;
     std::vector<Capsule> capsules;
+    std::vector<CollisionVolume> volumes; // (see CollisionVolume)
+    bool volume_pass = false;             // (a cutting tool - the giant axe: through the volumes, it cuts)
+    // a volume on these anchors round the hull of these points (in the body's space as built); its index, -1: too few
+    // anchors or points not spanning a volume
+    int add_volume(const std::string& name, const std::vector<uint32_t>& anchors, const std::vector<vec3>& points, float break_rms);
+    void place_volumes();                                  // (every substep: their fits, see CollisionVolume)
+    void push_volume(CollisionVolume& cv, vec3 p, vec3 f); // a force f at p on it, onto its anchors (the force array)
+    // Each volume's parts (after fem.finalize): the nodes of the frame's components held on by mounts (a part's side of
+    // one) other than its anchors' - the hood, doors, lid, fenders, bumpers, not the body-in-white or the suspension -
+    // less the ones inside it as built. Returns those left out (inside) over all volumes.
+    int find_volume_parts();
+    // The body's nodes renumbered (map: old -> new, -1 gone): the volumes follow (one whose anchor is gone is off), and
+    // the grab's nodes.
+    void remap_node_refs(const std::function<int64_t(uint32_t)>& map);
     std::vector<Wheel> wheels;
     std::vector<float> wind_area;       // optional per-node drag area (m^2) for wind forces
     std::vector<SlideNode> slides;
@@ -493,6 +550,7 @@ public:
     // settings
     float collision_radius = 0.05f;     // node-vs-triangle thickness for inter-body collisions
     float ground_friction = 1.0f;
+    float bounce = -1.0f;               // restitution of its static contacts (a ball's); -1: RoR's (80% of the approach taken)
     // The static contacts' push out of a penetration (RoR: a fifth of it a step as velocity, at most 2 m/s): up to
     // `contact_slop` deep none, at most `contact_push_max`. Each touch of a node kicks it off again; a stiff, barely
     // damped sheet (a steel drum) kept that up as a drumming that rocked a lying drum to and fro for good.
@@ -612,11 +670,16 @@ public:
     SubstepCallback pre_substep;       // controller hook (vehicles), called each substep before forces
     SubstepCallback post_frame;        // called once after all substeps (per frame)
 
-    // mouse grab
+    // mouse grab: grab_node pulled to grab_target; with grab_nodes the nodes in the grab tool's sphere instead, each to
+    // the target and its offset from the sphere's centre then (the region keeps its shape), the pull (grab_k) shared by
+    // weight x mass - grab_w, falling off from the centre to the sphere's edge
     int grab_node = -1;
     vec3 grab_target;
     float grab_k = 0;
     float grab_scale = 1.0f;         // the pull's strength: a multiplier of grab_k and of its force cap (the grab tool's)
+    std::vector<uint32_t> grab_nodes;
+    std::vector<vec3> grab_offsets;
+    std::vector<float> grab_w;
 
     // triangle elements: topology changes during the simulation
     uint32_t topo_version = 0;          // bumped whenever shells / nodes are added or re-linked (visuals rebuild)

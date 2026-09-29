@@ -1640,6 +1640,7 @@ int SoftBody::coarsen_shells(int max_merges, float quiet_frac) {
         if (!wind_area.empty()) wind2.push_back(wind_area[v]);
     }
     if (grab_node >= 0) grab_node = gone[grab_node] ? -1 : (int)nidx[grab_node];
+    remap_node_refs([&](uint32_t i) { return gone[i] ? (int64_t)-1 : (int64_t)nidx[i]; });
     nodes.swap(nodes2);
     info.swap(info2);
     wind_area.swap(wind2);
@@ -1777,6 +1778,7 @@ int SoftBody::detach_pieces(std::vector<std::unique_ptr<SoftBody>>& out) {
         ts.push_back(shells[si]);
     }
     if (grab_node >= 0) grab_node = piece[find((uint32_t)grab_node)] < 0 ? (int)nidx[grab_node] : -1;
+    remap_node_refs([&](uint32_t i) { return piece[find(i)] < 0 ? (int64_t)nidx[i] : (int64_t)-1; }); // (a volume on a piece: off)
     std::vector<int> part_of;
     if (!fem.empty()) {
         part_of.resize(nn);
@@ -1961,6 +1963,7 @@ bool SoftBody::reorder_shells() {
             e.edge = (uint8_t)((e.edge + 3 - rot[e.shell]) % 3); // (the edges were rotated with the corners)
         }
     if (grab_node >= 0 && grab_node < (int)nn) grab_node = (int)nidx[grab_node];
+    remap_node_refs([&](uint32_t i) { return i < nn ? (int64_t)nidx[i] : (int64_t)-1; });
     if (!fem.empty()) fem.renumber(*this, nidx); // (a sheet on a frame: the frame's nodes renumbered with it)
     node_wheel.clear();
     topo_log.clear();

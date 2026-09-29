@@ -61,6 +61,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <functional>
 #include <vector>
 
 namespace bl::phys {
@@ -121,6 +122,7 @@ struct ShellSection {
                                     // for seconds at 0.3%: a sheet's free edges flapped, a slab rocked a box off)
     float drill = 0.05f;            // the corners' turning about the normal against the element's in-plane turning: a
                                     // spring of this share of G t A per corner (weak: only so the rotation is not free)
+    vec3 color = vec3(-1.0f);       // (display only) its plates' colour; negative: the body's paint
     float mass_per_m2() const { return rho * t; }
     float D() const { return E * t * t * t / (12.0f * (1.0f - nu * nu)); } // bending stiffness (N m)
 };
@@ -143,6 +145,7 @@ struct FrameTri {
                                     // authored one, less one: the state, not the path - an element shaking at its yield
                                     // after an impact does not wear through)
     float util = 0;                 // stress against the yield (membrane or bending, the larger), for display
+    uint8_t tears = 0;              // edges it has torn free (FemFrame::tear_tri: a crack along one; three: a piece)
 };
 
 // How a member's end is joined to its node. The member's local axes: x along it, y in the vertical plane through it
@@ -353,9 +356,18 @@ public:
     // Destroy tool: members passing within r of p are torn there (at a joint, off it; else split and torn at that
     // point). Returns the tears.
     int break_near(SoftBody& b, vec3 p, float r);
-    // A triangle element torn out (a cut through it: the laser, the axe); finish_cuts after the last. Returns 1, 0 if
-    // it was already.
-    int tear_tri(SoftBody& b, uint32_t ti);
+    // A triangle element torn: a crack along one of its edges, the one most across `pull` (the stretch that tears it;
+    // zero: its plastic stretch's largest principal direction), opened by duplicating the edge's end nodes - the
+    // triangles on the element's side of the crack take the copies (a node inside the sheet: the crack goes on along
+    // its edge that runs straightest from the torn one), the members and everything else keep the node. Nothing is
+    // removed: the sheet parts along the crack, a piece cut off all round stays a piece. finish_cuts after the last.
+    // Returns 1 if a crack opened, 0 if none could (the element already free all round).
+    int tear_tri(SoftBody& b, uint32_t ti, vec3 pull = vec3(0));
+    // A cut through the shell (the laser's, the axe's plane): the triangles it crosses and their neighbours at those
+    // triangles' corners are sorted by the side their middles are on (side(p) >= 0 or < 0), and each of those corners
+    // with triangles on both sides is duplicated - the positive side's take the copy. The shell parts along its edges
+    // nearest the cut; nothing is removed. finish_cuts after. Returns the corners split.
+    int part_tris(SoftBody& b, const std::vector<uint32_t>& crossed, const std::function<float(vec3)>& side);
     // A member cut at t along it (0 at a): torn off the joint when that is close, else split there and torn. Then
     // finish_cuts once (the solver's pattern again, the body told of its new nodes). Returns the tears.
     int cut(SoftBody& b, uint32_t elem, float t);
@@ -398,6 +410,8 @@ public:
     bool tri_state(uint32_t ti, float d[18], vec3 axes[3]) const;
 
 private:
+    // (node fn duplicated: the triangles listed take the copy with their share of its mass; the copy's frame node)
+    uint32_t detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint32_t>& moved);
     std::vector<int32_t> slot_;
     std::vector<char> welded_;      // (compute_forces: the frame nodes some member is welded to, for the joints' damping)
     float last_h_ = 0;              // (the last step's length: a mount's overload accumulates over time)
@@ -507,6 +521,22 @@ private:
         uint32_t mount;
     };
     std::vector<std::vector<MountDamp>> comp_mdamp_;
+    // a spring of the body with one end off the frame (a wheel's spoke from its tread to the hub): implicit on both of
+    // its ends along it - the other end (its mass shared among such springs of its) condensed into the frame node's
+    // row (c mb / (mb + c) e e^T, its force's share on the right), its own change put back after the solve. (Taken on
+    // the frame's side alone, as if the other end stood still, the step dropped c e (e . dv) of the frame node's
+    // momentum: a driven FEM car lost a third of its tyres' push.)
+    struct OneSided {
+        uint32_t frame_node, other;   // (the frame node's slot, the other end's body node)
+        vec3 e;
+        float c, mb, share;           // (the spring's implicit coefficient, the other end's mass share, 1 / its springs)
+    };
+    std::vector<std::vector<OneSided>> comp_onesided_;
+    std::vector<std::vector<std::pair<uint32_t, vec3>>> comp_react_;   // (the other ends' impulses of the step, per component)
+    std::vector<uint16_t> onesided_n_;                                  // (per body node: its one-sided springs)
+    void one_sided_rhs(const SoftBody& b, int comp, float h);
+    void one_sided_react(const SoftBody& b, int comp, float h);
+    void apply_reacts(SoftBody& b, float step);
     std::vector<std::vector<Changed>> comp_changed_;
     struct CompStats {
         int failures = 0, clamps = 0;

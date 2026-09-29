@@ -250,9 +250,12 @@ int sphere_contacts(std::vector<SoftBody*>& bodies, float h, std::vector<uint32_
     // impact's overlap is a step's travel deep: its velocity is taken out, the overlap undone in a few steps.
     static const float kOut = getenv("BL_SPHERE_OUT") ? (float)atof(getenv("BL_SPHERE_OUT")) : 0.2f; // m/s
     const float mu = 0.4f;
-    thread_local std::vector<std::vector<float>> budget; // each node's push left this call
-    budget.resize(nb);
-    for (size_t i = 0; i < nb; i++) budget[i].assign(bodies[i]->nodes.size(), kOut * h);
+    // (against a ball - one rigid sphere, a projectile - a sheet's nodes may give way faster, on a budget of their own: a
+    // heavy ball of one node sank into a drum's light nodes, their push used up; the sheets among themselves keep kOut)
+    static const float kOutBall = 1.0f; // m/s
+    thread_local std::vector<std::vector<float>> budget, budget_ball; // each node's push left this call
+    budget.resize(nb), budget_ball.resize(nb);
+    for (size_t i = 0; i < nb; i++) budget[i].assign(bodies[i]->nodes.size(), kOut * h), budget_ball[i].assign(bodies[i]->nodes.size(), kOutBall * h);
     // one side of a pair: a sheet's sphere (its nodes, weighted) or a ball (the whole body, its centre of mass)
     auto side = [&](uint32_t bi, const SoftBody::Sphere& sp, float awake, vec3& c, vec3& v) {
         const SoftBody& b = *bodies[bi];
@@ -269,14 +272,15 @@ int sphere_contacts(std::vector<SoftBody*>& bodies, float h, std::vector<uint32_
         return W;
     };
     // the largest push (along the line of centres, as lam) its nodes have left this call
-    auto room = [&](uint32_t bi, const SoftBody::Sphere& sp, float awake, float lam) {
+    auto room = [&](uint32_t bi, const SoftBody::Sphere& sp, float awake, float lam, bool vs_ball) {
         const SoftBody& b = *bodies[bi];
+        const auto& bud = vs_ball ? budget_ball[bi] : budget[bi];
         for (int p = 0; p < sp.k; p++)
-            if (const float f = sp.w[p] * awake * b.nodes[sp.n[p]].inv_mass; f > 0) lam = std::min(lam, budget[bi][sp.n[p]] / f);
+            if (const float f = sp.w[p] * awake * b.nodes[sp.n[p]].inv_mass; f > 0) lam = std::min(lam, bud[sp.n[p]] / f);
         return lam;
     };
     // a push dp (lam n: positions) and an impulse dv (velocities) on one side
-    auto apply = [&](uint32_t bi, const SoftBody::Sphere& sp, float awake, vec3 dp, vec3 dv) {
+    auto apply = [&](uint32_t bi, const SoftBody::Sphere& sp, float awake, vec3 dp, vec3 dv, bool vs_ball = false) {
         SoftBody& b = *bodies[bi];
         if (sp.k == 0) {
             const float f = ball[bi].im * awake;
@@ -287,9 +291,9 @@ int sphere_contacts(std::vector<SoftBody*>& bodies, float h, std::vector<uint32_
         }
         for (int p = 0; p < sp.k; p++) {
             Node& x = b.nodes[sp.n[p]];
-            const float f = sp.w[p] * awake * x.inv_mass;
+            const float f = sp.w[p] * awake * b.nodes[sp.n[p]].inv_mass;
             x.p += dp * f, x.v += dv * f;
-            budget[bi][sp.n[p]] -= length(dp) * f;
+            (vs_ball ? budget_ball : budget)[bi][sp.n[p]] -= length(dp) * f;
         }
     };
     for (int it = 0; it < 2; it++)
@@ -300,6 +304,7 @@ int sphere_contacts(std::vector<SoftBody*>& bodies, float h, std::vector<uint32_
             const SoftBody::Sphere& sb = bb.spheres[ct.sb];
             const float ia = ba.sleeping ? 0.0f : 1.0f, ib = bb.sleeping ? 0.0f : 1.0f; // (asleep: immovable)
             vec3 ca, cb, va, vb;
+            const bool vs_ball = sa.k == 0 || sb.k == 0;
             const float W = side(ct.ba, sa, ia, ca, va) + side(ct.bb, sb, ib, cb, vb);
             if (!(W > 0)) continue;
             const vec3 d = cb - ca;
@@ -314,12 +319,25 @@ int sphere_contacts(std::vector<SoftBody*>& bodies, float h, std::vector<uint32_
             const vec3 dv = vb - va;
             const float vn = dot(dv, n);
             // the push: the overlap, at most what leaves the two parting at kOut, at most what its nodes have left
-            float lam = std::min(ct.r - l, std::max(0.0f, kOut - vn) * h) / W;
-            lam = std::max(0.0f, room(ct.bb, sb, ib, room(ct.ba, sa, ia, lam)));
+            float lam = std::min(ct.r - l, std::max(0.0f, (vs_ball ? kOutBall : kOut) - vn) * h) / W;
+            lam = std::max(0.0f, room(ct.bb, sb, ib, room(ct.ba, sa, ia, lam, vs_ball), vs_ball));
             static const bool push_v = getenv("BL_SPHERE_PUSHV") != nullptr; // (diagnostics: the push with velocity)
             const float pen = lam * W, lv = push_v ? lam / h : 0.0f;
-            apply(ct.ba, sa, ia, n * -lam, n * -lv);
-            apply(ct.bb, sb, ib, n * lam, n * lv);
+            apply(ct.ba, sa, ia, n * -lam, n * -lv, vs_ball);
+            apply(ct.bb, sb, ib, n * lam, n * lv, vs_ball);
+            // (a sheet that does not give way - its sphere still, trapped between the ball and the ground or a wall, its
+            // nodes pushed in and back each step - leaves the ball in it: then the ball comes out of the overlap itself,
+            // slowly and without speed; a sheet being dented moves away and is left to the push)
+            if (vs_ball) {
+                const bool ball_a = sa.k == 0;
+                const float ov = (ct.r - l) - pen, away = ball_a ? dot(vb, n) - dot(va, n) : dot(va, -n) - dot(vb, -n);
+                const uint32_t bb_i = ball_a ? ct.ba : ct.bb;
+                const float awake = ball_a ? ia : ib;
+                if (ov > 0.01f && away < 0.05f && vn > -0.2f && awake > 0 && ball[bb_i].im > 0) { // (at rest on it, not striking it)
+                    const float out = std::min(ov, 0.5f * h) / ball[bb_i].im;
+                    apply(bb_i, ball_a ? sa : sb, awake, ball_a ? n * -out : n * out, vec3(0));
+                }
+            }
             // the closing velocity (what the push left of it) out, the sliding one resisted by both impulses
             const float jn = std::max(0.0f, -(vn + (push_v ? pen / h : 0.0f))) / W;
             const vec3 vt = dv - n * vn;
@@ -327,8 +345,8 @@ int sphere_contacts(std::vector<SoftBody*>& bodies, float h, std::vector<uint32_
             const float jt = vtl > 1e-6f ? std::min(mu * (jn + lv), vtl / W) : 0.0f;
             if (jn <= 0 && jt <= 0) continue;
             const vec3 imp = n * jn - (vtl > 1e-6f ? vt * (jt / vtl) : vec3(0));
-            apply(ct.ba, sa, ia, vec3(0), -imp);
-            apply(ct.bb, sb, ib, vec3(0), imp);
+            apply(ct.ba, sa, ia, vec3(0), -imp, vs_ball);
+            apply(ct.bb, sb, ib, vec3(0), imp, vs_ball);
         }
     return (int)contacts.size();
 }

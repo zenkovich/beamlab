@@ -571,6 +571,9 @@ void World::build_islands(float frame_time) {
                 };
                 bool ti = !bi.tris.empty(), tj = !bj.tris.empty(), ci = !bi.capsules.empty(), cj = !bj.capsules.empty();
                 bool can = (has_contacters(bi) && (tj || cj)) || (has_contacters(bj) && (ti || ci)) || (ci && tj) || (cj && ti);
+                // (a collision volume meets the other's contacter nodes, balls and volumes)
+                const bool vi = !bi.volumes.empty() && !bi.volume_pass && !bj.volume_pass, vj = !bj.volumes.empty() && !bj.volume_pass && !bi.volume_pass;
+                can = can || (vi && (has_contacters(bj) || cj || vj)) || (vj && (has_contacters(bi) || ci));
                 if (!can) continue;
                 int a = find(i), b = find(j);
                 if (a != b) parent[a] = b;
@@ -734,7 +737,7 @@ void World::collide_static(SoftBody& b, size_t n0, size_t n1, const std::vector<
             F[i] += t.normal_force;
             if (t.touching) tyre.push_back({i, t});
         } else {
-            const vec3 f = primitive_collision(F[i], x.v, x.mass, c.normal, dt, gm, c.depth, inf[i].friction * fric_body, b.contact_push_max, b.contact_slop);
+            const vec3 f = primitive_collision(F[i], x.v, x.mass, c.normal, dt, gm, c.depth, inf[i].friction * fric_body, b.contact_push_max, b.contact_slop, b.bounce);
             F[i] += f;
             // a frame node pressed on: its normal motion is held in the frame's implicit step (FemFrame::contact_n)
             if (!b.fem.empty())
@@ -781,6 +784,134 @@ static inline bool near_triangle(vec3 p, vec3 a, vec3 b, vec3 c, vec3 tu, float 
     if (s > r || s < -r - depth) return false;
     const vec3 q = p - tu * s; // (over the face, within r of it)
     return length2(closest_on_triangle(q, a, b, c, bary) - q) <= r * r;
+}
+
+// The collision volumes (CollisionVolume): placed on their anchors, then each against its body's parts (their nodes
+// inside it), the other bodies of the island - their nodes inside it, their balls (a capsule of no length) reaching
+// into it, their volumes' vertices inside it - and against the static world (its vertices; a pole through a face).
+// Each contact as the ground's (primitive_collision) on the effective mass of the pair, the volume's side onto its
+// anchors. Serial: a few volumes, a few contacts.
+void World::collide_volumes(Island& isl, float dt, bool bodies) {
+    PROFILE_ACCUM("Volumes");
+    bool any = false;
+    for (SoftBody* b : isl.bodies) any |= !b->volumes.empty() && !b->volume_pass;
+    if (!any) return;
+    for (SoftBody* b : isl.bodies)
+        if (!b->volumes.empty()) b->place_volumes();
+    const GroundModel& gm = ground_models()[SURF_METAL];
+    constexpr float kFric = 0.4f;
+    const int nb = (int)isl.bodies.size();
+    auto overlap = [](vec3 amn, vec3 amx, vec3 bmn, vec3 bmx, float r) {
+        return amn.x - r <= bmx.x && bmn.x - r <= amx.x && amn.y - r <= bmx.y && bmn.y - r <= amx.y && amn.z - r <= bmx.z && bmn.z - r <= amx.z;
+    };
+    for (int ka = 0; ka < nb; ka++) {
+        SoftBody& A = *isl.bodies[ka];
+        if (A.volumes.empty() || A.volume_pass || A.force.size() != A.nodes.size()) continue;
+        const bool a_moves = !A.sleeping && !A.rigid;
+        for (CollisionVolume& V : A.volumes) {
+            if (!V.placed || !(V.mass > 0)) continue;
+            // a contact at p along n (out of the volume) pen deep, of a side of mass m moving at vel with force F on it;
+            // returns the force on that side (the volume takes it back)
+            auto contact = [&](vec3 p, vec3 n, float pen, float m, vec3 vel, vec3 F, bool other_moves) -> vec3 {
+                const float mv = a_moves ? V.mass : 1e30f, mo = other_moves ? m : 1e30f;
+                if (mv > 1e29f && mo > 1e29f) return vec3(0);
+                const float me = 1.0f / (1.0f / mv + 1.0f / mo);
+                const vec3 f = primitive_collision(other_moves ? F * (me / m) : vec3(0), vel - V.vel_at(p), me, n, dt, gm, pen, kFric);
+                if (a_moves) A.push_volume(V, p, -f);
+                return other_moves ? f : vec3(0);
+            };
+            int face;
+            // its body's parts (a door pushed in, the hood folded back): their nodes out of it, the reaction on its anchors
+            if (a_moves)
+                for (uint32_t i : V.parts) {
+                    const Node& x = A.nodes[i];
+                    if (x.inv_mass <= 0) continue;
+                    if (x.p.x < V.mn.x || x.p.x > V.mx.x || x.p.y < V.mn.y || x.p.y > V.mx.y || x.p.z < V.mn.z || x.p.z > V.mx.z) continue;
+                    const float s = V.depth(x.p, face);
+                    if (s >= 0) continue;
+                    A.force[i] += contact(x.p, V.wplanes[face].xyz(), -s, x.mass, x.v, A.force[i], true);
+                }
+            if (bodies)
+                for (int kb = 0; kb < nb; kb++) {
+                    if (kb == ka) continue;
+                    SoftBody& B = *isl.bodies[kb];
+                    if (B.volume_pass || (A.sleeping && B.sleeping) || B.force.size() != B.nodes.size()) continue;
+                    if (!overlap(V.mn, V.mx, B.aabb.mn, B.aabb.mx, 0.5f)) continue;
+                    const bool b_moves = !B.sleeping && !B.rigid;
+                    // its nodes
+                    for (size_t i = 0; i < B.nodes.size(); i++) {
+                        const Node& x = B.nodes[i];
+                        if (x.inv_mass <= 0 || !(B.info[i].flags & NF_CONTACTER)) continue;
+                        if (x.p.x < V.mn.x || x.p.x > V.mx.x || x.p.y < V.mn.y || x.p.y > V.mx.y || x.p.z < V.mn.z || x.p.z > V.mx.z) continue;
+                        const float s = V.depth(x.p, face);
+                        if (s >= 0) continue;
+                        B.force[i] += contact(x.p, V.wplanes[face].xyz(), -s, x.mass, x.v, B.force[i], b_moves);
+                        B.body_contacts++;
+                    }
+                    // its balls
+                    for (const Capsule& cp : B.capsules) {
+                        if (cp.a != cp.b || cp.a >= B.nodes.size()) continue;
+                        const Node& x = B.nodes[cp.a];
+                        if (x.inv_mass <= 0) continue;
+                        const float s = V.depth(x.p, face);
+                        if (s >= cp.radius) continue;
+                        B.force[cp.a] += contact(x.p - V.wplanes[face].xyz() * s, V.wplanes[face].xyz(), cp.radius - s, x.mass, x.v, B.force[cp.a], b_moves);
+                        B.body_contacts++;
+                    }
+                    // its volumes' vertices
+                    for (CollisionVolume& W : B.volumes) {
+                        if (!W.placed || !(W.mass > 0) || !overlap(V.mn, V.mx, W.mn, W.mx, 0.0f)) continue;
+                        const float mw = W.mass / (float)W.wverts.size();
+                        for (const vec3& p : W.wverts) {
+                            const float s = V.depth(p, face);
+                            if (s >= 0) continue;
+                            const vec3 f = contact(p, V.wplanes[face].xyz(), -s, mw, W.vel_at(p), vec3(0), b_moves);
+                            if (b_moves) B.push_volume(W, p, f);
+                        }
+                    }
+                }
+            if (!a_moves) continue;
+            // the static world: its vertices (the effective mass shared by the ones touching), a pole through a face
+            const std::vector<int>& bids = isl.box_ids[ka];
+            const std::vector<int>& cids = isl.cyl_ids[ka];
+            thread_local std::vector<std::pair<int, ContactInfo>> hits;
+            hits.clear();
+            const bool near_terrain = statics.has_terrain && V.mn.y <= isl.terrain_max[ka] + 0.05f;
+            for (int k = 0; k < (int)V.wverts.size(); k++) {
+                ContactInfo ci;
+                if (statics.collide_point(V.wverts[k], 0.0f, bids.data(), (int)bids.size(), cids.data(), (int)cids.size(), near_terrain, ci) && ci.depth > 0)
+                    hits.push_back({k, ci});
+            }
+            for (const auto& [k, ci] : hits) {
+                const vec3 p = V.wverts[k];
+                const GroundModel& g = ground_models()[ci.surface < SURF_COUNT ? ci.surface : 0];
+                vec3 f = primitive_collision(vec3(0), V.vel_at(p), V.mass / (float)hits.size(), ci.normal, dt, g, ci.depth, kFric);
+                if (ci.max_force > 0 && length(f) > ci.max_force) f *= ci.max_force / length(f);
+                A.push_volume(V, p, f);
+            }
+            for (int id : cids) {
+                if (id < 0 || id >= (int)statics.cylinders.size()) continue;
+                const StaticCylinder& cy = statics.cylinders[id];
+                if (cy.base.x + cy.radius < V.mn.x || cy.base.x - cy.radius > V.mx.x || cy.base.z + cy.radius < V.mn.z || cy.base.z - cy.radius > V.mx.z) continue;
+                const float y0 = std::max(V.mn.y, cy.base.y), y1 = std::min(V.mx.y, cy.base.y + cy.height);
+                if (y1 <= y0) continue;
+                // (its axis at a few heights through the hull: the deepest one)
+                float best = 1e30f;
+                vec3 bp(0), bn(0);
+                for (int m = 0; m < 5; m++) {
+                    const vec3 q(cy.base.x, y0 + (y1 - y0) * (m + 0.5f) / 5.0f, cy.base.z);
+                    const float s = V.depth(q, face);
+                    vec3 nh = V.wplanes[face].xyz();
+                    nh.y = 0;
+                    if (s < best && length2(nh) > 0.25f) best = s, bp = q, bn = normalize(nh);
+                }
+                if (best >= cy.radius) continue;
+                const GroundModel& g = ground_models()[cy.surface < SURF_COUNT ? cy.surface : 0];
+                const vec3 f = primitive_collision(vec3(0), V.vel_at(bp), V.mass, -bn, dt, g, cy.radius - best, kFric);
+                A.push_volume(V, bp - bn * best, f);
+            }
+        }
+    }
 }
 
 void World::rebuild_pairs(Island& isl) {
@@ -1927,6 +2058,7 @@ void World::simulate_island(Island& isl, int substeps) {
                     collide_pairs(isl);
                     isl.ph_ms[8] += prof::ticks_to_ms(prof::now() - c1);
                 }
+                collide_volumes(isl, dt, isl.bodies.size() > 1); // (the collision volumes: against the other bodies and the static world)
                 lap(2);
             }
             // 4) static contacts + integration (the sheets' forces of the later short steps are gathered here)
@@ -2432,13 +2564,16 @@ int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip
             }
             int tears = 0;
             for (const auto& [ei, t] : hits) tears += b.fem.cut(b, ei, t);
-            // triangle elements across the cut: torn out (a shell of them cut in two)
+            // triangle elements across the cut: the shell parts along its edges nearest the cut (FemFrame::part_tris: the
+            // nodes there duplicated, nothing removed)
+            std::vector<uint32_t> crossed;
             for (size_t ti = 0; ti < b.fem.tris.size(); ti++) {
                 const FrameTri& t = b.fem.tris[ti];
                 if (t.broken) continue;
                 const vec3 pa = b.nodes[b.fem.node[t.n[0]]].p, pb = b.nodes[b.fem.node[t.n[1]]].p, pc = b.nodes[b.fem.node[t.n[2]]].p;
-                if (crosses(pa, pb) || crosses(pb, pc) || crosses(pc, pa)) tears += b.fem.tear_tri(b, (uint32_t)ti);
+                if (crosses(pa, pb) || crosses(pb, pc) || crosses(pc, pa)) crossed.push_back((uint32_t)ti);
             }
+            if (!crossed.empty()) tears += b.fem.part_tris(b, crossed, side);
             b.fem.finish_cuts(b, tears);
             cut += tears;
             if (getenv("BL_FRAMEDBG")) printf("laser: %s: %zu members crossed, %d torn\n", b.name.c_str(), hits.size(), tears);

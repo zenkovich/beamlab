@@ -33,8 +33,9 @@ struct GroundModel {
 // RoR "primitiveCollision": contact force for a node given the force accumulated so far.
 // Cancels the normal force, removes 80% of approach velocity + 20% penetration per step,
 // then applies adhesion / Stribeck friction. `force` = accumulated force on the node (or contact side).
+// (restitution >= 0: instead the approach speed turned back to that fraction of it at once - a ball's bounce)
 vec3 primitive_collision(vec3 force, vec3 vel, float mass, vec3 normal, float dt, const GroundModel& gm, float pen, float friction_coef,
-                         float push_max = 2.0f, float slop = 0.0f);
+                         float push_max = 2.0f, float slop = 0.0f, float restitution = -1.0f);
 // Tyre tread contact, evaluated per node and resolved per wheel (see World::collide_static): RoR normal
 // response; friction is a velocity-level Coulomb model. `need` makes the node stick (cancels the applied
 // tangential force and removes half of the slip in this step), `cap` = ms*N is the node's share of the static

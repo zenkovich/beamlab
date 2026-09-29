@@ -250,17 +250,29 @@ void SoftBody::clear_forces(vec3 g) {
     }
     for (auto& fr : frames) fr.torque = vec3(0);
     if (grab_node >= 0 && grab_node < (int)n) {
-        Node& gn = nodes[grab_node];
-        vec3 d = grab_target - gn.p;
         const float gs = clampf(grab_scale, 0.01f, 100.0f);
-        float k = (grab_k > 0 ? grab_k : gn.mass * 400.0f) * gs;
-        // critically damped pull, force capped for robustness
-        vec3 F = d * k - gn.v * (2.0f * std::sqrt(k * gn.mass));
-        // (and capped by acceleration: a 5 g cloth node pulled with 20 kN would jump kilometres per second; a stronger
-        // grab raises the cap, up to 40000 m/s2)
-        float fl = length(F), fmax = std::min(std::min(gn.mass * 400.0f + 20000.0f, gn.mass * 5000.0f) * gs, gn.mass * 40000.0f);
-        if (fl > fmax) F *= fmax / fl;
-        f[grab_node] += F;
+        const bool many = !grab_nodes.empty() && grab_nodes.size() == grab_offsets.size() && grab_nodes.size() == grab_w.size();
+        float msum = 0; // (weight x mass)
+        if (many)
+            for (size_t j = 0; j < grab_nodes.size(); j++) msum += grab_nodes[j] < n ? nodes[grab_nodes[j]].mass * grab_w[j] : 0.0f;
+        const size_t cnt = many ? grab_nodes.size() : 1;
+        for (size_t j = 0; j < cnt; j++) {
+            const uint32_t i = many ? grab_nodes[j] : (uint32_t)grab_node;
+            if (i >= n) continue;
+            Node& gn = nodes[i];
+            if (gn.inv_mass <= 0) continue;
+            const float share = many ? (msum > 0 ? gn.mass * grab_w[j] / msum : 0.0f) : 1.0f; // (of the pull and of its force cap's constant)
+            if (!(share > 0)) continue;
+            vec3 d = grab_target + (many ? grab_offsets[j] : vec3(0)) - gn.p;
+            float k = (grab_k > 0 ? grab_k * share : gn.mass * 400.0f) * gs;
+            // critically damped pull, force capped for robustness
+            vec3 F = d * k - gn.v * (2.0f * std::sqrt(k * gn.mass));
+            // (and capped by acceleration: a 5 g cloth node pulled with 20 kN would jump kilometres per second; a stronger
+            // grab raises the cap, up to 40000 m/s2)
+            float fl = length(F), fmax = std::min(std::min(gn.mass * 400.0f + 20000.0f * share, gn.mass * 5000.0f) * gs, gn.mass * 40000.0f);
+            if (fl > fmax) F *= fmax / fl;
+            f[i] += F;
+        }
     }
 }
 

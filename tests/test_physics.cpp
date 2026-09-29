@@ -1686,11 +1686,43 @@ static void test_fem_tris() {
         b->pre_substep = [&](SoftBody& x, float) {
             for (uint32_t i : tip) x.force[i] += vec3(P / (float)tip.size(), 0, 0);
         };
+        const size_t nodes0 = b->nodes.size(), tris0 = b->fem.tris.size();
+        bool pulling = true;
+        b->pre_substep = [&](SoftBody& x, float) {
+            if (pulling)
+                for (uint32_t i : tip) x.force[i] += vec3(P / (float)tip.size(), 0, 0);
+        };
         for (int i = 0; i < 2000 && b->fem.tris_torn == 0; i++) w->step_substeps(1);
+        pulling = false; // (the load off at the first tear: the piece it tore off flies)
+        for (int i = 0; i < 400; i++) w->step_substeps(1);
         bool finite = true;
         for (const Node& x : b->nodes) finite &= std::isfinite(x.p.x + x.p.y + x.p.z);
-        printf("    strip pulled at twice its yield: %d triangles torn out\n", b->fem.tris_torn);
-        CHECK(b->fem.tris_torn > 0 && finite, "pulled strip: %d torn, finite %d", b->fem.tris_torn, (int)finite);
+        int gone = 0;
+        for (const FrameTri& t : b->fem.tris) gone += t.broken;
+        // (torn, a triangle stays: the crack opens along its edges, the nodes there duplicated - none disappears)
+        printf("    strip pulled at twice its yield: %d tears, %zu -> %zu nodes, %d of %zu triangles gone, %d components\n", b->fem.tris_torn, nodes0,
+               b->nodes.size(), gone, tris0, b->fem.components());
+        CHECK(b->fem.tris_torn > 0 && finite && gone == 0 && b->nodes.size() > nodes0 && b->fem.tris.size() == tris0 && b->fem.components() >= 2,
+              "pulled strip: %d torn, finite %d, %d gone, %zu nodes, %d components", b->fem.tris_torn, (int)finite, gone, b->nodes.size(), b->fem.components());
+    }
+    // a plate cut across by the laser: it parts along its edges into two pieces, no triangle removed, the nodes along the
+    // cut duplicated
+    {
+        auto w = world(false);
+        SoftBody* b = w->add_body(tri_plate(0.6f, 0.4f, 6, 4, make_shell_section("Steel", 0.002f), false));
+        const size_t nodes0 = b->nodes.size();
+        w->step_substeps(1);
+        const int cut = w->laser_cut(vec3(0.31f, 2.0f, 0.2f), normalize(vec3(0, -1, 0.3f)), normalize(vec3(0, -1, -0.3f)), 5.0f);
+        b->fem.finish_cuts(*b, cut);
+        for (int i = 0; i < 200; i++) w->step_substeps(1);
+        int gone = 0;
+        for (const FrameTri& t : b->fem.tris) gone += t.broken;
+        bool finite = true;
+        for (const Node& x : b->nodes) finite &= std::isfinite(x.p.x + x.p.y + x.p.z);
+        printf("    plate cut across by the laser: %d tears, %zu -> %zu nodes, %d triangles gone, %d components\n", cut, nodes0, b->nodes.size(), gone,
+               b->fem.components());
+        CHECK(cut > 0 && gone == 0 && b->nodes.size() > nodes0 && b->fem.components() == 2 && finite, "laser cut: %d tears, %d gone, %d components", cut, gone,
+              b->fem.components());
     }
     // a hollow steel cube (1 m, 2 mm, 5 x 5 cells a face) dropped 1 m on its face: it lands and rests, sound
     {
@@ -2479,6 +2511,158 @@ static void test_hull() {
     printf("    the ball's centre from the plane: %.3f m (hull, left at %.2f m/s), %.3f m (two-sided)\n", out.centre, out.speed, stays.centre);
 }
 
+// ---- one-sided springs, balls, collision volumes: a frame falling freely with a node hung on a spring under it falls at
+// g as a whole (the spring's implicit part taken on the frame's side alone - the other end held still for the step -
+// took momentum out: a driven FEM car lost a third of its tyres' push); a ball of one node and a capsule rests on the
+// ground at its radius; a node thrown at a body's collision volume is kept out of it, the momentum kept
+static void test_volumes() {
+    printf("one-sided springs, a one-node ball, collision volumes\n");
+    const FrameSection tube = frame_tube(2e-4f);
+    {
+        auto w = std::make_unique<World>();
+        w->settings.gravity = vec3(0, -9.81f, 0);
+        auto body = std::make_unique<SoftBody>();
+        body->name = "hung";
+        body->can_sleep = false;
+        const uint16_t si = body->fem.add_section(tube);
+        const uint32_t f0 = body->add_node(vec3(0, 50, 0), 1.0f, NF_NONE), f1 = body->add_node(vec3(0.5f, 50, 0), 1.0f, NF_NONE),
+                       f2 = body->add_node(vec3(0, 50, 0.5f), 1.0f, NF_NONE);
+        body->fem.add_element(f0, f1, si), body->fem.add_element(f1, f2, si), body->fem.add_element(f2, f0, si);
+        const uint32_t p = body->add_node(vec3(0, 49.5f, 0), 2.0f, NF_NONE);
+        body->add_beam(f0, p, 1e5f, 900.0f, 1e12f, 1e12f);
+        fix_inv_mass(*body);
+        body->fem.finalize(*body);
+        SoftBody* b = w->add_body(std::move(body));
+        const int steps = 1000;
+        for (int k = 0; k < steps; k++) w->step_substeps(1);
+        double P = 0, M = 0, pf = 0, mf = 0;
+        for (size_t i = 0; i < b->nodes.size(); i++) {
+            P += b->nodes[i].mass * b->nodes[i].v.y, M += b->nodes[i].mass;
+            if (b->fem.slot((uint32_t)i) >= 0) pf += b->nodes[i].mass * b->nodes[i].v.y, mf += b->nodes[i].mass;
+        }
+        const double t = steps * w->settings.dt, expect = -9.81 * t;
+        CHECK(std::fabs(P / (M * expect) - 1.0) < 0.01, "a frame with a hung node fell at %.3f of g as a whole", P / (M * expect));
+        CHECK(std::fabs(pf / (mf * expect) - 1.0) < 0.02, "its frame fell at %.3f of g", pf / (mf * expect));
+        printf("    in free fall: the whole at %.4f of g, the frame's nodes at %.4f\n", P / (M * expect), pf / (mf * expect));
+    }
+    {
+        auto w = std::make_unique<World>();
+        w->settings.gravity = vec3(0, -9.81f, 0);
+        w->statics.terrain.create(21, 21, 1.0f, vec2(-10, -10)); // (flat ground at y = 0)
+        w->statics.has_terrain = true;
+        w->statics.terrain.update_bounds();
+        auto body = std::make_unique<SoftBody>();
+        body->name = "ball";
+        const uint32_t c = body->add_node(vec3(0, 2, 0), 40.0f, NF_GROUND | NF_CONTACTER);
+        body->capsules.push_back({c, c, 0.22f});
+        body->sphere_ball = 0.22f, body->bounce = 0.2f, body->collision_radius = 0.01f;
+        body->finalize();
+        body->info[c].radius = 0.22f;
+        SoftBody* b = w->add_body(std::move(body));
+        for (int f = 0; f < 90; f++) w->step_substeps(33);
+        const float y = b->nodes[0].p.y, v = length(b->nodes[0].v);
+        CHECK(std::fabs(y - 0.22f) < 0.02f && v < 0.1f, "a ball of 0.22 m dropped on the ground rests at %.3f m, %.2f m/s", y, v);
+        printf("    a ball of 0.22 m dropped from 2 m: at %.3f m, %.3f m/s\n", y, v);
+    }
+    {
+        auto w = std::make_unique<World>();
+        w->settings.gravity = vec3(0);
+        auto cube = std::make_unique<SoftBody>();
+        cube->name = "cube";
+        std::vector<uint32_t> an;
+        for (int k = 0; k < 8; k++) an.push_back(cube->add_node(vec3((float)(k & 1), 5.0f + (float)((k >> 1) & 1), (float)((k >> 2) & 1)), 10.0f, NF_NONE));
+        for (int i = 0; i < 8; i++)
+            for (int j = i + 1; j < 8; j++) cube->add_beam(an[i], an[j], 1e6f, 1000.0f, 1e12f, 1e12f);
+        cube->finalize();
+        std::vector<vec3> hull;
+        for (int k = 0; k < 8; k++) hull.push_back(vec3(0.1f + 0.8f * (float)(k & 1), 5.1f + 0.8f * (float)((k >> 1) & 1), 0.1f + 0.8f * (float)((k >> 2) & 1)));
+        const int vi = cube->add_volume("box", an, hull, 0.2f);
+        CHECK(vi == 0 && cube->volumes[0].planes.size() == 6, "a box's hull: volume %d, %zu faces", vi, vi == 0 ? cube->volumes[0].planes.size() : 0);
+        SoftBody* A = w->add_body(std::move(cube));
+        auto shot = std::make_unique<SoftBody>();
+        shot->name = "shot";
+        shot->add_node(vec3(-1.0f, 5.5f, 0.5f), 2.0f, NF_GROUND | NF_CONTACTER);
+        shot->finalize();
+        shot->nodes[0].v = vec3(5, 0, 0);
+        SoftBody* B = w->add_body(std::move(shot));
+        float deepest = -1e9f;
+        for (int f = 0; f < 36; f++) {
+            w->step_substeps(33);
+            deepest = std::max(deepest, B->nodes[0].p.x);
+        }
+        vec3 P(0);
+        for (const Node& n : A->nodes) P += n.v * n.mass;
+        P += B->nodes[0].v * B->nodes[0].mass;
+        CHECK(deepest < 0.15f, "a node thrown at a collision volume went in to x %.3f (its face at 0.1)", deepest);
+        CHECK(std::fabs(P.x - 10.0f) < 0.3f && std::fabs(P.y) < 0.3f && std::fabs(P.z) < 0.3f, "the momentum of the node and the cube: (%.2f %.2f %.2f), was (10 0 0)", P.x, P.y, P.z);
+        CHECK(A->volumes[0].hits > 0 && !A->volumes[0].broken, "the volume: %d contacts, %s", A->volumes[0].hits, A->volumes[0].broken ? "off" : "on");
+        printf("    a 2 kg node at 5 m/s into a box's volume: in to %.3f m past its face, momentum (%.2f %.2f %.2f), %d contacts\n", deepest - 0.1f, P.x, P.y, P.z,
+               A->volumes[0].hits);
+    }
+    // the body's own parts (the frame's components with triangles on mounts: a hood, a door) held off its volumes, the
+    // frame it rides on not: a plate on three soft mounts 10 cm over a wide box volume on a heavy frame, thrown down at
+    // 8 m/s - its first blow (the mounts alone let it 20 cm into the box)
+    for (int held = 1; held >= 0; held--) {
+        auto w = std::make_unique<World>();
+        w->settings.gravity = vec3(0);
+        auto body = std::make_unique<SoftBody>();
+        body->name = "parted";
+        body->can_sleep = false;
+        const uint16_t si = body->fem.add_section(tube);
+        const vec3 fp[4] = {vec3(-0.5f, 1, -0.5f), vec3(1.5f, 1, -0.5f), vec3(-0.5f, 1, 1.5f), vec3(0.5f, 0.2f, 0.5f)};
+        uint32_t f[4];
+        for (int i = 0; i < 4; i++) f[i] = body->add_node(fp[i], 50.0f, NF_CONTACTER);
+        for (int i = 0; i < 4; i++)
+            for (int j = i + 1; j < 4; j++) body->fem.add_element(f[i], f[j], si);
+        ShellMesher m(*body, NF_CONTACTER);
+        const uint16_t ss = body->fem.add_shell_section(make_shell_section("Steel", 0.002f));
+        const std::vector<uint32_t> q = m.grid(vec3(0.2f, 1.55f, 0.2f), vec3(0.3f, 0, 0), vec3(0, 0, 0.3f), 2, 2, ss, false);
+        m.finish();
+        fix_inv_mass(*body);
+        body->fem.add_mount(f[0], q[0], 0.0f, 1e3f, 0.0f);
+        body->fem.add_mount(f[1], q[2], 0.0f, 1e3f, 0.0f);
+        body->fem.add_mount(f[2], q[6], 0.0f, 1e3f, 0.0f);
+        body->fem.finalize(*body);
+        std::vector<vec3> hull;
+        for (int k = 0; k < 8; k++) hull.push_back(vec3(-0.4f + 1.8f * (float)(k & 1), 1.05f + 0.4f * (float)((k >> 1) & 1), -0.4f + 1.8f * (float)((k >> 2) & 1)));
+        body->add_volume("box", {f[0], f[1], f[2], f[3]}, hull, 0.2f);
+        const int inside = body->find_volume_parts();
+        const std::vector<uint32_t> parts = body->volumes[0].parts;
+        if (held) {
+            bool frame_in = false;
+            for (uint32_t i : parts) frame_in |= i < 4;
+            CHECK(inside == 0 && parts.size() == q.size() && !frame_in, "the volume's parts: %zu nodes (want the plate's %zu), %d inside, the frame's %s", parts.size(),
+                  q.size(), inside, frame_in ? "in" : "not in");
+        } else {
+            body->volumes[0].parts.clear();
+        }
+        vec3 P0(0);
+        for (uint32_t i : q) body->nodes[i].v = vec3(0, -8, 0);
+        for (const Node& n : body->nodes) P0 += n.v * n.mass;
+        SoftBody* b = w->add_body(std::move(body));
+        float low = 1e9f, vrel = 0; // (the deepest of the plate's nodes into it; the plate's speed to it at the end)
+        for (int k = 0; k < 120; k++) {
+            w->step_substeps(1);
+            int face;
+            vrel = 0;
+            for (uint32_t i : q) low = std::min(low, b->volumes[0].depth(b->nodes[i].p, face)), vrel += (b->nodes[i].v.y - b->volumes[0].v.y) / (float)q.size();
+        }
+        vec3 P(0);
+        for (const Node& n : b->nodes) P += n.v * n.mass;
+        if (held) {
+            CHECK(low > -0.03f && vrel > -0.5f && b->volumes[0].hits > 0 && b->fem.solve_failures == 0,
+                  "a part thrown at its body's volume went %.3f m into it, at %.2f m/s to it after 60 ms, %d contacts, %d failed solves", -low, vrel, b->volumes[0].hits,
+                  b->fem.solve_failures);
+            CHECK(length(P - P0) < 0.02f * length(P0), "the parted body's momentum (%.2f %.2f %.2f), was (%.2f %.2f %.2f)", P.x, P.y, P.z, P0.x, P0.y, P0.z);
+            printf("    a plate on mounts thrown at 8 m/s at its body's volume: %.3f m into it, %.2f m/s to it after 60 ms, %d contacts, momentum %.3f of it\n", -low, vrel,
+                   b->volumes[0].hits, P.y / P0.y);
+        } else {
+            CHECK(low < -0.1f, "the plate not held off went only %.3f m into it", -low);
+            printf("    ... not held off (its nodes out of the volume's parts): %.3f m into it\n", -low);
+        }
+    }
+}
+
 // ---- FEM frame benchmark (`test_physics fembench [steps]`): the frame's cost per substep against its members, for
 // three kinds of structure and one split into parts: a planar truss (a ladder with diagonals: little fill), a car-like
 // cage (square rings of four tubes, longitudinals, the faces' diagonals), a cubic lattice (the most fill), and the cage
@@ -2626,6 +2810,7 @@ int main(int argc, char** argv) {
     run("frame", test_frame);
     run("fem_tri", test_fem_tris);
     run("hull", test_hull);
+    run("volumes", test_volumes);
     if (do_bench) bench();
     printf("\n%d checks passed, %d failed\n", g_pass, g_fail);
     JobSystem::get().shutdown();
