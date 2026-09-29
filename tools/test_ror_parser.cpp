@@ -589,6 +589,30 @@ void test_editor_models() {
               "mounts read: %zu", d.mounts.size());
         printf("  mounts: ok\n");
     }
+    // the mounts' kinds (`..., kind[, parameter]`: c a clamp and its break moment, h a hinge and its second node, s a
+    // stop, r a strap and its length); the editor writes them back as it read them
+    {
+        const std::string text = "Mounted kinds\nglobals\n100, 0\nnodes\n0, 0, 0, 0\n1, 1, 0, 0\n2, 0, 1, 0\n3, 1, 1, 0\n4, 0.5, 1.5, 0\n"
+                                 "set_frame_section Steel, tube, 0.03, 0.002\nbeams\n0, 1, F\n2, 3, F\n3, 4, F\n"
+                                 "mounts\n1, 3, 5000, 0, 0, c, 250\n0, 2, 800, 0, 2, h, 4\n1, 4, 0, 1e5, 0, s\n0, 4, 20000, 0, 0, r, 1.6\n1, 2, 900\nend\n";
+        const std::string path = temp_file("bl_mount_kinds.truck", text);
+        Document d;
+        CHECK(parse_truck_file(path, d) && d.warnings.empty(), "mount kinds parse (%zu warnings)", d.warnings.size());
+        const bool read_ok = d.mounts.size() == 5 && d.mounts[0].kind == 'c' && d.mounts[0].param == 250 && d.mounts[1].kind == 'h' && d.mounts[1].b2 == 4 &&
+                             d.mounts[1].damp == 2 && d.mounts[2].kind == 's' && d.mounts[2].k == 1e5f && d.mounts[3].kind == 'r' && d.mounts[3].param == 1.6f &&
+                             d.mounts[4].kind == 'p';
+        CHECK(read_ok, "mount kinds read: %zu", d.mounts.size());
+        bl::edit::Model m;
+        std::vector<std::string> notes;
+        Document d2;
+        const bool back = bl::edit::import_document(d, m, notes) && parse_truck_file(temp_file("bl_mount_kinds2.truck", bl::edit::write_truck(m)), d2);
+        bool same = back && d2.mounts.size() == d.mounts.size();
+        for (size_t i = 0; same && i < d.mounts.size(); i++)
+            same = d2.mounts[i].kind == d.mounts[i].kind && d2.mounts[i].param == d.mounts[i].param && d2.mounts[i].b2 == d.mounts[i].b2 &&
+                   d2.mounts[i].brk == d.mounts[i].brk && d2.mounts[i].k == d.mounts[i].k;
+        CHECK(same, "mount kinds: the editor's round trip changed them");
+        printf("  mount kinds: ok\n");
+    }
     // FEM triangles: `fem_tris` with `set_fem_shell material, thickness[, r, g, b]` before its triangles (a triangle
     // before any: the default, 1 mm steel); the editor writes them back as it read them
     {
@@ -624,6 +648,63 @@ void test_editor_models() {
                   box2.fem_presets.size() == 2 && box2.fem_presets[1].material == "Chromoly" && box2.fem_presets[1].thickness == 0.004f,
               "FEM box: %zu of %zu triangles, %zu beams, %d of the thick shell", db.fem_tris.size(), box.tris.size(), db.beams.size(), ones);
         printf("  FEM triangles: ok\n");
+    }
+    // the presets as they were: beam presets' names and colours (two with the same numbers stay two, an unused one
+    // stays), shell materials' names with spaces, FEM shells' names and a paint colour (-1); they were rebuilt from
+    // the directives: named by their numbers, merged, the unused ones gone
+    {
+        bl::edit::Model m = bl::edit::make_box(2, 2, 2, vec3(1, 1, 1), 100);
+        bl::edit::BeamGroup g0 = m.groups[0];
+        m.groups.clear();
+        for (int i = 0; i < 3; i++) {
+            bl::edit::BeamGroup g = g0;
+            g.name = i == 0 ? "Main frame" : i == 1 ? "Side rails" : "Spare, unused";
+            g.color = vec4(0.1f * (i + 1), 0.5f, 1.0f - 0.2f * i, 1.0f);
+            m.groups.push_back(g);
+        }
+        for (size_t i = 0; i < m.beams.size(); i++) m.beams[i].group = (int)(i % 2); // (the first two: the same numbers)
+        bl::edit::ShellPreset sa, sb;
+        sa.name = "Window glass 4 mm", sa.material = "Glass", sa.color = vec3(0.2f, 0.4f, 0.6f);
+        sb.name = "Unused panel", sb.material = "Aluminium", sb.color = vec3(-1);
+        m.shell_presets = {sa, sb};
+        for (size_t i = 0; i < m.tris.size(); i++)
+            if (i < 4) m.tris[i].shell = true, m.tris[i].shell_preset = 1;
+        bl::edit::FemPreset fa, fb, fc;
+        fa.name = "Roof skin", fa.thickness = 0.0008f, fa.color = vec3(-1);
+        fb.name = "Floor, thick", fb.material = "Aluminium", fb.thickness = 0.002f, fb.color = vec3(0.3f, 0.3f, 0.35f);
+        fc.name = "Unused reinforcement", fc.thickness = 0.0025f;
+        m.fem_presets = {fa, fb, fc};
+        for (size_t i = 4; i < m.tris.size(); i++) m.tris[i].fem = true, m.tris[i].collision = false, m.tris[i].fem_preset = i % 2 ? 1 : 0;
+        const std::string text = bl::edit::write_truck(m);
+        Document d;
+        bl::edit::Model b;
+        std::vector<std::string> notes;
+        CHECK(parse_truck_file(temp_file("bl_presets.truck", text), d) && d.warnings.empty() && bl::edit::import_document(d, b, notes), "presets file: %zu warnings",
+              d.warnings.size());
+        bl::edit::read_markers(text, b);
+        bool beams_ok = b.groups.size() == 3 && b.beams.size() == m.beams.size();
+        for (size_t i = 0; beams_ok && i < 3; i++)
+            beams_ok = b.groups[i].name == m.groups[i].name && std::fabs(b.groups[i].color.x - m.groups[i].color.x) + std::fabs(b.groups[i].color.y - m.groups[i].color.y) + std::fabs(b.groups[i].color.z - m.groups[i].color.z) + std::fabs(b.groups[i].color.w - m.groups[i].color.w) < 1e-3f && b.groups[i].spring == m.groups[i].spring;
+        for (size_t i = 0; beams_ok && i < b.beams.size(); i++) beams_ok = b.beams[i].group == m.beams[i].group;
+        CHECK(beams_ok, "beam presets: %zu read back (%s, %s)", b.groups.size(), b.groups.empty() ? "?" : b.groups[0].name.c_str(),
+              b.groups.size() > 1 ? b.groups[1].name.c_str() : "?");
+        bool shells_ok = b.shell_presets.size() == 2 && b.shell_presets[0].name == sa.name && b.shell_presets[1].name == sb.name &&
+                         length(b.shell_presets[0].color - sa.color) < 1e-3f && b.shell_presets[1].color.x < 0 && b.shell_presets[0].material == "Glass";
+        int shelled = 0;
+        for (const auto& t : b.tris) shelled += t.shell && t.shell_preset == 1;
+        CHECK(shells_ok && shelled == 4, "shell materials: %zu (%s), %d triangles of the first", b.shell_presets.size(),
+              b.shell_presets.empty() ? "?" : b.shell_presets[0].name.c_str(), shelled);
+        bool fem_ok = b.fem_presets.size() == 3;
+        for (size_t i = 0; fem_ok && i < 3; i++)
+            fem_ok = b.fem_presets[i].name == m.fem_presets[i].name && b.fem_presets[i].material == m.fem_presets[i].material &&
+                     std::fabs(b.fem_presets[i].thickness - m.fem_presets[i].thickness) < 1e-6f && length(b.fem_presets[i].color - m.fem_presets[i].color) < 1e-3f;
+        int ones = 0, fems = 0;
+        for (const auto& t : b.tris) fems += t.fem, ones += t.fem && t.fem_preset == 1;
+        int want = 0;
+        for (size_t i = 4; i < m.tris.size(); i++) want += i % 2;
+        CHECK(fem_ok && fems == (int)m.tris.size() - 4 && ones == want, "FEM shells: %zu (%s), %d of %d triangles, %d of the second (%d)", b.fem_presets.size(),
+              b.fem_presets.empty() ? "?" : b.fem_presets[0].name.c_str(), fems, (int)m.tris.size() - 4, ones, want);
+        printf("  presets' names and colours: ok\n");
     }
     // the cockpit camera (cinecam) only when asked for, and only in a file to drive: the editor's preview and physics
     // test get no node and beams of it (a shell-only shape would have had its eight beams along its edges); an older

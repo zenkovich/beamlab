@@ -273,6 +273,23 @@ void ModelEditor::draw(Renderer& r, int view) {
         seg(Elem::Joint, i, j.parent, j.child, c, j.layer, 1.4f);
         square(r, vf, P(j.parent), c, 5);
     }
+    // the sheet's welds (a short tick from the frame node), the parts' mounts (a line with a square at the part's node)
+    // and the slide nodes (a line to the middle of their rail): not editable here, shown so the parts' ties are seen
+    if (!skel_off) {
+        const uint32_t cw = dim(Renderer::rgba(1.0f, 0.85f, 0.25f, 0.9f), skel), cm = dim(Renderer::rgba(1.0f, 0.45f, 0.15f, 1), skel),
+                       cs = dim(Renderer::rgba(0.3f, 1.0f, 0.6f, 1), skel);
+        auto shown = [&](int n) { return n >= 0 && n < (int)M.nodes.size() && node_shown(n); };
+        for (const edit::Weld& w : M.welds)
+            if (shown(w.anchor) && shown(w.node)) r.thick_line(P(w.anchor), P(w.node), cw, bw * 0.8f);
+        for (const edit::Mount& mt : M.mounts)
+            if (shown(mt.a) && shown(mt.b)) r.thick_line(P(mt.a), P(mt.b), cm, bw * 1.2f), square(r, vf, P(mt.b), cm, 5);
+        for (const edit::SlideNode& sn : M.slidenodes) {
+            if (!shown(sn.node)) continue;
+            vec3 mid(0);
+            for (int n : sn.rail) mid += P(n) * (1.0f / (float)sn.rail.size());
+            r.thick_line(P(sn.node), mid, cs, bw), square(r, vf, P(sn.node), cs, 5);
+        }
+    }
     for (int i = 0; i < (int)M.wheels.size(); i++) {
         if (!elem_shown(Elem::Wheel, i)) continue;
         const edit::Wheel& w = M.wheels[i];

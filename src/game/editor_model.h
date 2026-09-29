@@ -82,6 +82,7 @@ struct Node {
     bool no_ground = false;         // 'c': no ground contact
     bool contacter = true;          // collides with other bodies
     bool fixed = false;             // fixes: nailed to the world
+    float minimass = -1.0f;         // its own least mass (set_default_minimass), -1: the model's minimass
     int layer = 0, group = -1;
 };
 
@@ -126,6 +127,32 @@ struct Tri {                        // cab triangle: a collision surface, or a t
     int fem_preset = 0;             // makes its own collision surface), neither `collision` nor `shell`
     std::string options;            // the cab options of an imported triangle (collision letters follow `collision`)
     bool hull() const { return !shell && options.find('h') != std::string::npos; }
+};
+
+// (BeamLab) a sheet's node welded to a frame node (the truck's `welds`, phys::SoftBody::Weld): the pull spread over the
+// sheet's nodes round it within the radius; anchor2 >= 0: held at the point t of the way from anchor to anchor2
+struct Weld {
+    int anchor = 0, node = 0;
+    float radius = 0.2f, brk = 0, k = 0;
+    int anchor2 = -1;
+    float t = 0;
+};
+
+// (BeamLab) a part's frame node b held at a distance on node a's frame (the truck's `mounts`, phys::FrameMount): a
+// bolt, a hinge; it lets go past its break force
+struct Mount {
+    int a = 0, b = 0;
+    float brk = 0, k = 0, damp = 0;
+    char kind = 'p';                // p point, c clamp, h hinge, s stop, r strap (see ror::Document::MountDef)
+    float param = 0;                // a clamp's break moment, a strap's length
+    int b2 = -1;                    // a hinge's second node
+};
+
+// a node that slides along a rail of nodes (the truck's `slidenodes`: a steering rack's ends in its housing)
+struct SlideNode {
+    int node = 0;
+    std::vector<int> rail;
+    float spring = -1, brk = -1, tolerance = -1, attach_rate = -1, attach_dist = -1;
 };
 
 struct Joint {                      // a beam with orientation: the child node is held at its rest offset in the
@@ -239,6 +266,9 @@ struct Model {
     std::vector<Tri> tris;
     std::vector<Wheel> wheels;
     std::vector<Joint> joints;
+    std::vector<Weld> welds;
+    std::vector<Mount> mounts;
+    std::vector<SlideNode> slidenodes;
     std::vector<Flexbody> flexbodies;
     std::vector<Prop> props;
     std::vector<Submesh> submeshes;

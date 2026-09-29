@@ -119,6 +119,33 @@ void remap_elements(Model& m, const std::vector<int>& map) {
             joints.push_back(j);
         }
     m.joints.swap(joints);
+    std::vector<Weld> welds;
+    for (Weld w : m.welds)
+        if (ok(w.anchor) && ok(w.node)) {
+            w.anchor = map[w.anchor], w.node = map[w.node];
+            w.anchor2 = ok(w.anchor2) ? map[w.anchor2] : -1;
+            welds.push_back(w);
+        }
+    m.welds.swap(welds);
+    std::vector<Mount> mounts;
+    for (Mount mt : m.mounts)
+        if (ok(mt.a) && ok(mt.b) && (mt.kind != 'h' || ok(mt.b2))) {
+            mt.a = map[mt.a], mt.b = map[mt.b];
+            if (mt.kind == 'h') mt.b2 = map[mt.b2];
+            mounts.push_back(mt);
+        }
+    m.mounts.swap(mounts);
+    std::vector<SlideNode> slides;
+    for (SlideNode sn : m.slidenodes) {
+        if (!ok(sn.node)) continue;
+        std::vector<int> rail;
+        for (int r : sn.rail)
+            if (ok(r)) rail.push_back(map[r]);
+        if (rail.size() < 2) continue;
+        sn.node = map[sn.node], sn.rail.swap(rail);
+        slides.push_back(sn);
+    }
+    m.slidenodes.swap(slides);
     std::vector<Flexbody> fbs;
     for (Flexbody f : m.flexbodies)
         if (gmap(f.ref) >= 0 && gmap(f.x) >= 0 && gmap(f.y) >= 0) {
@@ -179,6 +206,9 @@ int Model::node_uses(int n) const {
     for (const Tri& t : tris) c += (t.a == n || t.b == n || t.c == n);
     for (const Wheel& w : wheels) c += (w.n1 == n || w.n2 == n || w.arm == n);
     for (const Joint& j : joints) c += (j.parent == n || j.child == n);
+    for (const Weld& w : welds) c += (w.anchor == n || w.node == n || w.anchor2 == n);
+    for (const Mount& mt : mounts) c += (mt.a == n || mt.b == n || (mt.kind == 'h' && mt.b2 == n));
+    for (const SlideNode& sn : slidenodes) c += sn.node == n || std::find(sn.rail.begin(), sn.rail.end(), n) != sn.rail.end();
     for (const Flexbody& f : flexbodies) c += (f.ref == n || f.x == n || f.y == n);
     for (const Prop& p : props) c += (p.ref == n || p.x == n || p.y == n);
     return c;
@@ -294,6 +324,8 @@ int Model::merge_nodes(const std::vector<std::vector<int>>& groups, const std::v
     shocks.erase(std::remove_if(shocks.begin(), shocks.end(), [](const Shock& x) { return x.a == x.b; }), shocks.end());
     hydros.erase(std::remove_if(hydros.begin(), hydros.end(), [](const Hydro& x) { return x.a == x.b; }), hydros.end());
     joints.erase(std::remove_if(joints.begin(), joints.end(), [](const Joint& x) { return x.parent == x.child; }), joints.end());
+    welds.erase(std::remove_if(welds.begin(), welds.end(), [](const Weld& x) { return x.anchor == x.node; }), welds.end());
+    mounts.erase(std::remove_if(mounts.begin(), mounts.end(), [](const Mount& x) { return x.a == x.b; }), mounts.end());
     std::set<std::array<int, 3>> tseen;
     std::vector<Tri> ts;
     for (const Tri& t : tris) {
@@ -989,6 +1021,25 @@ std::string write_truck(const Model& m, bool preview) {
         for (const Group& g : m.node_groups) o += " " + g.name + "|" + (g.visible ? "1" : "0");
         o += "\n";
     }
+    // the presets whole (names, colours, the unused ones): the game reads the sections' directives, the editor these;
+    // before each run of elements the preset's index (`;editor-preset:`, `;editor-shell:`, `;editor-fem:`)
+    auto clean = [](std::string s) {
+        for (char& c : s)
+            if (c == '|' || c == '\n' || c == '\r') c = '/';
+        return s;
+    };
+    for (const BeamGroup& g : m.groups)
+        o += ";editor-beam-preset: " + clean(g.name) + "|" + fmt("%.3f", g.color.x) + " " + fmt("%.3f", g.color.y) + " " + fmt("%.3f", g.color.z) + " " +
+             fmt("%.3f", g.color.w) + "|" + num(g.spring) + " " + num(g.damp) + " " + num(g.deform) + " " + num(g.brk) + " " + num(g.plastic) + "|" + fmt("%d", g.type) +
+             " " + (g.invisible ? "1" : "0") + " " + (g.hold_rotation ? "1" : "0") + " " + num(g.joint_k) + "|" + clean(g.frame_material) + " " + fmt("%d", g.frame_shape) +
+             " " + num(g.frame_outer) + " " + num(g.frame_wall) + " " + fmt("%d", g.frame_end_a) + " " + fmt("%d", g.frame_end_b) + " " + num(g.frame_joint_k) + " " +
+             num(g.frame_break) + " " + num(g.frame_joint_damp) + "\n";
+    for (const ShellPreset& sp : m.shell_presets)
+        o += ";editor-shell-preset: " + clean(sp.name) + "|" + clean(sp.material) + "|" + num(sp.kg_m2) + " " + num(sp.thickness) + " " + fmt("%.3f", sp.color.x) + " " +
+             fmt("%.3f", sp.color.y) + " " + fmt("%.3f", sp.color.z) + " " + fmt("%d", sp.max_level) + "\n";
+    for (const FemPreset& fp : m.fem_presets)
+        o += ";editor-fem-preset: " + clean(fp.name) + "|" + clean(fp.material) + "|" + num(fp.thickness) + " " + fmt("%.3f", fp.color.x) + " " + fmt("%.3f", fp.color.y) +
+             " " + fmt("%.3f", fp.color.z) + "\n";
     if (!m.ref_path.empty())
         o += ";editor-ref: " + m.ref_path + "|" + fmt("%.4f", m.ref_offset.x) + "|" + fmt("%.4f", m.ref_offset.y) + "|" + fmt("%.4f", m.ref_offset.z) + "|" + fmt("%.4f", m.ref_scale) + "|" +
              fmt("%.2f", m.ref_yaw) + "|" + fmt("%.2f", m.ref_alpha) + "|" + (m.ref_mockup ? "1" : "0") + "\n";
@@ -1018,9 +1069,11 @@ std::string write_truck(const Model& m, bool preview) {
     }
     o += "nodes\n;id, x, y, z, options[, load]\n";
     section();
+    float cur_minimass = -1.0f;
     for (int i = 0; i < (int)m.nodes.size(); i++) {
         const Node& n = m.nodes[i];
         mark(n.layer, n.group);
+        if (n.minimass != cur_minimass) o += "set_default_minimass " + num(n.minimass) + "\n", cur_minimass = n.minimass;
         std::string opt;
         if (n.load_bearing || n.load >= 0) opt += 'l';
         if (n.no_ground) opt += 'c';
@@ -1038,7 +1091,7 @@ std::string write_truck(const Model& m, bool preview) {
             if (b.group != cur) {
                 cur = b.group;
                 const BeamGroup& g = m.groups[std::clamp(cur, 0, (int)m.groups.size() - 1)];
-                o += ";" + g.name + "\nset_beam_defaults " + num(g.spring) + ", " + num(g.damp) + ", " + num(g.deform) + ", " + num(g.brk) + ", 0.05, tracks/beam, " +
+                o += ";editor-preset: " + fmt("%d", std::clamp(cur, 0, (int)m.groups.size() - 1)) + " " + clean(g.name) + "\nset_beam_defaults " + num(g.spring) + ", " + num(g.damp) + ", " + num(g.deform) + ", " + num(g.brk) + ", 0.05, tracks/beam, " +
                      num(g.plastic) + "\n";
                 if (g.is_frame()) {
                     const std::string ja = phys::frame_joint_name((phys::FrameJoint)g.frame_end_a), jb = phys::frame_joint_name((phys::FrameJoint)g.frame_end_b);
@@ -1304,6 +1357,8 @@ std::string write_truck(const Model& m, bool preview) {
                     std::string name = sp.name.empty() ? "material" + std::to_string(k) : sp.name;
                     for (char& c : name)
                         if (c == ' ' || c == ',' || c == '\t' || c == ';' || c == ':' || c == '|') c = '_';
+                    name += "_" + std::to_string(k); // (unique: the parser takes a name again as the same material)
+                    o += ";editor-shell: " + fmt("%d", k) + "\n";
                     o += "set_shell_material " + name + ", " + sp.material + ", " + num(sp.kg_m2) + ", " + num(sp.thickness) + ", " + fmt("%.3f", sp.color.x) + ", " +
                          fmt("%.3f", sp.color.y) + ", " + fmt("%.3f", sp.color.z) + ", " + fmt("%d", sp.max_level) + "\n";
                 }
@@ -1322,11 +1377,43 @@ std::string write_truck(const Model& m, bool preview) {
                 for (const Tri& t : m.tris) any |= t.fem && (std::clamp(t.fem_preset, 0, np - 1) == k);
                 if (!any) continue;
                 const FemPreset fp = m.fem_preset(k);
+                o += ";editor-fem: " + fmt("%d", k) + "\n";
                 o += "set_fem_shell " + fp.material + ", " + num(fp.thickness) + ", " + fmt("%.3f", fp.color.x) + ", " + fmt("%.3f", fp.color.y) + ", " + fmt("%.3f", fp.color.z) +
                      "\n";
                 for (const Tri& t : m.tris)
                     if (t.fem && std::clamp(t.fem_preset, 0, np - 1) == k) o += (mark(t.layer, -1), fmt("%d", t.a)) + ", " + fmt("%d", t.b) + ", " + fmt("%d", t.c) + "\n";
             }
+        }
+    }
+    if (!m.welds.empty()) {
+        o += "welds\n;(BeamLab) anchor, sheet node, radius m, break force N, stiffness N/m[, anchor2, t]\n";
+        section();
+        for (const Weld& w : m.welds)
+            o += fmt("%d", w.anchor) + ", " + fmt("%d", w.node) + ", " + num(w.radius) + ", " + num(w.brk) + ", " + num(w.k) +
+                 (w.anchor2 >= 0 ? ", " + fmt("%d", w.anchor2) + ", " + num(w.t) : std::string()) + "\n";
+    }
+    if (!m.mounts.empty()) {
+        o += "mounts\n;(BeamLab) node a, node b, break force N, stiffness N/m, turning damping N m s/rad[, kind (p c h s r), its parameter]\n";
+        section();
+        for (const Mount& mt : m.mounts) {
+            o += fmt("%d", mt.a) + ", " + fmt("%d", mt.b) + ", " + num(mt.brk) + ", " + num(mt.k) + ", " + num(mt.damp);
+            if (mt.kind == 'h') o += ", h, " + fmt("%d", mt.b2);
+            else if (mt.kind == 'c' || mt.kind == 'r') o += fmt(", %c, ", mt.kind) + num(mt.param);
+            else if (mt.kind == 's') o += ", s";
+            o += "\n";
+        }
+    }
+    if (!m.slidenodes.empty()) {
+        o += "slidenodes\n;node, rail nodes..., S spring, B break, T tolerance, R attach rate, D attach distance\n";
+        section();
+        for (const SlideNode& sn : m.slidenodes) {
+            o += fmt("%d", sn.node);
+            for (int r : sn.rail) o += ", " + fmt("%d", r);
+            auto opt = [&](char c, float v) {
+                if (v >= 0) o += std::string(", ") + c + num(v);
+            };
+            opt('S', sn.spring), opt('B', sn.brk), opt('T', sn.tolerance), opt('R', sn.attach_rate), opt('D', sn.attach_dist);
+            o += "\n";
         }
     }
     o += "end\n";
@@ -1381,6 +1468,7 @@ bool import_document(const ror::Document& d, Model& m, std::vector<std::string>&
         n.load_bearing = has_opt(nd.options, 'l');
         n.no_ground = has_opt(nd.options, 'c');
         n.load = nd.load_weight;
+        n.minimass = nd.minimass;
         n.contacter = false;
         map[i] = (int)m.nodes.size();
         m.nodes.push_back(n);
@@ -1572,6 +1660,39 @@ bool import_document(const ror::Document& d, Model& m, std::vector<std::string>&
         t.fem = true, t.collision = false, t.shell = false, t.fem_preset = ft.shell;
         m.tris.push_back(t);
     }
+    // the sheet's welds to the frame, the parts' mounts, the slide nodes
+    for (const auto& w : d.welds) {
+        if (!ok(w.anchor) || !ok(w.node)) {
+            dropped++;
+            continue;
+        }
+        Weld x;
+        x.anchor = map[w.anchor], x.node = map[w.node], x.radius = w.radius, x.brk = w.brk, x.k = w.k;
+        x.anchor2 = ok(w.anchor2) ? map[w.anchor2] : -1, x.t = w.t;
+        m.welds.push_back(x);
+    }
+    for (const auto& mt : d.mounts) {
+        if (!ok(mt.a) || !ok(mt.b) || (mt.kind == 'h' && !ok(mt.b2))) {
+            dropped++;
+            continue;
+        }
+        Mount x;
+        x.a = map[mt.a], x.b = map[mt.b], x.brk = mt.brk, x.k = mt.k, x.damp = mt.damp;
+        x.kind = mt.kind, x.param = mt.param, x.b2 = mt.kind == 'h' ? map[mt.b2] : -1;
+        m.mounts.push_back(x);
+    }
+    for (const auto& sn : d.slidenodes) {
+        SlideNode x;
+        x.node = ok(sn.node) ? map[sn.node] : -1;
+        for (int r : sn.rail)
+            if (ok(r)) x.rail.push_back(map[r]);
+        if (x.node < 0 || x.rail.size() < 2) {
+            dropped++;
+            continue;
+        }
+        x.spring = sn.spring, x.brk = sn.break_force, x.tolerance = sn.tolerance, x.attach_rate = sn.attach_rate, x.attach_dist = sn.attach_dist;
+        m.slidenodes.push_back(x);
+    }
     for (const auto& sm : d.shell_materials) {
         ShellPreset p;
         p.name = sm.name, p.material = sm.material, p.kg_m2 = sm.kg_m2, p.thickness = sm.thickness, p.color = sm.color, p.max_level = sm.max_level;
@@ -1685,6 +1806,19 @@ void read_markers(const std::string& text, Model& m) {
     std::string section;
     int layer = 0, group = -1;
     int counts[9] = {}; // nodes, beams, shocks, hydros, wheels, cab, joints, flexbodies, props (across repeated sections)
+    // the presets whole (write_truck), each beam's preset, the parser's shell materials and FEM shells in the order of
+    // their directives -> the editor's preset
+    std::vector<BeamGroup> beam_presets;
+    std::vector<ShellPreset> shell_presets;
+    std::vector<FemPreset> fem_presets;
+    std::vector<int> beam_preset, shell_map{0}, fem_map;
+    int cur_preset = -1, next_shell = -1, next_fem = -1;
+    auto nums = [&](const std::string& s) {
+        std::vector<float> v;
+        for (const std::string& t : split(s, ' '))
+            if (!t.empty()) v.push_back((float)atof(t.c_str()));
+        return v;
+    };
     int submesh_count = 0, own_submesh = -1;
     bool own_next = false, hidden_next = false;
     std::vector<Flexbody> off_flex;
@@ -1747,6 +1881,48 @@ void read_markers(const std::string& text, Model& m) {
                 if (f.size() > 5) m.ref_yaw = (float)atof(f[5].c_str());
                 if (f.size() > 6) m.ref_alpha = (float)atof(f[6].c_str());
                 if (f.size() > 7) m.ref_mockup = f[7] != "0";
+            } else if (line.rfind(";editor-beam-preset:", 0) == 0) {
+                const std::vector<std::string> f = split(line.substr(line.find(':') + 2), '|');
+                if (f.size() >= 5) {
+                    BeamGroup g;
+                    g.name = f[0];
+                    const std::vector<float> c = nums(f[1]), sp = nums(f[2]), ty = nums(f[3]);
+                    if (c.size() >= 4) g.color = vec4(c[0], c[1], c[2], c[3]);
+                    if (sp.size() >= 5) g.spring = sp[0], g.damp = sp[1], g.deform = sp[2], g.brk = sp[3], g.plastic = sp[4];
+                    if (ty.size() >= 4) g.type = (int)ty[0], g.invisible = ty[1] != 0, g.hold_rotation = ty[2] != 0, g.joint_k = ty[3];
+                    const std::vector<std::string> fr = split(f[4], ' ');
+                    if (fr.size() >= 9) {
+                        g.frame_material = fr[0], g.frame_shape = atoi(fr[1].c_str());
+                        g.frame_outer = (float)atof(fr[2].c_str()), g.frame_wall = (float)atof(fr[3].c_str());
+                        g.frame_end_a = atoi(fr[4].c_str()), g.frame_end_b = atoi(fr[5].c_str()), g.frame_joint_k = (float)atof(fr[6].c_str());
+                        g.frame_break = (float)atof(fr[7].c_str()), g.frame_joint_damp = (float)atof(fr[8].c_str());
+                    }
+                    beam_presets.push_back(g);
+                }
+            } else if (line.rfind(";editor-shell-preset:", 0) == 0) {
+                const std::vector<std::string> f = split(line.substr(line.find(':') + 2), '|');
+                if (f.size() >= 3) {
+                    ShellPreset p;
+                    p.name = f[0], p.material = f[1];
+                    const std::vector<float> v = nums(f[2]);
+                    if (v.size() >= 6) p.kg_m2 = v[0], p.thickness = v[1], p.color = vec3(v[2], v[3], v[4]), p.max_level = (int)v[5];
+                    shell_presets.push_back(p);
+                }
+            } else if (line.rfind(";editor-fem-preset:", 0) == 0) {
+                const std::vector<std::string> f = split(line.substr(line.find(':') + 2), '|');
+                if (f.size() >= 3) {
+                    FemPreset p;
+                    p.name = f[0], p.material = f[1];
+                    const std::vector<float> v = nums(f[2]);
+                    if (v.size() >= 4) p.thickness = v[0], p.color = vec3(v[1], v[2], v[3]);
+                    fem_presets.push_back(p);
+                }
+            } else if (line.rfind(";editor-preset:", 0) == 0) {
+                cur_preset = atoi(line.c_str() + 15);
+            } else if (line.rfind(";editor-shell:", 0) == 0) {
+                next_shell = atoi(line.c_str() + 14);
+            } else if (line.rfind(";editor-fem:", 0) == 0) {
+                next_fem = atoi(line.c_str() + 12);
             } else if (line.rfind(";editor-own-submesh", 0) == 0) {
                 own_next = true;
             } else if (line == ";editor-hidden") {
@@ -1801,6 +1977,8 @@ void read_markers(const std::string& text, Model& m) {
             }
             continue;
         }
+        if (line.rfind("set_shell_material", 0) == 0) shell_map.push_back(next_shell), next_shell = -1; // (the parser's material k + 1)
+        if (line.rfind("set_fem_shell", 0) == 0) fem_map.push_back(next_fem), next_fem = -1;        // (its FEM shell k)
         if (line.rfind("set_", 0) == 0 || line.rfind("forset", 0) == 0 || line == "end") continue;
         if (section == "nodes" || section == "nodes2") {
             const int i = counts[0]++;
@@ -1808,6 +1986,8 @@ void read_markers(const std::string& text, Model& m) {
         } else if (section == "beams") {
             const int i = counts[1]++;
             if (i < (int)m.beams.size()) m.beams[i].layer = layer;
+            if (i >= (int)beam_preset.size()) beam_preset.resize(i + 1, -1);
+            beam_preset[i] = cur_preset;
         } else if (section == "shocks" || section == "shocks2" || section == "shocks3") {
             const int i = counts[2]++;
             if (i < (int)m.shocks.size()) m.shocks[i].layer = layer;
@@ -1835,6 +2015,39 @@ void read_markers(const std::string& text, Model& m) {
     }
     for (const Flexbody& f : off_flex) m.flexbodies.push_back(f);
     for (const Prop& p : off_props) m.props.push_back(p);
+    // the editor's presets as they were (the import made them from the directives: merged where the numbers are the
+    // same, named by their numbers, the unused ones gone)
+    if (!beam_presets.empty()) {
+        std::vector<int> was(m.beams.size());
+        for (size_t i = 0; i < m.beams.size(); i++) was[i] = m.beams[i].group;
+        for (size_t i = 0; i < m.beams.size(); i++) {
+            const int p = i < beam_preset.size() ? beam_preset[i] : -1;
+            if (p >= 0 && p < (int)beam_presets.size()) m.beams[i].group = p;
+            else { // (no marker: the imported preset, added after the editor's)
+                beam_presets.push_back(m.groups[std::clamp(was[i], 0, (int)m.groups.size() - 1)]);
+                const int g = (int)beam_presets.size() - 1;
+                for (size_t j = i; j < m.beams.size(); j++)
+                    if (was[j] == was[i] && (j >= beam_preset.size() || beam_preset[j] < 0)) m.beams[j].group = g, was[j] = -2;
+            }
+        }
+        m.groups = beam_presets;
+    }
+    if (!shell_presets.empty()) {
+        for (Tri& t : m.tris)
+            if (t.shell && t.shell_preset > 0) {
+                const int k = t.shell_preset < (int)shell_map.size() ? shell_map[t.shell_preset] : -1;
+                t.shell_preset = k >= 1 && k <= (int)shell_presets.size() ? k : 0;
+            }
+        m.shell_presets = shell_presets;
+    }
+    if (!fem_presets.empty()) {
+        for (Tri& t : m.tris)
+            if (t.fem) {
+                const int k = t.fem_preset >= 0 && t.fem_preset < (int)fem_map.size() ? fem_map[t.fem_preset] : -1;
+                t.fem_preset = k >= 0 && k < (int)fem_presets.size() ? k : 0;
+            }
+        m.fem_presets = fem_presets;
+    }
     // the editor's own submesh (planar texture coordinates made at every save) is the editor's again
     if (own_submesh >= 0 && own_submesh < (int)m.submeshes.size()) {
         for (Tri& t : m.tris) {

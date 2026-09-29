@@ -1438,6 +1438,8 @@ void ModelEditor::ui_properties() {
                                  (M.fem_count() ? "  (" + std::to_string(M.fem_count()) + " FEM)" : std::string()));
             row("Wheels", std::to_string(M.wheels.size()));
             row("Shocks, rods, joints", std::to_string(M.shocks.size()) + ", " + std::to_string(M.hydros.size()) + ", " + std::to_string(M.joints.size()));
+            if (!M.welds.empty() || !M.mounts.empty() || !M.slidenodes.empty())
+                row("Welds, mounts, slides", std::to_string(M.welds.size()) + ", " + std::to_string(M.mounts.size()) + ", " + std::to_string(M.slidenodes.size()));
             row("Meshes", std::to_string(M.flexbodies.size() + M.props.size()));
             row("Folder", M.home);
             props_end();
