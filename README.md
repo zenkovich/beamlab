@@ -128,7 +128,7 @@ the triangles it evaluated.
 | Tab | control the next vehicle of the scene |
 | right mouse drag, wheel | look around, zoom |
 | G / X / B / L | tool: **grab** (drag a node) / **destroy** (hold LMB: breaks beams, joints and surfaces under the cursor) / **shoot** (LMB, hold for auto-fire) / **laser** (hold LMB and sweep: cuts along the cursor's path, no blast) |
-| Z, `,` / `.`, Delete | projectile type (steel ball, rubber ball, crate, cannonball, plank), speed 5 .. 150 m/s, remove projectiles |
+| Z, `,` / `.`, Delete | projectile type (steel ball, rubber ball, crate, cannonball, plank; the balls one collision sphere each - a node and a capsule of no length, `build_ball`, bouncing by `SoftBody::bounce` - no beams), speed 5 .. 150 m/s, remove projectiles |
 | `[` / `]` (keypad - / +) | slower / faster time: 0.01x, 0.02x, 0.05x, 0.1x, 0.25x, 0.5x, 1x, 2x |
 | T / Backspace | slow motion 0.2x on-off / back to 1x |
 | P / N | pause / single step |
@@ -156,7 +156,7 @@ Everything is ImGui. The menu bar at the top of the screen holds:
     (`WorldSettings`).
   - **Scene**: drop crates, jelly balls, metal blocks, planks; add AI vehicles; launch the vehicle at a wall; send a heavy truck over the bridge;
     in the *Vehicle vs Vehicle* scene: the crash setup (vehicle A and B, their speeds, layout, slow motion).
-  - **Tools**: grab / destroy / shoot / laser, grab strength (0.05x - 20x), destroy radius and blast, projectile type, speed and fire rate, laser range.
+  - **Tools**: grab / destroy / shoot / laser, grab strength (0.05x - 50x) and radius (a sphere round the picked node: every body's nodes in it pulled together, keeping their places, the pull falling off to its edge; drawn under the cursor and while pulling; 0: one node), destroy radius and blast, projectile type, speed and fire rate, laser range.
 
 - **Editor**: the model editor (Ctrl+E), below.
 
@@ -309,7 +309,7 @@ absorbers, steering rods (hydros), orientation joints, cab triangles (collision 
   drawn on a sheet body; see Inter-body collisions. View > Collision geometry draws them amber with a tick along the
   outward normal (torn ones are no longer drawn).
 - **Tests**: **Physics test** (Ctrl+P) simulates the model where it stands without gravity (G toggles it, Space
-  pauses, R restarts): use the game's tools in any view (1 - 4: grab a node, destroy by sweeping, shoot projectiles, cut with the laser; their radius, projectile, speed, rate, range in the left panel; the grab's strength 0.05x - 20x with 0.2x / 1x / 5x buttons, or the mouse wheel while pulling); the speed of the simulation from 0.01x to 2x (the slider, - and =, Backspace: real time; paused, Step or N moves on by 10 ms), kept from one test to the next, the game's own speed back afterwards and watch it flex, the beams drawn through the
+  pauses, R restarts): use the game's tools in any view (1 - 4: grab a node, destroy by sweeping, shoot projectiles, cut with the laser; their radius, projectile, speed, rate, range in the left panel; the grab's strength 0.05x - 50x with 0.2x / 1x / 5x buttons, or the mouse wheel while pulling, and its radius); the speed of the simulation from 0.01x to 2x (the slider, - and =, Backspace: real time; paused, Step or N moves on by 10 ms), kept from one test to the next, the game's own speed back afterwards and watch it flex, the beams drawn through the
   see-through meshes (without the joints' frame axes, which looked like stray beams), frame elements in steel blue
   (orange once bent for good) with the frame's peak load against its yield; Esc comes back to editing. **Test drive** (Ctrl+T) saves the model and drives it on the stage;
   Esc comes back.
@@ -329,7 +329,8 @@ absorbers, steering rods (hydros), orientation joints, cab triangles (collision 
   and its break moment N m, h a hinge and the part's second node on its line, s a stop, r a strap and its length as
   a factor of the rest distance), `fem_tris` (n1, n2,
   n3: triangle elements of the FEM frame, of the last `set_fem_shell material, thickness m[, r, g, b]` before them - a
-  triangle before any is 1 mm steel; the colour paints the vehicle's plates); the beam defaults a
+  triangle before any is 1 mm steel; the colour paints the vehicle's plates), `collision_volumes` (`volume name[, break
+  rms m]`, its `anchors n1, n2, ...` and its hull's `vertex x, y, z` lines: see Collision volumes); the beam defaults a
   vehicle's shocks, hydros and wheels were defined under (set_beam_defaults_scale applied where the builder applies it),
   its node friction on the wheels and `enable_advanced_deformation` are kept; so are `welds` (the sheet panels on their
   frame), `mounts` (the bolted parts), `slidenodes` (a steering rack's ends) and the nodes' `set_default_minimass`,
@@ -389,7 +390,7 @@ mechanisms, and driven fast round a rough field the hubs folded, the wheels to 6
 spinning), the pickups and towers of heavier tube; anti-roll bars of spring-steel tube (a torsion tube in two bearings - a member along its axis, a swivel at the bar's end - levers and drop links to the arms; soft springs alone rolled it over at 0.8 g); the rear wheels' torque reacted on the frame over the axle (from the shock's top, 31 degrees off the vertical, the reaction's pair of forces pushed the wheel down and lifted the car 0.1-0.3 m on the throttle). V8 850 N m, four speeds, rear-wheel drive: 0-100 km/h in about 7 s (on asphalt the tyres hold it to ~0.45 g). The Frame Car's test pad with a gravel lane: ten 0.5 m whoops every 8 m and a tabletop jump (a 2.2 m kicker curving up to 12 degrees, a 16 m table, a 20 m landing); the Scene menu has the Frame Car's tests and the whoops at 80 km/h and the jump at 90 |
 | Buggy: Head-on / Side impact / Wall / Drop 10 m / Slab / Barrel roll / Whoops / Jump | the Buggy's tests as scenes of their own (the Frame Car's tests' scenes alike) |
 | FEM Shells | triangle elements of the FEM frame (see Frame elements): a 2 x 2 m sheet of 3 mm steel (16 x 16 cells) on two supports, a 1.5 x 0.5 m cantilever of 8 mm steel clamped in a block, a hollow 1 m cube of 2 mm steel (5 x 5 cells a face). Scene menu: a 40 kg steel ball on the sheet from 3 or 10 m, a 500 kg block on it from 1 m (it folds to the ground), 100 kg welded under the cantilever's tip (a box of lead: it springs) or 250 kg (past its plastic moment: it folds at the root), 1 t dropped on its tip, the cube dropped 5 m on a face or a corner, 1 t spread on its lid, a 1 t slab dropped on it, the cube thrown at the wall at 50 km/h. F3 draws the triangles' edges on the plate's face towards the camera (blue, orange where yielded; F4: by load) |
-| Shell Car | a saloon on the BMW E36's lines (the mod's, 4.9 m, a 3.0 m wheelbase, ~1260 kg; `tools/make_shell_car.py`) whose body-in-white is a thin spatial structure: FEM members of box section along its load-carrying lines (sills 110 x 1.8 mm, hinge pillars 100 x 2.0, B pillars 80 x 1.8, the A and C pillars, the roof rails and three bows, the cowl and the floor's cross members, the front rails with the upper rails along the fenders' line and the radiator support, the rear rails, the rear doors' posts, the arches' lips) and single sheets of FEM triangles between them (the floor, the firewall, the roof, the aprons, the rear wheelhouses, the quarter panels, the rear panel, the parcel shelf): 165 nodes, 133 members and 214 triangles, 245 kg of steel (the first version's double-skinned body sides and boxes: 342 nodes, 748 triangles, 30 -> 20 ms a frame). The hood and the fenders are the E36's panels as FEM triangles alone; the doors, the trunk lid and the bumpers sheets welded onto FEM inner shells (the bumpers' 2 mm beams); all are parts on mounts of their kinds: hinges (the part turns about its hinges' line only), latches, clamped bolts (the fenders, the bumpers' brackets: they give 0.2 rad at their break moment and let go past it - a part left on one bolt does not swing about it), buffers (with its latch gone the hood rests on them, it does not fall into the engine bay) and opening stays. The Frame Car's suspension of FEM tubes: double wishbones on ball joints (on the rails and on the aprons or the rear wheelhouses), uprights, a rack sliding in its housing and tie rods in front, toe links at the rear; 260 N m rear-wheel drive. The Frame Car's test pad with the gravel lane and the rough field; the Scene menu has the crash tests, the drops, the roll, the curb, the ramp, the slab, the axe, the whoops, the jump, and lets the latches go. ~6 ms of physics a frame with the FEM at 2 kHz (8 in the crashes) |
+| Shell Car | a saloon on the BMW E36's lines (the mod's, 4.9 m, a 3.0 m wheelbase, ~1460 kg; `tools/make_shell_car.py`), all FEM elements (no sheets). Its body-in-white is a thin spatial structure: FEM members of box section along its load-carrying lines (sills 110 x 1.8 mm, hinge pillars 100 x 2.0, B pillars 80 x 1.8, the A pillars on the E36's line and the C pillars, the roof rails and three bows, the cowl and the floor's cross members, the front rails with the upper rails along the fenders' line and the radiator support, the rear rails, the bumpers' beams on crash boxes, the rear doors' posts, the arches' lips) and single sheets of FEM triangles between them (the floor, the firewall, the roof, the aprons, the rear wheelhouses, the quarter panels, the rear panel, the parcel shelf): 175 nodes, 191 members and 216 triangles, ~310 kg of steel (the first version's double-skinned body sides and boxes: 342 nodes, 748 triangles, 30 -> 20 ms a frame). The hood, the fenders, the doors (with window frames of FEM members), the trunk lid (an L: its top and its rear face), the bumpers and the tail lights are the E36's panels as FEM triangles - steel, the bumpers and the lamps polypropylene in their own colours (`set_fem_shell`'s) - the bumpers scanned round their outlines (the corners' wrap), the quarters' feet and the rear panel's corners tucked in under the rear bumper. All are parts on mounts of their kinds: hinges (the part turns about its hinges' line only), latches, clamped bolts (the fenders, the bumpers' brackets, the lamps: they give 0.2 rad at their break moment and let go past it - a part left on one bolt does not swing about it), buffers (with its latch gone the hood rests on them, it does not fall into the engine bay; the doors' edges rest on their openings' flanges, so laid on its side it keeps its doors) and opening stays. The suspension of FEM tubes (the Frame Car's layout, stiff): double wishbones on ball joints inside the wheels, the lower ones 0.45 m long on the subframes' cross members, the upper ones 0.28 m in frames of members on the aprons or the rear wheelhouses (at the rear triangulated down to the lower pivots), uprights with the steering arms level with the lower ball joints, a rack sliding in its housing and tie rods in front, toe links on brackets at the rear - their inner ends placed by a kinematic sweep of the linkage: no bump steer (under 0.05 degrees over +-10 cm; the previous layout's rear toe ran to 40 degrees at full droop, the car on its side), camber -3 degrees at full droop; maraging steel (70 x 14 uprights, 45 x 5 arms) that stays elastic through every test; coil-overs of 1.6 Hz, 9 cm of droop; 280 N m rear-wheel drive, the engine's inertia a real one's (0.2 kg m2: RoR's `engoption` figure is taken in rpm, the 0.10 it had was ten times that - in first gear as much again as the car's mass to spin up), tyres of 24 rays (200 kN/m, 300 N s/m: a third less rolling resistance): 0-50 km/h in 3.5 s (5.5 before, with the FEM's lost push). Three collision volumes (see Collision volumes) - the engine (on the firewall, the rails' middle and the towers), the cabin (30 cm under the roof, 15 inside the doors; on the floor, sills, B pillars, cowl), the trunk - keep other cars, the slab, poles and balls out of it once its panels give. The volumes hold its own panels off as well (7-10 cm clear of them standing): the doors on the cabin in the side impact, the hood and the front bumper on the engine at the wall, the lid on the trunk under the slab. The Frame Car's test pad with the gravel lane and the rough field; the Scene menu has the crash tests, the drops, the roll, the curb, the ramp, the slab, the axe, the whoops, the jump, lays it on its side and lets the latches go; the test scenes under Test cars/Shell Car run one each (head-on, side impact, wall, pole, drop, on the roof, on its side, slab, axe, barrel roll, curb, whoops, jump, the latches). ~7 ms of physics a frame with the FEM at 2 kHz (8-11 in the crashes) |
 | Steel Barrels | 200 l steel drums (572 x 880 mm, 1.0 mm steel of 200 MPa, 16 kg; `build_barrel`): the wall and both ends one closed sheet of 480 triangle elements (a 20 x 9 grid round the wall, rings and a fan on the ends), the two rolling hoops pressed out 8 mm at a third and two thirds, the ends dished in 2 cm inside a flat band at the rim (a drum stood on another rests on the band; on a slope down to the middle it was pushed off) and every node up to 3 mm off the true surface (a flat end and a true cylinder cannot start to buckle: they held 60 times what a real drum takes and nothing dented); the membrane is projected (a quarter of steel's yield force in the plane: 9 cm triangles stand for a wall that folds in waves of a few centimetres), bending is plastic from 0.01 rad with some work hardening; the ends are shaded apart from the wall (a crease at 45 degrees). A second kind (Scene menu: "with FEM rings", green in the front row) has the chimes and hoops as rings of 8 mm frame elements too (their stretch left to the membrane: a hundredth of their axial stiffness): the ends and hoops stay round, the wall between dents. A pad with a 15 degree ramp and a wall; the Scene menu drops one on its bottom from 1 or 5 m, on its side from 2 or 10 m, on the rim from 2 m, rolls it down the ramp, kicks it into the wall, throws one at another at 8 m/s, stands one on another, drops one onto another from 1.5 or 3 m, drops a 40 kg steel ball on one from 3 or 8 m and shoots it at one against the wall at 20 m/s. Scene menu too: tip one over (a push at its top). Drops dent the chimes and pop the dished ends out, the ball dents it deep (20% of its volume from 3 m; from 8 m it tears) and rolls off (projectiles meet the drums as spheres: `SoftBody::sphere_ball`, `sphere_target`; the drums meet each other node against triangle), a ball shot at one against the wall crushes it to half; knocked over or dropped they come to rest where they land, and left alone they stay where they are. `tools/test_scenes.py` checks each by the drum's volume (`BL_SHELLDBG` prints it), the frame rings, the ball's clearance, the tip, coming to rest and the drift at rest |
 | Stress: Barrel pile | 15 steel drums on their sides in a pile (5 - 4 - 3 - 2 - 1, chocks at the bottom row), three more thrown into it one after another at 10 m/s (the sheet drums; `BL_BARREL_FEM=1`: with frame rings). `tools/test_scenes.py` checks the physics time |
 | Tape Maze | 590 m gymkhana course marked only with tape: five lanes joined by hairpins, then a chicane; 450 stakes in 60 tape sections, stage timer, autopilot |
@@ -490,7 +491,9 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
   planes with shear deformation), welded to their nodes by default. Co-rotational: the member's frame follows its chord
   and the mean of its ends' orientations, the small deformations in it (elongation, twist, end rotations against the
   chord) meet the linear element stiffness, so large motions are exact. Sections from the material and shape (tube,
-  box, rod, bar: A, I, J, shear areas, plastic moment and forces).
+  box, rod, bar: A, I, J, shear areas, plastic moment and forces); the materials: Steel (S355), Chromoly (4130),
+  Aluminium (6061-T6), Titanium, Carbon, Wood, Plastic, SpringSteel (51CrV4, 1.2 GPa), Maraging (maraging steel 300,
+  1.9 GPa: suspension uprights and arms that stay elastic).
   - *Joints* at a member's end: rigid (welded), ball (all three rotations free), hinge_v / hinge_h (free about the
     member's z / y axis), swivel (the twist free), elastic (a rotational spring, N m/rad); a freed rotation is
     condensed out of the member's stiffness, a spring's flexibility adds to it. An end that frees the twist has no say
@@ -546,6 +549,13 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     frame box leaves it as a rigid piece and comes to rest on the ground. The Frame Car (181 frame nodes, 273 members,
     579 factor blocks): about 27 us for the members' forces and 66 us for the solve per substep on an M-series core.
     `BL_FRAMEDBG=1` prints why a member splits or breaks; `BL_FRAME_THETA`, `BL_FRAME_DISS` override the step.
+  - *The body's springs on frame nodes* (shocks, bump stops, a wheel's spokes on its hub) join the implicit step on the
+    frame's side: (theta h^2 k + h d) e e^T. One with its other end off the frame (a tread node on a hub) has that end's
+    share of its mass condensed into the frame node's row (c mb / (mb + c) e e^T, its force's share on the right side)
+    and the end's own change put back after the solve (`FemFrame::one_sided_rhs / one_sided_react`); taken on the
+    frame's side alone, as if the other end stood still for the step, it took c e (e . dv) of the frame node's momentum
+    every step - a driven FEM car lost a third of its tyres' push (the Frame Car 60%), a frame with a node hung on a
+    spring fell at 0.92 g (`BL_ONESIDED_OLD=1`: as before, diagnostics).
   - *Components and mounts.* The frame's parts joined by members (and by the body's springs between their nodes) are
     its components: each is ordered (minimum degree), assembled, factored and solved on its own, the components of all
     the island's frames beside each other on the team (`FemFrame::solve_begin / solve_component / solve_end`; the
@@ -598,8 +608,15 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     past the yield is returned radially (the rest shape follows the stretch), the bending moment at the three points
     past the plastic moment sigma_y t^2 / 4 likewise (the corners' rest rotations follow); the damage is the rest
     shape's largest principal plastic stretch against the authored shape (a state, not a path: a panel shaken on its
-    yield surface did not tear), past the material's elongation the triangle is torn out (its collision triangle with
-    it). Splits, cuts, the destroy tool, compaction and debris handle the triangles like members. A triangle's mass
+    yield surface did not tear), past the material's elongation the triangle tears - nothing is removed: a crack opens
+    along its edge most across its plastic stretch's largest principal direction, the edge's end nodes duplicated
+    (`FemFrame::tear_tri`: at each end the triangles on the torn element's side of the crack take the copy, a third of
+    the node's mass at least; a node inside the sheet has the crack go on along its edge straightest on from the torn
+    one; the members, mounts, welds and springs keep the node; the collision triangles follow), each further tear of
+    the same triangle half the elongation later, three and it is a piece. The laser and the axe part the shell along
+    its edges nearest the cut (`FemFrame::part_tris`: the triangles round the cut sorted by the side their middles are
+    on, every corner with triangles on both sides duplicated), the destroy tool tears radially. Splits, compaction and
+    debris handle the triangles like members. A triangle's mass
     rho t A goes a third to each corner, its rotary inertia to the nodes. A limit: the contacts with other bodies are
     explicit, a thin shell's node pushed as a free node of a few hundred grams against its members' forces, so a heavy
     body resting on a thin shell keeps it trembling a little (a 1 t slab on the 2 mm cube: its nodes at a few tenths of
@@ -609,7 +626,8 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     fem_tri`): a rigid turn makes no force, a cantilever strip's tip across between the plate and the beam results
     (14.9 mm: 13.9 / 15.2) and along to 0.6%, a clamped square plate's middle within 2% of Timoshenko's table, a free
     plate spun about three axes keeps its energy (0.9%), a strip at half its first yield springs back, at 0.9 of its
-    collapse load keeps a set, at 1.3 folds, pulled at twice its yield tears; a 1 m box of 2 mm steel dropped 1 m
+    collapse load keeps a set, at 1.3 folds, pulled at twice its yield tears (no triangle removed, the nodes along the
+    crack duplicated, the strip in pieces), a plate cut across by the laser parts into two; a 1 m box of 2 mm steel dropped 1 m
     rests, silent in 4 s. The cost: a closed shell's factor grows as n^1.5 (the Shell Car's 316 nodes: 20k block
     updates, 9 ms a frame; `BL_FACTORDBG=1` prints a frame's factor pattern); `BL_FEMDBG=n` prints every n frames each
     body's triangles (torn, yielded, peak load, the fastest node).
@@ -657,6 +675,21 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     triangles reaches its hull depth past its box (islands, partners). Hull triangles tear when an edge is stretched
     2.5 times, when a laser or the axe's cut crosses them (on a sheet body too: before, a sheet body's other collision
     triangles were never cut) and with frame debris breaking off (they do not hold debris on the body).
+  - **Collision volumes** (`SoftBody::volumes`, `CollisionVolume`, the truck's `collision_volumes`; `World::collide_volumes`):
+    a heuristic for what fills a car - the engine in its bay, the seats and occupants in the cabin, the trunk's load -
+    under its thin panels: convex hulls (the hull of the given points) riding on N anchor nodes of the frame, placed
+    every substep by the anchors' best rigid fit (the rotation by Mueller's iteration from the last). Other bodies'
+    contacter nodes inside one, their balls reaching into it and other volumes' vertices inside it are pushed out along
+    its nearest face, so are the nodes of the body's own parts on mounts - the FEM components with triangles that hold
+    a mount's part side, not the anchors' own (the hood, the doors, the lid, the fenders, the bumpers and the lamps, not
+    the body-in-white or the suspension; `SoftBody::find_volume_parts`, the nodes inside one as built left out with a
+    warning; `BL_VOLPARTS_OFF=1` leaves them to the other bodies alone): a door pushed in stops on the cabin, the hood
+    folded back on the engine; and its vertices out of the static world (terrain, boxes) and a pole through its faces; each contact
+    is the ground's response on the pair's effective mass, the volume's share spread onto its anchors as the force and
+    the moment it makes on a rigid body. Crushed or torn out of shape past its `break rms` (the fit's residual) a volume
+    is off for good; a body with `volume_pass` (the giant axe) goes through them. Bodies with volumes share an island
+    with anything they could touch. The Scene status line gives each volume's contacts and largest force; with the
+    collision view (F-key or `BL_COLLISION=1`, `BL_HIDEMESHES=1` for the view alone) they are drawn in magenta.
   - Each body first gets a list of partners (bodies whose expanded boxes overlap); only nodes inside a partner's box
     enter the hash, and a body's own nodes are skipped in the scans unless it self-collides. A sheet or cloth next to
     other bodies used to scan thousands of its own nodes every rebuild.
@@ -912,7 +945,11 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
 - **Grab tool.** The pull is a critically damped spring whose stiffness follows the grabbed body's mass, and its force
   is capped by the node's own mass as well (a 5 g cloth node pulled with 20 kN used to fly off at km/s). The grab strength
   (`Game::grab_strength` -> `SoftBody::grab_scale`, 0.01x - 100x) scales the stiffness and the cap together; the cap
-  never exceeds 40000 m/s² times the node's mass.
+  never exceeds 40000 m/s² times the node's mass. With a radius (`Game::grab_radius`) the grab takes a sphere round the
+  picked node: the nodes of every body in it (`Game::grab_bodies`; each body's own stiffness from its mass), each pulled
+  to the target and its offset from the centre, the body's pull shared by weight x mass, the weight (1 - (r/R)^2)^2 -
+  all of it at the centre, none at the edge (`SoftBody::grab_nodes`, `grab_offsets`, `grab_w`; renumbered with the body's
+  nodes, `SoftBody::remap_node_refs`, not dropped when a sheet refines or cracks).
 - **Sleeping.** A body sleeps after 1 s below its sleep speed; a sleeping body is woken by a contact partner that
   moves faster than the partner's own sleep speed (soft bales keep rocking a little: a stack of them used to wake
   each other forever and creep apart). Imported stage props start asleep, as in RBR.
