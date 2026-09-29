@@ -193,6 +193,15 @@ struct FrameElement {
 // FemFrame::kOverloadTime. The two nodes' turning against each other can be damped (a hinge's friction; implicit on each
 // side against the other's turning at the step's start). A mount is no member: a part held by mounts alone is a
 // component of the frame's own, solved apart from the rest (and beside it, in parallel).
+// Its kinds (MountKind): a point (b alone, as above); a clamp - b and up to three of the part's nodes round it each held
+// at its point of the anchor, so the part turns on it only as far as the springs give (a bolted flange: a part left on
+// one bolt does not swing about it; with a break moment it gives FemFrame::kClampGive at it) and it lets go past the
+// break force or the break moment about the nodes' middle; a
+// hinge - b and a second node of the part on the hinge's line (b2) held: the part turns about that line only; a stop -
+// b kept from coming nearer to a than it stood (it pushes only: a lid resting on its buffers); a strap - b kept within
+// `len` times that distance of a (it pulls only: a lid's opening stay).
+enum class MountKind : uint8_t { Point, Clamp, Hinge, Stop, Strap };
+
 struct FrameMount {
     uint32_t a = 0, b = 0;          // body nodes (a: the anchor's side)
     // the point b is held at: carried by a and three frame nodes near it (their positions' affine combination, a point
@@ -206,11 +215,25 @@ struct FrameMount {
                                             // them tore the mount's seat - the spring on a node left dangling flung it)
     vec3 off{0};                    // (in a's frame: from a to where b is held, when na is 0)
     float k = 0, c = 0;             // spring (N/m; 0 at the start: from the nodes' masses), damping (N s/m)
+    float m_eff = 0;                // (the two sides' effective mass: the spring at most m_eff / h^2 at a frame step h)
     float brk = 0;                  // break force (N; 0: never)
     float damp = 0;                 // the turning's damping (N m s/rad)
     float overload = 0;             // (the force over the break force, less one, over time)
     float f = 0;                    // its force at the last step (N), for display
     bool made = false, broken = false;
+    MountKind kind = MountKind::Point;
+    uint32_t b2 = 0;                // a hinge: the part's second node on its line
+    float brk_m = 0;                // a clamp: the break moment (N m; 0: never)
+    float len = 1;                  // a strap: how far it lets b go, times the rest distance
+    float L0 = 0;                   // (a stop's, a strap's rest distance of a and b)
+    // (a clamp's and a hinge's other held nodes: bn[0] is b; their points' weights on the anchor's nodes, or their
+    // offsets in a's frame; each one's spring and damping)
+    int nb = 1;
+    uint32_t bn[4] = {0, 0, 0, 0};
+    float bw[4][4] = {};
+    vec3 boff[4];
+    float bk[4] = {0, 0, 0, 0}, bc[4] = {0, 0, 0, 0}, bm[4] = {0, 0, 0, 0};
+    float m = 0;                    // its moment about the held nodes' middle at the last step (N m), for display
 };
 
 class FemFrame {
@@ -218,6 +241,8 @@ public:
     // a mount lets go when its force has stood this long over its break force (s: at twice it for 5 ms, at 1.5 times
     // for 10), not on a peak
     static constexpr float kOverloadTime = 0.005f;
+    // a clamp mount's give: it turns the part this far (rad) at its break moment before it lets go
+    static constexpr float kClampGive = 0.2f;
     // frame nodes
     std::vector<uint32_t> node;     // the body's node of each frame node
     std::vector<quat> q;            // orientation (node -> world); identity at rest in the definition's space
@@ -262,13 +287,20 @@ public:
     // A member between two body nodes (their frame nodes are made as needed), with the joints at its ends.
     uint32_t add_element(uint32_t body_a, uint32_t body_b, uint16_t section, uint8_t end_a = FJ_RIGID, uint8_t end_b = FJ_RIGID, int32_t tag = -1);
     // A mount (see FrameMount) of body node b on body node a, where b is now; k 0: the most the nodes' masses take at
-    // the step (a quarter of the explicit limit); damp: the turning's damping.
-    uint32_t add_mount(uint32_t body_a, uint32_t body_b, float brk, float k = 0, float damp = 0);
+    // the step (a quarter of the explicit limit); damp: the turning's damping; kind and its parameter: a clamp's break
+    // moment (N m), a hinge's second node, a strap's length (times the rest distance).
+    uint32_t add_mount(uint32_t body_a, uint32_t body_b, float brk, float k = 0, float damp = 0, MountKind kind = MountKind::Point, float param = 0,
+                       uint32_t body_b2 = 0);
     int mounts_broken = 0;          // mounts let go so far
     // components: parts of the frame joined by members (and the body's springs between their nodes), each solved on
     // its own (solve_component); mounts and springs between two of them act explicitly
     int components() const { return (int)comp_range_.size(); }
     int component_nodes(int c) const { return comp_range_[c].second - comp_range_[c].first; }
+    // The component a body node's frame node is in (-1: none, or the pattern not made yet).
+    int component_of(uint32_t body_node) const;
+    // The latches let go: the point mounts of the parts that have hinges (a hood, a lid, a door swings free on them).
+    // Returns how many.
+    int release_latches(SoftBody& b);
     int component_members(int c) const { return (int)comp_elems_[c].size(); }
     int component_tris(int c) const { return (int)comp_tris_[c].size(); }
     float element_mass(const FrameElement& e) const { return sections[e.section].mass_per_m() * e.L0; }
@@ -301,6 +333,14 @@ public:
     void solve_component(SoftBody& b, int c);
     void solve_end(SoftBody& b);
     void hold(SoftBody& b, float step);
+    // A step between the frame's steps (WorldSettings::frame_every): the frame's response to this step's forces beyond
+    // what the last step took them to be (its prediction), through that step's factorization again - the elements not
+    // evaluated, assembled or factored, the contacts, the welds and the beams on the frame nodes answered by the
+    // structure at once (held and taken one step late, the sheet's welds let go and a thin shell's light nodes, pushed
+    // alone by a contact, tore). held_begin returns the components (0: no factorization to use: hold instead).
+    int held_begin(SoftBody& b, float step);
+    void held_component(SoftBody& b, int c);
+    void held_end(SoftBody& b);
     std::vector<vec3> impulse;      // per frame node: the forces held over the short steps less what solve took them
                                     // to be (N s)
     // After the body's integration (a step of length h): the frame nodes' double positions and orientations advanced,
@@ -313,6 +353,9 @@ public:
     // Destroy tool: members passing within r of p are torn there (at a joint, off it; else split and torn at that
     // point). Returns the tears.
     int break_near(SoftBody& b, vec3 p, float r);
+    // A triangle element torn out (a cut through it: the laser, the axe); finish_cuts after the last. Returns 1, 0 if
+    // it was already.
+    int tear_tri(SoftBody& b, uint32_t ti);
     // A member cut at t along it (0 at a): torn off the joint when that is close, else split there and torn. Then
     // finish_cuts once (the solver's pattern again, the body told of its new nodes). Returns the tears.
     int cut(SoftBody& b, uint32_t elem, float t);
@@ -443,6 +486,10 @@ private:
     std::vector<uint8_t> elem_swap_;              // 1: the block's row node is the element's a
     std::vector<double> diag_, off_, rhs_;        // numeric blocks (36 doubles each), right-hand side (6 per node)
     std::vector<char> fixed_;                     // (solve's scratch)
+    std::vector<vec3> pred_, tpred_;              // (the smooth force and torque a step took for its whole length, per node)
+    std::vector<vec3> member_t_;                  // (the members' part of the torque, as member_f)
+    std::vector<char> comp_factored_;             // (a component's factorization in diag_ / off_ / dinv_ is its last step's)
+    float held_step_ = 0;
     std::vector<double> dinv_;                    // the factor's inverse diagonals
     std::vector<double> diagA_, offA_, rhsA_;     // the system as assembled, kept while members yield (active-set passes)
     struct Changed {

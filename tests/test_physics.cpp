@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -1600,11 +1601,13 @@ static void test_fem_tris() {
         printf("    clamped square plate: middle %.4f mm (Timoshenko %.4f)\n", got * 1e3, want * 1e3);
         CHECK(std::fabs(got / want - 1) < 0.05, "clamped plate %.5g vs %.5g", got, want);
     }
-    // a free plate spun about three axes: after a second it keeps its shape (little strain energy) and its energy
-    {
+    // a free plate spun about three axes: after a second it keeps its shape (little strain energy) and its energy; the
+    // frame's step at 2 kHz and at the default 1 kHz (the linearization over twice the step strains it a little more)
+    for (int fe : {1, kFrameEveryLag}) {
         ShellSection s2 = make_shell_section("Steel", 0.002f);
         s2.yield = 0;
         auto w = world(false);
+        w->settings.frame_every = fe;
         auto body = tri_plate(1.0f, 1.0f, 6, 6, s2, false);
         const vec3 om(1.5f, 5.0f, 1.0f), c(0.5f, 1, 0.5f);
         for (Node& x : body->nodes) x.v = cross(om, x.p - c);
@@ -1623,8 +1626,8 @@ static void test_fem_tris() {
             umax = std::max(umax, b->fem.tri_energy());
         }
         const double ke1 = kinetic();
-        printf("    free plate spun: energy %.3f -> %.3f J, strain energy at most %.2e J\n", ke0, ke1, umax);
-        CHECK(std::fabs(ke1 / ke0 - 1) < 0.02 && umax < 1e-3 * ke0, "spun plate: energy %.4g -> %.4g, strain %.3g", ke0, ke1, umax);
+        printf("    free plate spun (its step at %d Hz): energy %.3f -> %.3f J, strain energy at most %.2e J\n", 2000 / fe, ke0, ke1, umax);
+        CHECK(std::fabs(ke1 / ke0 - 1) < 0.02 && umax < (fe == 1 ? 1e-3 : 2e-2) * ke0, "spun plate (%d): energy %.4g -> %.4g, strain %.3g", fe, ke0, ke1, umax);
         CHECK(b->fem.solve_failures == 0 && b->fem.clamps == 0, "spun plate: %d failures, %d clamps", b->fem.solve_failures, b->fem.clamps);
     }
     // plastic: a strip 0.5 m x 0.2 m of 10 mm steel. Loaded to half its first yield it springs back; to 0.9 of its
@@ -2186,7 +2189,10 @@ static void test_frame() {
             printf("    mount (breaks at 500 N) %s: %s\n", c.name, torn_at >= 0 ? "let go" : "held");
             if (torn_at >= 0) printf("      after %.1f ms\n", torn_at * dt_ms);
             CHECK((torn_at >= 0) == c.tears, "mount %s: %s", c.name, torn_at >= 0 ? "let go" : "held");
-            if (c.tears) CHECK(torn_at * dt_ms >= 1000.0f * FemFrame::kOverloadTime, "let go after %.1f ms, before the overload time", torn_at * dt_ms);
+            // (within a step of the frame's: the overload is counted at its steps)
+            if (c.tears)
+                CHECK(torn_at * dt_ms >= 1000.0f * FemFrame::kOverloadTime - dt_ms * (float)w->settings.frame_every, "let go after %.1f ms, before the overload time",
+                      torn_at * dt_ms);
         }
     }
     // a released joint's damping (FrameSection::joint_damp) is implicit: an arm on a ball joint (its node held by a
@@ -2321,6 +2327,104 @@ static void test_frame() {
                 else if (dmp < 100) CHECK(ymin < 0.7f && vlast < 0.05f, "the damped hinge: down to %.3f, still %.3f m/s", ymin, vlast);
                 else CHECK(ymin > 0.9f, "the heavily damped hinge fell to %.3f", ymin);
             }
+        }
+    }
+    // mount kinds (FrameMount): the same frame and square part. A clamp alone holds it (the part's nodes round the bolt
+    // held: it does not swing about the bolt, as it does on a point) and lets go past its break moment below its break
+    // force; a hinge alone (two of the part's nodes on its line) lets it turn about that line only; a stop keeps a lid
+    // hinged over the frame from falling through it; a strap ends a part's swing
+    {
+        struct MountSpec {
+            int f, q;           // the frame's node, the part's (indices in the tetrahedron, the square)
+            MountKind kind;
+            float brk, param;
+            int q2;             // a hinge's second node of the part
+        };
+        auto make = [&](float y, std::vector<MountSpec> specs, uint32_t* fn, uint32_t* qn) {
+            auto body = std::make_unique<SoftBody>();
+            body->name = "mounted";
+            body->can_sleep = false;
+            const uint16_t si = body->fem.add_section(tube);
+            const vec3 fp[4] = {vec3(0, 1, 0), vec3(0.5f, 1, 0), vec3(0, 1, 0.5f), vec3(0.2f, 1.5f, 0.2f)};
+            for (int i = 0; i < 4; i++) fn[i] = body->add_node(fp[i], 0.0f, i < 3 ? NF_FIXED : NF_NONE);
+            for (int i = 0; i < 4; i++)
+                for (int j = i + 1; j < 4; j++) frame_chain(*body, fn[i], fn[j], 2, si);
+            const vec3 qp[4] = {vec3(0.05f, y, 0.05f), vec3(0.45f, y, 0.05f), vec3(0.45f, y, 0.45f), vec3(0.05f, y, 0.45f)};
+            for (int i = 0; i < 4; i++) qn[i] = body->add_node(qp[i], 0.5f, NF_NONE);
+            for (int i = 0; i < 4; i++) frame_chain(*body, qn[i], qn[(i + 1) % 4], 2, si);
+            frame_chain(*body, qn[0], qn[2], 2, si);
+            fix_inv_mass(*body);
+            for (const MountSpec& m : specs)
+                body->fem.add_mount(fn[m.f], qn[m.q], m.brk, 0.0f, 0.0f, m.kind, m.param, m.q2 >= 0 ? qn[m.q2] : 0);
+            body->fem.finalize(*body);
+            return body;
+        };
+        auto run = [&](std::unique_ptr<SoftBody> body, int steps, const std::function<void(SoftBody&, int)>& load, const std::function<void(const SoftBody&)>& watch) {
+            auto w = world(false);
+            w->settings.gravity = vec3(0, -9.81f, 0);
+            SoftBody* b = w->add_body(std::move(body));
+            int step = 0;
+            b->pre_substep = [&](SoftBody& x, float) { load(x, step); };
+            bool finite = true;
+            for (; step < steps; step++) {
+                w->step_substeps(1);
+                for (const Node& n : b->nodes) finite &= std::isfinite(n.p.x + n.p.y + n.p.z);
+                watch(*b);
+            }
+            CHECK(finite && b->fem.solve_failures == 0, "mount kinds: not finite or %d failed solves", b->fem.solve_failures);
+            return b->fem.mounts_broken;
+        };
+        const auto none = [](SoftBody&, int) {};
+        uint32_t f[4], q[4];
+        // hanging from one mount 4 cm under the frame: a point (it swings down), a clamp (it holds)
+        for (MountKind k : {MountKind::Point, MountKind::Clamp}) {
+            float ymin = 1e9f;
+            run(make(0.96f, {{0, 0, k, 0.0f, 0.0f, -1}}, f, q), 4000, none, [&](const SoftBody& b) { ymin = std::min(ymin, b.nodes[q[2]].p.y); });
+            printf("    a square hung from one %s: its far corner down to %.3f m\n", k == MountKind::Point ? "point mount" : "clamp", ymin);
+            if (k == MountKind::Point) CHECK(ymin < 0.7f, "on a point mount the part did not swing down (%.3f)", ymin);
+            else CHECK(ymin > 0.93f, "on a clamp the part swung down to %.3f", ymin);
+        }
+        // a clamp (1000 N, 20 N m) and a load at the far corner: 20 N holds (11 N m), 80 N twists it off (46 N m)
+        for (float P : {20.0f, 80.0f}) {
+            const int broken = run(make(0.96f, {{0, 0, MountKind::Clamp, 1000.0f, 20.0f, -1}}, f, q), 1500,
+                                   [&](SoftBody& x, int) { x.force[q[2]] += vec3(0, -P, 0); }, [](const SoftBody&) {});
+            printf("    a clamp (1000 N, 20 N m) with %.0f N at the far corner: %s\n", P, broken ? "let go" : "held");
+            CHECK((broken > 0) == (P > 50.0f), "the clamp with %.0f N at the far corner: %d let go", P, broken);
+        }
+        // one hinge (the part's two nodes on the x line): the far edge swings down, the hinge's line stays
+        {
+            float ymin = 1e9f, ymax_line = -1e9f, ymin_line = 1e9f;
+            run(make(0.96f, {{0, 0, MountKind::Hinge, 0.0f, 0.0f, 1}}, f, q), 4000, none, [&](const SoftBody& b) {
+                ymin = std::min(ymin, b.nodes[q[2]].p.y);
+                ymin_line = std::min(ymin_line, b.nodes[q[1]].p.y), ymax_line = std::max(ymax_line, b.nodes[q[1]].p.y);
+            });
+            printf("    a square on one hinge: its far corner down to %.3f m, the hinge's far node within %.1f mm\n", ymin, (ymax_line - ymin_line) * 1e3f);
+            CHECK(ymin < 0.7f && ymax_line - ymin_line < 0.01f, "one hinge: far corner %.3f, the line's node moved %.4f", ymin, ymax_line - ymin_line);
+        }
+        // a lid hinged (two points on the x line) 4 cm over the frame: it falls through it, or rests on a stop
+        for (bool stop : {false, true}) {
+            std::vector<MountSpec> ms = {{0, 0, MountKind::Point, 0.0f, 0.0f, -1}, {1, 1, MountKind::Point, 0.0f, 0.0f, -1}};
+            if (stop) ms.push_back({2, 3, MountKind::Stop, 0.0f, 0.0f, -1});
+            float ymin = 1e9f;
+            run(make(1.04f, ms, f, q), 3000, none, [&](const SoftBody& b) { ymin = std::min(ymin, b.nodes[q[3]].p.y); });
+            printf("    a lid hinged over the frame %s: its free edge down to %.3f m\n", stop ? "on a stop" : "with no stop", ymin);
+            if (stop) CHECK(ymin > 1.02f, "the lid on its stop sank to %.3f", ymin);
+            else CHECK(ymin < 0.8f, "the lid with no stop stayed at %.3f", ymin);
+        }
+        // a part swinging on a point mount, a strap from the frame's far corner to its far corner (1.2 times the rest)
+        for (bool strap : {false, true}) {
+            std::vector<MountSpec> ms = {{0, 0, MountKind::Point, 0.0f, 0.0f, -1}};
+            if (strap) ms.push_back({1, 2, MountKind::Strap, 0.0f, 1.2f, -1});
+            float dmax = 0;
+            float L0 = 0;
+            run(make(0.96f, ms, f, q), 3000, none, [&](const SoftBody& b) {
+                const float d = length(b.nodes[q[2]].p - b.nodes[f[1]].p);
+                if (L0 == 0) L0 = d;
+                dmax = std::max(dmax, d);
+            });
+            printf("    a swinging part %s: its far corner out to %.2f times its rest distance from the frame's\n", strap ? "on a strap (1.2)" : "with no strap", dmax / L0);
+            if (strap) CHECK(dmax < 1.25f * L0, "the strap let it out to %.2f", dmax / L0);
+            else CHECK(dmax > 1.4f * L0, "with no strap it went out to %.2f only", dmax / L0);
         }
     }
 }

@@ -178,6 +178,7 @@ struct World::Island {
     long long shell_steps = 0, beam_steps = 0;
     long long node_steps = 0, hinge_evals = 0;  // (this frame: node integrations, hinges evaluated)
     size_t nt_fast = 0, nc_fast = 0;         // where the fast bodies' pairs start in nt / nc
+    std::vector<uint8_t> near_keep;          // (near_pairs: scratch)
     std::vector<AABB> boxes;                 // per body, expanded by the contact reach
     std::vector<std::vector<int>> partners;  // per body: bodies whose boxes overlap
 
@@ -276,8 +277,12 @@ void World::step_frame(float frame_dt) {
     } else {
         m_accum -= n * (double)settings.dt;
     }
+    // (a lagging frame: half again the substeps of an average one to catch up, or the physics not keeping up with the
+    // clock - its frames' implicit step at the lower rate)
+    m_lagging = settings.lag_rate && (m_stats.step_ms > m_avg_frame * 1000.0 || n > (int)std::ceil(1.5 * m_avg_frame / settings.dt));
     if (n > 0) step_substeps(n);
     else m_stats.substeps = 0;
+    m_lagging = false;
     float got = n * settings.dt;
     m_stats.realtime_factor = m_stats.realtime_factor * 0.9f + 0.1f * (want > 0 ? std::min(1.5f, got / frame_dt) : 1.0f);
 }
@@ -803,10 +808,10 @@ void World::rebuild_pairs(Island& isl) {
             for (Triangle& t : b->tris)
                 if (!t.torn && t.rest_edge2 > 0 && max_edge2(b->nodes[t.a].p, b->nodes[t.b].p, b->nodes[t.c].p) > kTornStretch2 * t.rest_edge2) t.torn = true;
     }
-    // Adaptive rebuild interval (Verlet-list style): the candidate margin must cover the relative motion
-    // until the next rebuild. The interval follows the slow bodies (piles at rest rebuild rarely); a fast body
-    // (projectile, a car at speed) gets its own extra margin and is paired separately, so one bullet flying into a
-    // pile does not make the whole pile rebuild every substep.
+    // The rebuild interval is the collision detection's (WorldSettings::collision_hz: 17 substeps at 120 Hz), Verlet-list
+    // style: the candidate margin covers the relative motion until the next rebuild. The margin follows the slow bodies'
+    // speed; a fast body (projectile, a car at speed) gets its own extra margin and is paired separately, so one bullet
+    // flying into a pile does not widen the whole pile's margins. (near_pairs then keeps the pairs within reach.)
     constexpr float kFastSpeed = 8.0f;
     float slow_speed = 0;
     for (SoftBody* b : isl.bodies)
@@ -814,9 +819,7 @@ void World::rebuild_pairs(Island& isl) {
     (void)top_speed;
     const float speed = slow_speed + 0.5f;
     isl.slow_speed = speed;
-    const float margin_budget = 0.08f;
-    int interval = (int)(margin_budget / (2.0f * speed * isl.dt));
-    interval = std::max(1, std::min(settings.pair_rebuild_interval, interval));
+    const int interval = std::max(1, (int)std::ceil(1.0 / ((double)std::max(1.0f, settings.collision_hz) * isl.dt) - 1e-6));
     // A fast body's schedule follows its bulk speed (mass-weighted RMS of its nodes, +25%), not its fastest node: the top
     // of a spinning wheel moves at twice the car's speed. Its nodes get margins of their own speed (fast_pairs).
     isl.bulk.assign(nb, 0.0f);
@@ -1054,13 +1057,10 @@ void World::rebuild_pairs(Island& isl) {
     bp_lap(); // 4: queries
     isl.nt_fast = isl.nt.size();
     isl.nc_fast = isl.nc.size();
-    isl.fast_interval = interval;
+    isl.fast_interval = interval; // (refreshed with the rest: collision_hz; their margins cover their travel until then)
     isl.fast_dense = false;
-    if (any_fast) {
-        isl.fast_interval = std::max(1, std::min(interval, (int)(0.06f / (fast_speed * isl.dt))));
-        isl.fast_dense = isl.fast_interval < interval;
-        fast_pairs(isl);
-    }
+    (void)fast_speed;
+    if (any_fast) fast_pairs(isl);
     bp_lap(); // 5: fast pairs
     // ---- 3) capsules vs triangles (only when the island has both, e.g. trees vs vehicles)
     if (any_caps && any_tris) {
@@ -1354,6 +1354,50 @@ void World::fast_pairs(Island& isl) {
                 (time_seconds() - t_g0) * 1000.0, grid_ms, query_ms, nq, (int)isl.team->parallel(), isl.fast_interval, isl.margin, fast, tris, c_tris.exchange(0), c_cells.exchange(0), c_tests.exchange(0),
                 isl.nt.size() + isl.nc.size() - before, names.c_str());
     }
+}
+
+// The collision detection's second half, at its rate: of the candidate pairs (node, triangle) the ones within reach
+// until the next detection - the contact radius (a hull's depth behind it) and the travel of both sides at 1.25 times
+// their speeds, 2 cm more; the exact contact of those is found every substep (collide_pairs), the rest wait.
+void World::near_pairs(Island& isl) {
+    PROFILE_ACCUM("Near pairs");
+    const size_t n = isl.nt.size();
+    if (n == 0) return;
+    const float T = (float)std::max(isl.rebuild_interval, 1) * isl.dt;
+    isl.near_keep.assign(n, 1);
+    constexpr size_t kChunk = 2048;
+    const int nch = (int)((n + kChunk - 1) / kChunk);
+    auto pass = [&](int c) {
+        const size_t i0 = (size_t)c * kChunk, i1 = std::min(n, i0 + kChunk);
+        for (size_t i = i0; i < i1; i++) {
+            const Island::NT& pr = isl.nt[i];
+            const SoftBody& bn = *isl.bodies[pr.bn];
+            const SoftBody& bt = *isl.bodies[pr.bt];
+            const Node& x = bn.nodes[pr.node];
+            const Triangle& t = bt.tris[pr.tri];
+            if (t.torn) {
+                isl.near_keep[i] = 0;
+                continue;
+            }
+            const Node &a = bt.nodes[t.a], &b = bt.nodes[t.b], &c3 = bt.nodes[t.c];
+            vec3 bary;
+            const vec3 q = closest_on_triangle(x.p, a.p, b.p, c3.p, bary);
+            const float vt = std::sqrt(std::max(length2(a.v), std::max(length2(b.v), length2(c3.v))));
+            const float reach = bn.collision_radius + (t.two_sided ? 0.0f : bt.hull_depth) + 1.25f * (length(x.v) + vt) * T + 0.02f;
+            isl.near_keep[i] = length2(x.p - q) < reach * reach;
+        }
+    };
+    if (isl.team) isl.team->run(nch, pass);
+    else
+        for (int c = 0; c < nch; c++) pass(c);
+    // (compacted in order: the fast bodies' pairs stay after nt_fast)
+    size_t w = 0, fast = isl.nt_fast >= n ? std::string::npos : 0;
+    for (size_t i = 0; i < n; i++) {
+        if (i == isl.nt_fast) fast = w;
+        if (isl.near_keep[i]) isl.nt[w++] = isl.nt[i];
+    }
+    isl.nt_fast = fast == std::string::npos ? w : fast;
+    isl.nt.resize(w);
 }
 
 void World::refresh_fast_pairs(Island& isl) {
@@ -1735,6 +1779,9 @@ void World::simulate_island(Island& isl, int substeps) {
     isl.dt = dt;
     isl.subs.assign(nb, 0);
     constexpr uint32_t kNodeChunk = 1024;
+    // a frame's implicit step this substep (every frame_every substeps; a sub-cycled sheet's own frame every short step)
+    const int fe = std::max(1, m_lagging ? settings.frame_every_lag : settings.frame_every);
+    auto fem_due = [](const SoftBody& b) { return b.fem_left <= 0; };
     // internal forces of one body other than its triangles (a sub-cycled body recomputes them for every short step)
     auto base_forces = [&](SoftBody& b, float bdt, bool controller, bool fem_parts) {
         PROFILE_ACCUM("Beam forces"); // (gravity, drag, wind, controllers, beams, shocks, joints, wheels)
@@ -1746,8 +1793,8 @@ void World::simulate_island(Island& isl, int substeps) {
         b.compute_beam_forces();
         if (!b.shocks.empty()) b.compute_shock_forces();
         if (!b.joints.empty()) b.compute_joint_forces();
-        const bool fem_step = !b.fem.empty() && (controller || b.fem_every_step) && !b.rigid;
-        if (!b.welds.empty()) b.compute_weld_forces(fem_step);
+        const bool fem_step = !b.fem.empty() && (b.fem_every_step || (controller && fem_due(b))) && !b.rigid;
+        if (!b.welds.empty()) b.compute_weld_forces(!b.fem.empty() && !b.rigid); // (their moment on the frame nodes: its steps and the held ones)
         if (fem_step && !fem_parts) { // (once per substep: the frame's step, FemFrame::solve; fem_parts: in chunks of their own)
             PROFILE_ACCUM("Frame elements");
             b.fem.compute_forces(b);
@@ -1793,6 +1840,7 @@ void World::simulate_island(Island& isl, int substeps) {
                 b.wake();
             }
             isl.subs[k] = b.sleeping ? 0 : 1 << b.dt_shift();
+            if (!b.fem.empty() && b.fem_left <= 0) b.fem_period = fe; // (its frame's step now: over this many substeps)
             maxsub = std::max(maxsub, isl.subs[k]);
             isl.node_steps += (long long)b.nodes.size() * isl.subs[k];
             isl.beam_steps += (long long)b.beams.size() * isl.subs[k];
@@ -1806,7 +1854,7 @@ void World::simulate_island(Island& isl, int substeps) {
                 if (isl.subs[k] <= j) continue;
                 SoftBody& b = *isl.bodies[k];
                 isl.work.push_back({(uint32_t)k, 0, 0, 0});
-                if (!b.fem.empty() && (j == 0 || b.fem_every_step) && !b.rigid) {
+                if (!b.fem.empty() && (b.fem_every_step || (j == 0 && fem_due(b))) && !b.rigid) {
                     const int fc = b.fem.begin_forces(b);
                     for (int c = 0; c < fc; c++) isl.work.push_back({(uint32_t)k, 4, (uint32_t)c, 0});
                     isl.fem_parts[k] = 1;
@@ -1864,12 +1912,14 @@ void World::simulate_island(Island& isl, int substeps) {
                     const uint64_t c0 = prof::now();
                     if (s == 0 || s >= isl.next_rebuild || rebuild_now) {
                         rebuild_pairs(isl);
+                        near_pairs(isl);
                         isl.next_rebuild = s + isl.rebuild_interval;
                         isl.next_fast = s + isl.fast_interval;
                         rebuild_now = false;
                         isl.ph_ms[6] += prof::ticks_to_ms(prof::now() - c0);
                     } else if (isl.fast_interval > 0 && isl.fast_interval < isl.rebuild_interval && s >= isl.next_fast) {
                         refresh_fast_pairs(isl);
+                        near_pairs(isl);
                         isl.next_fast = s + isl.fast_interval;
                         isl.ph_ms[7] += prof::ticks_to_ms(prof::now() - c0);
                     }
@@ -1922,8 +1972,13 @@ void World::simulate_island(Island& isl, int substeps) {
                             // every force on the frame nodes is in: their implicit step (the new velocities as forces),
                             // once per substep, next, a component each; the short steps of a sub-cycled body hold them
                             // at those velocities
-                            if (b.fem_every_step || j == 0) {
+                            if (b.fem_every_step || (j == 0 && fem_due(b))) {
                                 isl.fem_defer[i] = 1;
+                                return;
+                            }
+                            static const bool no_held = getenv("BL_NOHELD") != nullptr; // (diagnostics: held as before)
+                            if (!b.rigid && !no_held) { // (between the frame's steps: its factorization answers this step's forces)
+                                isl.fem_defer[i] = 2;
                                 return;
                             }
                             b.fem.hold(b, bdt);
@@ -1938,18 +1993,32 @@ void World::simulate_island(Island& isl, int substeps) {
                     if (!isl.fem_defer[i]) continue;
                     SoftBody& b = *isl.bodies[isl.work[i].body];
                     const float bdt = dt / (float)isl.subs[isl.work[i].body];
-                    const int nc = b.fem.solve_begin(b, b.fem_every_step ? bdt : dt, bdt, settings.frame_theta,
-                                                     b.fem_dissipation >= 0 ? b.fem_dissipation : settings.frame_dissipation);
+                    int nc = 0;
+                    if (isl.fem_defer[i] == 2) {
+                        nc = b.fem.held_begin(b, bdt);
+                        if (nc == 0) isl.fem_defer[i] = 3, b.fem.hold(b, bdt); // (no factorization yet: held)
+                    } else {
+                        // (the numerical dissipation per step over the steps it spans: the same per second)
+                        const float hs = b.fem_every_step ? 1.0f : (float)b.fem_period;
+                        nc = b.fem.solve_begin(b, b.fem_every_step ? bdt : dt * (float)b.fem_period, bdt, settings.frame_theta,
+                                               (b.fem_dissipation >= 0 ? b.fem_dissipation : settings.frame_dissipation) / hs);
+                    }
                     for (int c = 0; c < nc; c++) isl.fem_work.push_back({(uint32_t)i, c});
                 }
-                if (!isl.fem_work.empty()) {
+                if (!isl.fem_work.empty() || std::find(isl.fem_defer.begin(), isl.fem_defer.end(), 3) != isl.fem_defer.end()) {
                     team.run((int)isl.fem_work.size(), [&](int q) {
-                        PROFILE_ACCUM("Frame solve");
                         SoftBody& b = *isl.bodies[isl.work[isl.fem_work[q].first].body];
-                        b.fem.solve_component(b, isl.fem_work[q].second);
+                        if (isl.fem_defer[isl.fem_work[q].first] == 2) {
+                            b.fem.held_component(b, isl.fem_work[q].second);
+                        } else {
+                            PROFILE_ACCUM("Frame solve");
+                            b.fem.solve_component(b, isl.fem_work[q].second);
+                        }
                     });
-                    for (int i = 0; i < (int)isl.work.size(); i++)
-                        if (isl.fem_defer[i]) isl.bodies[isl.work[i].body]->fem.solve_end(*isl.bodies[isl.work[i].body]);
+                    for (int i = 0; i < (int)isl.work.size(); i++) {
+                        if (isl.fem_defer[i] == 1) isl.bodies[isl.work[i].body]->fem.solve_end(*isl.bodies[isl.work[i].body]);
+                        if (isl.fem_defer[i] == 2) isl.bodies[isl.work[i].body]->fem.held_end(*isl.bodies[isl.work[i].body]);
+                    }
                     team.run((int)isl.work.size(), [&](int i) {
                         if (!isl.fem_defer[i]) return;
                         PROFILE_ACCUM("Integrate");
@@ -2033,6 +2102,10 @@ void World::simulate_island(Island& isl, int substeps) {
                 }
             }
             lap(4);
+        }
+        for (int k = 0; k < nb; k++) {
+            SoftBody& b = *isl.bodies[k];
+            if (isl.subs[k] > 0 && !b.fem.empty()) b.fem_left = b.fem_left <= 0 ? b.fem_period - 1 : b.fem_left - 1;
         }
         // new nodes and triangles: they take over the contact pairs of what they came from (or a new search)
         for (int k = 0; k < nb; k++) {
@@ -2359,6 +2432,13 @@ int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip
             }
             int tears = 0;
             for (const auto& [ei, t] : hits) tears += b.fem.cut(b, ei, t);
+            // triangle elements across the cut: torn out (a shell of them cut in two)
+            for (size_t ti = 0; ti < b.fem.tris.size(); ti++) {
+                const FrameTri& t = b.fem.tris[ti];
+                if (t.broken) continue;
+                const vec3 pa = b.nodes[b.fem.node[t.n[0]]].p, pb = b.nodes[b.fem.node[t.n[1]]].p, pc = b.nodes[b.fem.node[t.n[2]]].p;
+                if (crosses(pa, pb) || crosses(pb, pc) || crosses(pc, pa)) tears += b.fem.tear_tri(b, (uint32_t)ti);
+            }
             b.fem.finish_cuts(b, tears);
             cut += tears;
             if (getenv("BL_FRAMEDBG")) printf("laser: %s: %zu members crossed, %d torn\n", b.name.c_str(), hits.size(), tears);

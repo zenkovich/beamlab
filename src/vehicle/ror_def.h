@@ -366,9 +366,15 @@ struct Document {
     // point of a's frame where it stands (a part on the body at a distance: no member between them; phys::FrameMount),
     // both frame nodes; no stiffness: the most the nodes' masses take at the step. A part held by mounts alone is a
     // component of the frame solved on its own
+    // `..., turning damping, kind[, parameter]` - kind p (a point, the default), c (a clamp: b and the part's nodes round
+    // it held; the parameter its break moment N m), h (a hinge: the parameter the part's second node on its line), s (a
+    // stop: pushes b off a only), r (a strap: pulls b back past the parameter times its distance); see phys::FrameMount
     struct MountDef {
         int a = 0, b = 0;
         float brk = 0, k = 0, damp = 0;
+        char kind = 'p';
+        float param = 0;
+        int b2 = -1;                // (a hinge's second node)
     };
     std::vector<MountDef> mounts;
     // (BeamLab) `fem_tris`: n1, n2, n3 - triangle elements of the FEM frame (a shell: membrane and bending in the frame's

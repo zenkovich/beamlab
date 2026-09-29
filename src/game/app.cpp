@@ -104,6 +104,8 @@ bool App::init(const AppOptions& opt) {
     if (getenv("BL_NORIGID")) m_game.world.settings.rigid_pieces = false;
     if (const char* t = getenv("BL_FRAME_THETA")) m_game.world.settings.frame_theta = (float)atof(t); // (diagnostics: the frames' step)
     if (const char* d = getenv("BL_FRAME_DISS")) m_game.world.settings.frame_dissipation = (float)atof(d);
+    if (const char* e = getenv("BL_FRAME_EVERY")) m_game.world.settings.frame_every = std::max(1, atoi(e)); // (diagnostics: the rates)
+    if (const char* c = getenv("BL_COLLISION_HZ")) m_game.world.settings.collision_hz = (float)atof(c);
     if (!opt.spawn.empty()) {
         float x = 0, z = 0, yaw = 0;
         if (sscanf(opt.spawn.c_str(), "%f,%f,%f", &x, &z, &yaw) >= 2) {
@@ -949,6 +951,7 @@ int App::run(const AppOptions& opt) {
         static const bool live = getenv("BL_LIVE") != nullptr; // (diagnostics: scripted runs stepped like the interactive app)
         const bool fixed = (bench || !opt.screenshot.empty() || !opt.shots.empty()) && !opt.realtime && !live;
         if (fixed) dt = 1.0f / 60.0f; // deterministic stepping
+        m_game.world.settings.lag_rate = !fixed;  // (and the frames' step at one rate)
         dt = std::min(dt, 0.1f);
         m_frame_ms = dt * 1000.0;
         m_fps = m_fps * 0.9f + 0.1f * (dt > 0 ? 1.0f / dt : 0);

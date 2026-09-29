@@ -938,7 +938,7 @@ void Parser::data_line() {
         md().welds.push_back(w);
         return;
     }
-    case Kw::MOUNTS: { // (BeamLab) node a, node b, break force N[, stiffness N/m[, turning damping N m s/rad]]
+    case Kw::MOUNTS: { // (BeamLab) node a, node b, break force N[, stiffness N/m[, turning damping N m s/rad[, kind[, parameter]]]]
         if (!need(2)) return;
         Document::MountDef m;
         m.a = ref(0);
@@ -946,6 +946,16 @@ void Parser::data_line() {
         if (ntok_ > 2) m.brk = f(2);
         if (ntok_ > 3) m.k = f(3);
         if (ntok_ > 4) m.damp = f(4);
+        if (ntok_ > 5) {
+            const char c = tok_[5].empty() ? 'p' : (char)std::tolower((unsigned char)tok_[5][0]);
+            if (c == 'p' || c == 'c' || c == 'h' || c == 's' || c == 'r') m.kind = c;
+            else warn_at(line_no_, "mount kind '%.*s' unknown, using a point", (int)tok_[5].size(), tok_[5].data());
+            if (ntok_ > 6) {
+                if (m.kind == 'h') m.b2 = ref(6);
+                else m.param = f(6);
+            }
+            if (m.kind == 'h' && m.b2 < 0) warn_at(line_no_, "a hinge mount needs its second node, using a point"), m.kind = 'p';
+        }
         md().mounts.push_back(m);
         return;
     }

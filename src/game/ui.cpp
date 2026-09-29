@@ -356,7 +356,9 @@ void App::ui_main_menu() {
         ImGui::Checkbox("Inter-body collisions", &s.inter_body_collisions);
         ImGui::Checkbox("Sleeping (islands at rest)", &s.sleeping);
         ImGui::Checkbox("Multithreading", &s.multithreaded);
-        ImGui::SliderInt("Max broadphase interval", &s.pair_rebuild_interval, 1, 32);
+        ImGui::SliderInt("FEM step every n substeps", &s.frame_every, 1, 4);
+        ImGui::SliderInt("... in lagging frames", &s.frame_every_lag, 1, 4);
+        ImGui::SliderFloat("Collision detection (Hz)", &s.collision_hz, 30.0f, 2000.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
         ImGui::SliderInt("Max substeps/frame", &s.max_substeps_per_frame, 10, 200);
         ImGui::TextDisabled("Fixed step: %.1f kHz", 1.0f / s.dt / 1000.0f);
         ImGui::SeparatorText("Sheets (triangle elements)");

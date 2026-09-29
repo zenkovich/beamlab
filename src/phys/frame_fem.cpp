@@ -21,6 +21,7 @@ static const FrameMaterial kMaterials[] = {
     {"Carbon", 1.2e11f, 2.5e10f, 1600.0f, 6.0e8f, 0.015f},     // CFRP tube: strong, light and brittle
     {"Wood", 1.1e10f, 7.0e8f, 500.0f, 4.0e7f, 0.02f},          // pine along the grain
     {"Plastic", 1.6e9f, 5.8e8f, 950.0f, 3.0e7f, 0.08f},        // polypropylene: a bumper's absorber and brackets, a mirror's arm
+    {"SpringSteel", 2.06e11f, 7.9e10f, 7850.0f, 1.2e9f, 0.06f}, // 51CrV4, quenched and tempered: torsion and anti-roll bars
 };
 
 const FrameMaterial* frame_materials(int& count) {
@@ -143,11 +144,15 @@ uint32_t FemFrame::add_node(uint32_t body_node) {
     return (uint32_t)node.size() - 1;
 }
 
-uint32_t FemFrame::add_mount(uint32_t body_a, uint32_t body_b, float brk, float k, float damp) {
+uint32_t FemFrame::add_mount(uint32_t body_a, uint32_t body_b, float brk, float k, float damp, MountKind kind, float param, uint32_t body_b2) {
     FrameMount m;
     add_node(body_a), add_node(body_b);
     m.a = body_a, m.b = body_b;
     m.brk = brk, m.k = k, m.damp = damp;
+    m.kind = kind;
+    if (kind == MountKind::Clamp) m.brk_m = std::max(0.0f, param);
+    if (kind == MountKind::Strap) m.len = std::max(1.0f, param);
+    if (kind == MountKind::Hinge) add_node(body_b2), m.b2 = body_b2;
     mounts.push_back(m);
     ready_ = false;
     return (uint32_t)mounts.size() - 1;
@@ -252,64 +257,125 @@ void FemFrame::finalize(const SoftBody& b) {
         if (sa < 0 || sb < 0) continue;
         m.off = conj(q[sa]).rotate(b.nodes[m.b].p - b.nodes[m.a].p);
         m.na = 0;
-        // the anchor's nodes: a and, of the frame nodes a few members round it (within 0.9 m), the farthest from a, from
-        // their line and from their plane
+        const float h = kDefaultDt;
+        if (m.kind == MountKind::Stop || m.kind == MountKind::Strap) {
+            // (a stop, a strap: the two nodes' distance alone)
+            const float iab = b.nodes[m.a].inv_mass + b.nodes[m.b].inv_mass;
+            m.m_eff = iab > 0 ? 1.0f / iab : 1.0f;
+            if (!(m.k > 0)) m.k = 0.25f * m.m_eff / (h * h);
+            m.c = 2.0f * 0.3f * std::sqrt(m.k * m.m_eff);
+            m.L0 = length(b.nodes[m.b].p - b.nodes[m.a].p);
+            m.nb = 1, m.bn[0] = m.b;
+            m.made = true;
+            m.members[0] = (uint8_t)std::min(255, members_at((uint32_t)sa));
+            m.members[4] = (uint8_t)std::min(255, members_at((uint32_t)sb));
+            continue;
+        }
+        // the anchor's nodes: a and, of the frame nodes a few members (or triangles' edges) round it (within 0.9 m), the
+        // farthest from a, from their line and from their plane
         if (nbr.empty()) {
             nbr.assign(n, {});
             for (const FrameElement& e : elems)
                 if (!e.broken) nbr[e.a].push_back(e.b), nbr[e.b].push_back(e.a);
+            for (const FrameTri& t : tris)
+                if (!t.broken)
+                    for (int i = 0; i < 3; i++) nbr[t.n[i]].push_back(t.n[(i + 1) % 3]), nbr[t.n[(i + 1) % 3]].push_back(t.n[i]);
         }
+        // (of candidates round node c within reach: the farthest from it, then off their line, then off their plane)
+        auto spread = [&](int c, float reach, int out[3]) {
+            const vec3 x0 = b.nodes[node[c]].p;
+            std::vector<uint32_t> cand{(uint32_t)c};
+            for (size_t r0 = 0, ring = 0; ring < 6 && r0 < cand.size(); ring++) {
+                const size_t r1 = cand.size();
+                for (size_t i = r0; i < r1; i++)
+                    for (uint32_t u : nbr[cand[i]])
+                        if (std::find(cand.begin(), cand.end(), u) == cand.end() && length(b.nodes[node[u]].p - x0) < reach) cand.push_back(u);
+                r0 = r1;
+            }
+            out[0] = out[1] = out[2] = -1;
+            float best = 0;
+            for (uint32_t u : cand)
+                if (u != (uint32_t)c && length(b.nodes[node[u]].p - x0) > best) best = length(b.nodes[node[u]].p - x0), out[0] = (int)u;
+            if (out[0] >= 0) {
+                const vec3 d1 = normalize(b.nodes[node[out[0]]].p - x0);
+                best = 0;
+                for (uint32_t u : cand) {
+                    const vec3 r = b.nodes[node[u]].p - x0;
+                    const float l = length(r - d1 * dot(r, d1));
+                    if (u != (uint32_t)c && l > best) best = l, out[1] = (int)u;
+                }
+            }
+            if (out[1] >= 0) {
+                const vec3 nrm = normalize(cross(b.nodes[node[out[0]]].p - x0, b.nodes[node[out[1]]].p - x0));
+                best = 0;
+                for (uint32_t u : cand) {
+                    const float l = std::fabs(dot(b.nodes[node[u]].p - x0, nrm));
+                    if (u != (uint32_t)c && l > best) best = l, out[2] = (int)u;
+                }
+                if (best < 0.02f) out[2] = -1;
+            }
+        };
         const vec3 x0 = b.nodes[m.a].p;
-        std::vector<uint32_t> cand{(uint32_t)sa};
-        for (size_t r0 = 0, ring = 0; ring < 6 && r0 < cand.size(); ring++) {
-            const size_t r1 = cand.size();
-            for (size_t i = r0; i < r1; i++)
-                for (uint32_t u : nbr[cand[i]])
-                    if (std::find(cand.begin(), cand.end(), u) == cand.end() && length(b.nodes[node[u]].p - x0) < 0.9f) cand.push_back(u);
-            r0 = r1;
-        }
-        int i1 = -1, i2 = -1, i3 = -1;
-        float best = 0;
-        for (uint32_t u : cand)
-            if (u != (uint32_t)sa && length(b.nodes[node[u]].p - x0) > best) best = length(b.nodes[node[u]].p - x0), i1 = (int)u;
-        if (i1 >= 0) {
-            const vec3 d1 = normalize(b.nodes[node[i1]].p - x0);
-            best = 0;
-            for (uint32_t u : cand) {
-                const vec3 r = b.nodes[node[u]].p - x0;
-                const float l = length(r - d1 * dot(r, d1));
-                if (u != (uint32_t)sa && l > best) best = l, i2 = (int)u;
-            }
-        }
-        if (i2 >= 0) {
-            const vec3 nrm = normalize(cross(b.nodes[node[i1]].p - x0, b.nodes[node[i2]].p - x0));
-            best = 0;
-            for (uint32_t u : cand) {
-                const float l = std::fabs(dot(b.nodes[node[u]].p - x0, nrm));
-                if (u != (uint32_t)sa && l > best) best = l, i3 = (int)u;
-            }
-            if (best < 0.02f) i3 = -1;
-        }
-        if (i3 >= 0) {
-            const vec3 e1 = b.nodes[node[i1]].p - x0, e2 = b.nodes[node[i2]].p - x0, e3 = b.nodes[node[i3]].p - x0, r = b.nodes[m.b].p - x0;
-            const float det = dot(e1, cross(e2, e3));
+        int ai[3];
+        spread(sa, 0.9f, ai);
+        vec3 e1, e2, e3;
+        float det = 0;
+        if (ai[2] >= 0) {
+            e1 = b.nodes[node[ai[0]]].p - x0, e2 = b.nodes[node[ai[1]]].p - x0, e3 = b.nodes[node[ai[2]]].p - x0;
+            det = dot(e1, cross(e2, e3));
             if (std::fabs(det) > 1e-9f) {
-                const float l1 = dot(r, cross(e2, e3)) / det, l2 = dot(e1, cross(r, e3)) / det, l3 = dot(e1, cross(e2, r)) / det;
-                m.an[0] = m.a, m.an[1] = node[i1], m.an[2] = node[i2], m.an[3] = node[i3];
-                m.aw[0] = 1.0f - l1 - l2 - l3, m.aw[1] = l1, m.aw[2] = l2, m.aw[3] = l3;
+                m.an[0] = m.a, m.an[1] = node[ai[0]], m.an[2] = node[ai[1]], m.an[3] = node[ai[2]];
                 m.na = 4;
             }
         }
-        float ia = 0;
-        if (m.na > 0)
-            for (int i = 0; i < m.na; i++) ia += m.aw[i] * m.aw[i] * b.nodes[m.an[i]].inv_mass;
-        else
-            ia = b.nodes[m.a].inv_mass;
-        const float ib = b.nodes[m.b].inv_mass;
-        const float m_eff = ia + ib > 0 ? 1.0f / (ia + ib) : 1.0f;
-        const float h = kDefaultDt;
-        if (!(m.k > 0)) m.k = 0.25f * m_eff / (h * h);
-        m.c = 2.0f * 0.3f * std::sqrt(m.k * m_eff);
+        // the part's nodes held: b; a hinge's second node on its line; a clamp's three more round b (within 0.5 m, the
+        // part's own: its members' and triangles' ring round b)
+        m.nb = 1, m.bn[0] = m.b;
+        if (m.kind == MountKind::Hinge && slot(m.b2) >= 0 && m.b2 != m.b) m.bn[m.nb++] = m.b2;
+        if (m.kind == MountKind::Clamp) {
+            int bi[3];
+            spread(sb, 0.5f, bi);
+            for (int j = 0; j < 3; j++)
+                if (bi[j] >= 0) m.bn[m.nb++] = node[bi[j]];
+        }
+        // each one's point: its affine weights on the anchor's nodes (or its offset in a's frame), its spring - a quarter
+        // of what it and its share of the anchor take at the step, the anchor shared by them all
+        float ksum = 0;
+        for (int j = 0; j < m.nb; j++) {
+            const vec3 r = b.nodes[m.bn[j]].p - x0;
+            float ia = 0;
+            if (m.na > 0) {
+                const float l1 = dot(r, cross(e2, e3)) / det, l2 = dot(e1, cross(r, e3)) / det, l3 = dot(e1, cross(e2, r)) / det;
+                m.bw[j][0] = 1.0f - l1 - l2 - l3, m.bw[j][1] = l1, m.bw[j][2] = l2, m.bw[j][3] = l3;
+                for (int i = 0; i < 4; i++) ia += m.bw[j][i] * m.bw[j][i] * b.nodes[m.an[i]].inv_mass;
+            } else {
+                m.boff[j] = conj(q[sa]).rotate(r);
+                ia = b.nodes[m.a].inv_mass;
+            }
+            const float ib = b.nodes[m.bn[j]].inv_mass;
+            const float me = ia * m.nb + ib > 0 ? 1.0f / (ia * m.nb + ib) : 1.0f;
+            m.bm[j] = me;
+            m.bk[j] = m.k > 0 ? m.k / m.nb : 0.25f * me / (h * h);
+            m.bc[j] = 2.0f * 0.3f * std::sqrt(m.bk[j] * me);
+            ksum += m.bk[j];
+            if (j == 0) m.m_eff = me;
+        }
+        // (a clamp with a break moment gives a little before it lets go: the nodes round b on springs that turn the part
+        // kClampGive radians at that moment - a bolted flange's give and slip - b's own spring the step's)
+        if (m.kind == MountKind::Clamp && m.brk_m > 0 && m.nb > 1) {
+            float r2 = 0;
+            for (int j = 1; j < m.nb; j++) r2 += length2(b.nodes[m.bn[j]].p - b.nodes[m.b].p);
+            if (r2 > 1e-6f)
+                for (int j = 1; j < m.nb; j++) {
+                    ksum -= m.bk[j];
+                    m.bk[j] = std::min(m.bk[j], m.brk_m / kClampGive / r2);
+                    m.bc[j] = 2.0f * 0.3f * std::sqrt(m.bk[j] * m.bm[j]);
+                    ksum += m.bk[j];
+                }
+        }
+        for (int i = 0; i < 4; i++) m.aw[i] = m.bw[0][i];
+        m.k = ksum;
+        m.c = m.bc[0];
         m.made = true;
         {
             const int na = std::max(1, m.na);
@@ -318,8 +384,8 @@ void FemFrame::finalize(const SoftBody& b) {
         }
         static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
         if (dbg)
-            printf("frame: mount %u-%u: %.0f mm off, anchor of %d nodes (%.2f %.2f %.2f %.2f), k %.3g N/m, c %.3g N s/m, masses %.2f %.2f kg\n", m.a, m.b,
-                   length(m.off) * 1000.0f, m.na, m.aw[0], m.aw[1], m.aw[2], m.aw[3], m.k, m.c, b.nodes[m.a].mass, b.nodes[m.b].mass);
+            printf("frame: mount %u-%u (kind %d, %d nodes held): %.0f mm off, anchor of %d nodes (%.2f %.2f %.2f %.2f), k %.3g N/m, c %.3g N s/m, masses %.2f %.2f kg\n",
+                   m.a, m.b, (int)m.kind, m.nb, length(m.off) * 1000.0f, m.na, m.aw[0], m.aw[1], m.aw[2], m.aw[3], m.k, m.c, b.nodes[m.a].mass, b.nodes[m.b].mass);
     }
     analyse();
     tan_.assign(elems.size(), Tangent());
@@ -327,8 +393,9 @@ void FemFrame::finalize(const SoftBody& b) {
     ready_ = true;
 }
 
-// The mounts' springs: b held at a's point (explicit; acting for the frame's step, as the members); past the break force
-// for kOverloadTime a mount lets go
+// The mounts' springs: b (and a clamp's, a hinge's other nodes) held at a's points (explicit; acting for the frame's
+// step, as the members); past the break force (a clamp's break moment) for kOverloadTime a mount lets go. A stop pushes
+// b off a, a strap pulls it back, past their distances
 void FemFrame::mount_forces(SoftBody& b) {
     vec3* F = b.force.data();
     static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
@@ -338,40 +405,88 @@ void FemFrame::mount_forces(SoftBody& b) {
         if (m.broken || !m.made) continue;
         const int sa = slot(m.a), sb = slot(m.b);
         if (sa < 0 || sb < 0) continue;
+        // (the load against its limit: past it for kOverloadTime, it lets go)
+        auto lets_go = [&](float over) {
+            if (!b.allow_break) return false;
+            m.overload = std::max(0.0f, m.overload + (over - 1.0f) * h);
+            if (m.overload <= kOverloadTime) return false;
+            if (dbg) printf("frame: mount %zu (%u-%u, kind %d) lets go at %.0f N, %.0f N m (breaks at %.0f N, %.0f N m)\n", i, m.a, m.b, (int)m.kind, m.f, m.m, m.brk, m.brk_m);
+            m.broken = true;
+            mounts_broken++;
+            b.stats.broken_beams++;
+            debris_check = true;
+            return true;
+        };
+        // (explicit for the frame's step: at a longer step than the substep at most what the nodes' masses take at it,
+        // omega h 1 - 2e6 N/m on half-kilo nodes rang at 1 kHz and let a part go on a 1 ms peak)
+        auto capped = [&](float k, float c, float me, float& kk, float& cc) {
+            kk = k, cc = c;
+            if (h > 1.5f * kDefaultDt && me > 0 && k > me / (h * h)) {
+                const float kmax = me / (h * h);
+                cc = c * std::sqrt(kmax / k), kk = kmax;
+            }
+        };
         const Node& A = b.nodes[m.a];
-        const Node& B = b.nodes[m.b];
-        vec3 P(0), Pv(0), r(0);
-        if (m.na > 0) {
-            for (int j = 0; j < m.na; j++) P += b.nodes[m.an[j]].p * m.aw[j], Pv += b.nodes[m.an[j]].v * m.aw[j];
-        } else {
-            r = q[sa].rotate(m.off);
-            P = A.p + r, Pv = A.v + cross(w[sa], r);
-        }
-        const vec3 d = P - B.p, dv = Pv - B.v;
-        const vec3 f = d * m.k + dv * m.c; // (on b; the anchor's nodes take it back)
-        m.f = length(f);
-        if (m.brk > 0 && b.allow_break) {
-            m.overload = std::max(0.0f, m.overload + (length(d * m.k) / m.brk - 1.0f) * h);
-            if (m.overload > kOverloadTime) {
-                if (dbg) printf("frame: mount %zu (%u-%u) lets go at %.0f N (breaks at %.0f)\n", i, m.a, m.b, m.f, m.brk);
-                m.broken = true;
-                mounts_broken++;
-                b.stats.broken_beams++;
-                debris_check = true;
+        if (m.kind == MountKind::Stop || m.kind == MountKind::Strap) {
+            const Node& B = b.nodes[m.b];
+            const vec3 dx = B.p - A.p;
+            const float L = length(dx);
+            const float lim = m.kind == MountKind::Stop ? m.L0 : m.L0 * m.len;
+            if (L < 1e-6f || (m.kind == MountKind::Stop ? L >= lim : L <= lim)) {
+                m.f = 0, m.overload = std::max(0.0f, m.overload - h);
                 continue;
             }
+            const vec3 nrm = dx / L;
+            float k, c;
+            capped(m.k, m.c, m.m_eff, k, c);
+            const float fs = k * (lim - L); // (on b along a->b: a stop's out, a strap's in)
+            float fn = fs - c * dot(B.v - A.v, nrm);
+            fn = m.kind == MountKind::Stop ? std::max(0.0f, fn) : std::min(0.0f, fn);
+            m.f = std::fabs(fs), m.m = 0;
+            if (m.brk > 0 && lets_go(std::fabs(fs) / m.brk)) continue;
+            const vec3 f = nrm * fn;
+            F[m.b] += f, member_f[sb] += f;
+            F[m.a] -= f, member_f[sa] -= f;
+            continue;
         }
-        F[m.b] += f;
-        member_f[sb] += f;
-        if (m.na > 0) {
-            for (int j = 0; j < m.na; j++) {
-                F[m.an[j]] -= f * m.aw[j];
-                if (const int sj = slot(m.an[j]); sj >= 0) member_f[sj] -= f * m.aw[j];
+        // a point, a clamp, a hinge: each held node on its spring to its point of the anchor
+        vec3 fj[4], rj[4], xm(0), fsum(0);
+        for (int j = 0; j < m.nb; j++) {
+            const Node& Bj = b.nodes[m.bn[j]];
+            vec3 P(0), Pv(0);
+            if (m.na > 0) {
+                for (int k = 0; k < m.na; k++) P += b.nodes[m.an[k]].p * m.bw[j][k], Pv += b.nodes[m.an[k]].v * m.bw[j][k];
+            } else {
+                rj[j] = q[sa].rotate(m.boff[j]);
+                P = A.p + rj[j], Pv = A.v + cross(w[sa], rj[j]);
             }
-        } else {
-            F[m.a] -= f;
-            member_f[sa] -= f;
-            torque[sa] += cross(r, -f);
+            float k, c;
+            capped(m.bk[j], m.bc[j], m.bm[j], k, c);
+            const vec3 fs = (P - Bj.p) * k;
+            fj[j] = fs + (Pv - Bj.v) * c; // (on the part's node; the anchor's nodes take it back)
+            fsum += fs, xm += Bj.p / (float)m.nb;
+        }
+        vec3 msum(0);
+        for (int j = 0; j < m.nb; j++) msum += cross(b.nodes[m.bn[j]].p - xm, fj[j]);
+        m.f = length(fsum), m.m = length(msum);
+        float over = m.brk > 0 ? m.f / m.brk : 0.0f;
+        if (m.kind == MountKind::Clamp && m.brk_m > 0) over = std::max(over, m.m / m.brk_m);
+        if ((m.brk > 0 || m.brk_m > 0) && lets_go(over)) continue;
+        for (int j = 0; j < m.nb; j++) {
+            const vec3 f = fj[j];
+            F[m.bn[j]] += f;
+            if (const int sj = slot(m.bn[j]); sj >= 0) member_f[sj] += f;
+            if (m.na > 0) {
+                for (int k = 0; k < m.na; k++) {
+                    F[m.an[k]] -= f * m.bw[j][k];
+                    if (const int sk = slot(m.an[k]); sk >= 0) member_f[sk] -= f * m.bw[j][k];
+                }
+            } else {
+                F[m.a] -= f;
+                member_f[sa] -= f;
+                torque[sa] += cross(rj[j], -f);
+                if ((size_t)sa < member_t_.size()) member_t_[sa] += cross(rj[j], -f);
+            }
         }
     }
 }
@@ -972,6 +1087,7 @@ int FemFrame::begin_forces(SoftBody& b) {
         if ((float)x[0] != p.x || (float)x[1] != p.y || (float)x[2] != p.z) x[0] = p.x, x[1] = p.y, x[2] = p.z;
     }
     member_f.assign(node.size(), vec3(0));
+    member_t_.assign(node.size(), vec3(0));
     // (the frame nodes some member is welded to: a released end's damping turns its node against the member only where
     // the node's turning is someone's - a node held by released ends alone has the inertia of a few grams)
     bool any_damp = false;
@@ -1177,6 +1293,8 @@ void FemFrame::end_forces(SoftBody& b) {
         member_f[e.b] -= o.fa;
         torque[e.a] += o.ta;
         torque[e.b] += o.tb;
+        member_t_[e.a] += o.ta;
+        member_t_[e.b] += o.tb;
     }
     for (size_t ti = 0; ti < tris.size() && ti < tri_out_.size(); ti++) {
         const TriOut& o = tri_out_[ti];
@@ -1186,6 +1304,7 @@ void FemFrame::end_forces(SoftBody& b) {
             F[node[t.n[i]]] += o.f[i];
             member_f[t.n[i]] += o.f[i];
             torque[t.n[i]] += o.t[i];
+            member_t_[t.n[i]] += o.t[i];
         }
     }
     if (!mounts.empty()) mount_forces(b);
@@ -1324,6 +1443,103 @@ void FemFrame::hold(SoftBody& b, float step) {
     for (vec3& c : contact_f) c = vec3(0);
 }
 
+int FemFrame::held_begin(SoftBody& b, float step) {
+    if (!ready_ || node.empty() || comp_factored_.size() != comp_range_.size() || pred_.size() != node.size() || tpred_.size() != node.size() ||
+        fixed_.size() != node.size() || rhs_.size() < node.size() * 6)
+        return 0;
+    bool any = false;
+    for (char c : comp_factored_) any |= c != 0;
+    if (!any) return 0;
+    held_step_ = step;
+    impulse.resize(node.size(), vec3(0));
+    for (CompStats& cs : comp_stats_) cs.clamps = 0; // (the step's were counted by solve_end)
+    return (int)comp_range_.size();
+}
+
+void FemFrame::held_component(SoftBody& b, int comp) {
+    PROFILE_ACCUM("Frame held");
+    const int k0 = comp_range_[comp].first, k1 = comp_range_[comp].second;
+    const float step = held_step_;
+    vec3* F = b.force.data();
+    if (!comp_factored_[comp]) { // (its step failed: the forces held for the next, as hold)
+        for (int kk = k0; kk < k1; kk++) {
+            const int i = perm_[kk];
+            Node& x = b.nodes[node[i]];
+            if (x.inv_mass <= 0) continue;
+            const vec3 fc = i < (int)contact_f.size() ? contact_f[i] : vec3(0);
+            impulse[i] += (F[node[i]] - fc) * step;
+            x.v += fc * (step * x.inv_mass);
+            F[node[i]] = vec3(0);
+        }
+        return;
+    }
+    // the right side: this step's force beyond the prediction (the step took it for its whole length), its torque
+    for (int kk = k0; kk < k1; kk++) {
+        const int i = perm_[kk];
+        double* r = &rhs_[(size_t)kk * 6];
+        if (fixed_[i] || b.nodes[node[i]].inv_mass <= 0) {
+            for (int j = 0; j < 6; j++) r[j] = 0;
+            continue;
+        }
+        const vec3 d = (F[node[i]] - pred_[i]) * step, t = (torque[i] - tpred_[i]) * step;
+        r[0] = d.x, r[1] = d.y, r[2] = d.z, r[3] = t.x, r[4] = t.y, r[5] = t.z;
+        impulse[i] += pred_[i] * step; // (the prediction's debt for this step paid)
+    }
+    // L L^T x = r with the last step's factor
+    for (int k = k0; k < k1; k++) {
+        double* y = &rhs_[(size_t)k * 6];
+        forward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], y);
+        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) {
+            const double* L = &off_[(size_t)p * 36];
+            double* r = &rhs_[(size_t)row_[p] * 6];
+            for (int i = 0; i < 6; i++) {
+                double s = 0;
+                for (int j = 0; j < 6; j++) s += L[i * 6 + j] * y[j];
+                r[i] -= s;
+            }
+        }
+    }
+    for (int k = k1 - 1; k >= k0; k--) {
+        double* x = &rhs_[(size_t)k * 6];
+        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) {
+            const double* L = &off_[(size_t)p * 36];
+            const double* xr = &rhs_[(size_t)row_[p] * 6];
+            for (int j = 0; j < 6; j++) {
+                double s = 0;
+                for (int i = 0; i < 6; i++) s += L[i * 6 + j] * xr[i];
+                x[j] -= s;
+            }
+        }
+        backward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], x);
+    }
+    CompStats& st = comp_stats_[comp];
+    for (int kk = k0; kk < k1; kk++) {
+        const int i = perm_[kk];
+        if (fixed_[i]) continue;
+        const double* x = &rhs_[(size_t)kk * 6];
+        const Node& nd = b.nodes[node[i]];
+        vec3 dv((float)x[0], (float)x[1], (float)x[2]);
+        const vec3 dw((float)x[3], (float)x[4], (float)x[5]);
+        if (!std::isfinite(dv.x + dv.y + dv.z + dw.x + dw.y + dw.z)) {
+            F[node[i]] = vec3(0);
+            continue;
+        }
+        const float kMaxDv = 40.0f, kMaxW = 3000.0f;
+        if (const float l = length(dv); l > kMaxDv) dv *= kMaxDv / l, st.clamps++;
+        F[node[i]] = dv * (nd.mass / step);
+        w[i] += dw;
+        if (const float l = length(w[i]); l > kMaxW) w[i] *= kMaxW / l, st.clamps++;
+    }
+}
+
+void FemFrame::held_end(SoftBody&) {
+    for (const CompStats& cs : comp_stats_) clamps += cs.clamps;
+    for (CompStats& cs : comp_stats_) cs.clamps = 0;
+    for (vec3& t : torque) t = vec3(0);
+    for (vec3& c : contact_n) c = vec3(0);
+    for (vec3& c : contact_f) c = vec3(0);
+}
+
 void FemFrame::solve(SoftBody& b, float h, float step, float theta, float dissipation) {
     const int nc = solve_begin(b, h, step, theta, dissipation);
     for (int c = 0; c < nc; c++) solve_component(b, c);
@@ -1341,6 +1557,9 @@ int FemFrame::solve_begin(SoftBody& b, float h, float step, float theta, float d
     // (a sub-cycled body's contacts with other bodies, held over its short steps: World::step_island)
     sv_.ext = h > step && b.ext_force.size() == b.nodes.size() ? b.ext_force.data() : nullptr;
     w0_ = w;
+    pred_.resize(node.size(), vec3(0));
+    tpred_.resize(node.size(), vec3(0));
+    comp_factored_.assign(comp_range_.size(), 0);
     comp_stats_.assign(comp_range_.size(), CompStats());
     return (int)comp_range_.size();
 }
@@ -1457,9 +1676,15 @@ void FemFrame::solve_component(SoftBody& b, int comp) {
         if (h > step && E) fc += E[node[i]];
         const double hs = (double)h - (double)step;
         const vec3 fm = i < (int)member_f.size() ? member_f[i] : vec3(0);
+        const vec3 tm = i < (int)member_t_.size() ? member_t_[i] : vec3(0);
+        // (the smooth forces taken for the whole of h, corrected by what they turn out to be in the steps between:
+        // held_component at once, hold at the next step; taken for this step alone they loaded the structure every
+        // other step, and a cantilever's static twist came out 14% short)
         r[0] = h * (double)f.x - hs * fc.x + J.x, r[1] = h * (double)f.y - hs * fc.y + J.y, r[2] = h * (double)f.z - hs * fc.z + J.z;
         impulse[i] = (f - fm - fc) * -(float)hs;
+        pred_[i] = f - fm - fc;
         r[3] = h * (double)m.x, r[4] = h * (double)m.y, r[5] = h * (double)m.z;
+        tpred_[i] = m - tm;
         if (i < (int)contact_n.size() && length2(contact_n[i]) > 0) {
             // a ground contact: kappa n n^T towards the normal velocity change the contact asked for (step f.n / m, its
             // force being in f: for its short step, the later ones hold theirs); kappa 200 m makes it 99.5% of it
@@ -1643,6 +1868,7 @@ void FemFrame::solve_component(SoftBody& b, int comp) {
             sub_abt(T, &off_[(size_t)up.pj * 36], &off_[(size_t)up.pi * 36]);
         }
     }
+    comp_factored_[comp] = 1;
     // L L^T x = r
     for (int k = k0; k < k1; k++) {
         double* y = &rhs_[(size_t)k * 6];
@@ -2036,7 +2262,10 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
         }
     // (a part on mounts, a sheet on welds: held by them; a part's frame and its skin go together)
     for (const FrameMount& m : mounts)
-        if (!m.broken) join(m.a, m.b), other[m.a] = other[m.b] = 1;
+        if (!m.broken) {
+            join(m.a, m.b), other[m.a] = other[m.b] = 1;
+            for (int k = 1; k < m.nb; k++) join(m.a, m.bn[k]), other[m.bn[k]] = 1;
+        }
     for (const Weld& wd : b.welds) {
         if (wd.broken) continue;
         for (uint32_t i = wd.first; i < wd.first + wd.count && i < b.weld_nodes.size(); i++) join(wd.anchor, b.weld_nodes[i]);
@@ -2175,8 +2404,13 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
 void FemFrame::renumber(const SoftBody& b, const std::vector<uint32_t>& nidx) {
     for (uint32_t& v : node)
         if (v < nidx.size()) v = nidx[v];
-    for (FrameMount& m : mounts)
-        if (m.a < nidx.size() && m.b < nidx.size()) m.a = nidx[m.a], m.b = nidx[m.b];
+    for (FrameMount& m : mounts) {
+        auto re = [&](uint32_t& v) {
+            if (v < nidx.size()) v = nidx[v];
+        };
+        re(m.a), re(m.b), re(m.b2);
+        for (int k = 0; k < 4; k++) re(m.an[k]), re(m.bn[k]);
+    }
     slot_.assign(b.nodes.size(), -1);
     for (size_t i = 0; i < node.size(); i++)
         if (node[i] < slot_.size()) slot_[node[i]] = (int32_t)i;
@@ -2234,11 +2468,18 @@ void FemFrame::split_off(SoftBody& b, const std::vector<int>& part_of, const std
             }
     // the kept frame: its nodes renumbered (those gone are unused now), then compacted; a mount with an end gone lets go
     for (FrameMount& m : mounts) {
-        if (m.a >= part_of.size() || m.b >= part_of.size() || part_of[m.a] >= 0 || part_of[m.b] >= 0) {
+        auto gone = [&](uint32_t v) { return v >= part_of.size() || part_of[v] >= 0; };
+        bool off = gone(m.a) || gone(m.b) || (m.kind == MountKind::Hinge && gone(m.b2));
+        for (int k = 0; k < m.na; k++) off |= gone(m.an[k]);
+        for (int k = 0; k < m.nb; k++) off |= gone(m.bn[k]);
+        if (off) {
             m.broken = true;
             continue;
         }
         m.a = nidx[m.a], m.b = nidx[m.b];
+        if (m.kind == MountKind::Hinge) m.b2 = nidx[m.b2];
+        for (int k = 0; k < m.na; k++) m.an[k] = nidx[m.an[k]];
+        for (int k = 0; k < m.nb; k++) m.bn[k] = nidx[m.bn[k]];
     }
     for (uint32_t& v : node) v = v < part_of.size() && part_of[v] < 0 ? nidx[v] : 0;
     slot_.assign(b.nodes.size(), -1);
@@ -2275,19 +2516,53 @@ int FemFrame::break_near(SoftBody& b, vec3 p, float r) {
         n += cut(b, (uint32_t)ei, t);
     }
     // the triangles within reach: torn out
-    for (FrameTri& t : tris) {
+    for (size_t ti = 0; ti < tris.size(); ti++) {
+        const FrameTri& t = tris[ti];
         if (t.broken) continue;
         vec3 bary;
         const vec3 c = closest_on_triangle(p, b.nodes[node[t.n[0]]].p, b.nodes[node[t.n[1]]].p, b.nodes[node[t.n[2]]].p, bary);
         if (length2(c - p) > r * r) continue;
-        t.broken = true;
-        if (t.coll >= 0 && t.coll < (int)b.tris.size()) b.tris[t.coll].torn = true;
-        tris_torn++;
-        ready_ = false;
-        n++;
+        n += tear_tri(b, (uint32_t)ti);
     }
     finish_cuts(b, n);
     return n;
+}
+
+int FemFrame::component_of(uint32_t body_node) const {
+    const int sl = slot(body_node);
+    if (sl < 0 || (size_t)sl >= iperm_.size()) return -1;
+    const int k = iperm_[sl];
+    for (size_t c = 0; c < comp_range_.size(); c++)
+        if (k >= comp_range_[c].first && k < comp_range_[c].second) return (int)c;
+    return -1;
+}
+
+int FemFrame::release_latches(SoftBody& b) {
+    std::vector<int> hinged;
+    for (const FrameMount& m : mounts)
+        if (!m.broken && m.kind == MountKind::Hinge) hinged.push_back(component_of(m.b));
+    int n = 0;
+    for (FrameMount& m : mounts) {
+        if (m.broken || m.kind != MountKind::Point) continue;
+        const int c = component_of(m.b);
+        if (c < 0 || std::find(hinged.begin(), hinged.end(), c) == hinged.end()) continue;
+        m.broken = true;
+        mounts_broken++;
+        b.stats.broken_beams++;
+        n++;
+    }
+    if (n) b.wake();
+    return n;
+}
+
+int FemFrame::tear_tri(SoftBody& b, uint32_t ti) {
+    if (ti >= tris.size() || tris[ti].broken) return 0;
+    FrameTri& t = tris[ti];
+    t.broken = true;
+    if (t.coll >= 0 && t.coll < (int)b.tris.size()) b.tris[t.coll].torn = true;
+    tris_torn++;
+    ready_ = false;
+    return 1;
 }
 
 int FemFrame::cut(SoftBody& b, uint32_t ei, float t) {

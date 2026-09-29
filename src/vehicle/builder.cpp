@@ -715,12 +715,6 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
             // (the mass it put on its nodes: its share of the dry mass and its own; moved along when it splits or tears)
             body.fem.elems[e].mass = frame_mass[bi];
         }
-        // the parts on the frame at a distance (`mounts`): both ends frame nodes
-        for (const auto& m : d.mounts)
-            if (m.a >= 0 && m.b >= 0 && m.a < N && m.b < N && body.fem.slot((uint32_t)m.a) >= 0 && body.fem.slot((uint32_t)m.b) >= 0)
-                body.fem.add_mount((uint32_t)m.a, (uint32_t)m.b, m.brk, m.k, m.damp);
-            else
-                warnings.push_back(format("mount %d-%d: not between two frame nodes", m.a, m.b));
     }
     // ---- triangle elements (FEM shells: phys::FrameTri) on frame nodes of their own or the members'
     if (!d.fem_tris.empty()) {
@@ -735,6 +729,16 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
             const uint32_t k = body.fem.add_tri((uint32_t)t.n1, (uint32_t)t.n2, (uint32_t)t.n3, (uint16_t)shell_id[t.shell], (int32_t)ti, fem_tri_coll[ti]);
             body.fem.tris[k].mass = body.fem.shell_sections[shell_id[t.shell]].mass_per_m2() * 0.5f * length(cross(pos[t.n2] - pos[t.n1], pos[t.n3] - pos[t.n1]));
         }
+    }
+    // ---- the parts on the frame at a distance (`mounts`): both ends frame nodes (the members' or the triangles')
+    for (const auto& m : d.mounts) {
+        const phys::MountKind kind = m.kind == 'c' ? phys::MountKind::Clamp : m.kind == 'h' ? phys::MountKind::Hinge : m.kind == 's' ? phys::MountKind::Stop
+                                     : m.kind == 'r' ? phys::MountKind::Strap : phys::MountKind::Point;
+        const bool b2_ok = kind != phys::MountKind::Hinge || (m.b2 >= 0 && m.b2 < N && body.fem.slot((uint32_t)m.b2) >= 0);
+        if (m.a >= 0 && m.b >= 0 && m.a < N && m.b < N && body.fem.slot((uint32_t)m.a) >= 0 && body.fem.slot((uint32_t)m.b) >= 0 && b2_ok)
+            body.fem.add_mount((uint32_t)m.a, (uint32_t)m.b, m.brk, m.k, m.damp, kind, m.param, (uint32_t)std::max(0, m.b2));
+        else
+            warnings.push_back(format("mount %d-%d: not between frame nodes", m.a, m.b));
     }
     if (!body.fem.empty()) body.fem.finalize(body);
     drive.hydros.clear();

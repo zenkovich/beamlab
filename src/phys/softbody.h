@@ -22,6 +22,8 @@
 namespace bl::phys {
 
 constexpr float kDefaultDt = 0.0005f; // 2000 Hz like RoR
+constexpr int kFrameEvery = 1;        // the FEM frames' implicit step every this many substeps: 2000 Hz (WorldSettings::frame_every)
+constexpr int kFrameEveryLag = 2;     // ... in a frame that lags (WorldSettings::frame_every_lag): 1000 Hz
 
 enum NodeFlag : uint16_t {
     NF_NONE = 0,
@@ -502,6 +504,8 @@ public:
     float rest_damp = 0, rest_speed = 0.5f;
     float rest_roll = 0;                // (m/s2) rolling resistance on the ground, at any speed
     bool fem_every_step = false;        // its frame solved in every short step (a sub-cycled sheet whose nodes the frame shares)
+    int fem_left = 0;                   // substeps until its frame's next step (0: this one)
+    int fem_period = 1;                 // the substeps its frame's last step spans (WorldSettings::frame_every[_lag])
     float fem_dissipation = -1.0f;      // its frame's implicit step's numerical damping (-1: the world's frame_dissipation)
     float rest_friction = 1.0f;         // the ground friction's factor at rest (a dented drum's skin trembled a little
                                         // and walked it across the ground on its friction)
