@@ -445,15 +445,34 @@ void App::frame(float dt) {
         }
     }
     if (!m_opt.drive.empty()) {
-        float thr = 0, st = 0, br = 0;
+        float thr = 0, st = 0, br = 0, period = 0;
         int cmd = 0;
-        sscanf(m_opt.drive.c_str(), "%f,%f,%f,%d", &thr, &st, &br, &cmd);
+        sscanf(m_opt.drive.c_str(), "%f,%f,%f,%d,%f", &thr, &st, &br, &cmd, &period);
         vin.throttle = thr;
         vin.steer = st;
+        // (a period s: the steering swept from side to side, a sine of that period - "in all directions")
+        if (period > 0) vin.steer = st * std::sin(2.0f * kPi * (float)m_frame_index / (60.0f * period));
         vin.brake = br;
         vin.command_key = cmd;
+        // BL_ORBIT=cx,cz,r[,period s[,top km/h]]: the test driver drives round a circle of radius r about (cx, cz),
+        // turning the other way round every period, the throttle off above the top speed (steering to a point on the
+        // circle 8 m ahead)
+        if (const char* orb = getenv("BL_ORBIT"); orb && m_game.player_vehicle()) {
+            float cx = 0, cz = 0, r = 15, per = 0, top = 1e9f;
+            sscanf(orb, "%f,%f,%f,%f,%f", &cx, &cz, &r, &per, &top);
+            Vehicle* v = m_game.player_vehicle();
+            const float t = (float)m_frame_index / 60.0f;
+            const float dir = per > 0 && ((int)(t / per) & 1) ? -1.0f : 1.0f;
+            const vec3 p = v->position(), f = v->forward();
+            const float th = std::atan2(p.z - cz, p.x - cx) + dir * 8.0f / std::max(r, 1.0f);
+            const vec3 tgt(cx + r * std::cos(th), p.y, cz + r * std::sin(th));
+            const vec3 to = normalize_or(vec3(tgt.x - p.x, 0, tgt.z - p.z), f);
+            const vec3 fh = normalize_or(vec3(f.x, 0, f.z), to);
+            vin.steer = clampf(-2.0f * std::asin(clampf(cross(fh, to).y, -1, 1)), -1, 1);
+            if (v->speed_kmh() > top) vin.throttle = 0;
+        }
         // steer 0 = test driver holds the initial heading (asymmetric models and open diffs pull to one side)
-        if (Vehicle* v = m_game.player_vehicle(); v && st == 0) {
+        else if (Vehicle* v = m_game.player_vehicle(); v && st == 0) {
             static vec3 hold_dir(0), hold_pos(0);
             vec3 f = v->forward();
             f.y = 0;
@@ -499,7 +518,7 @@ void App::frame(float dt) {
                 printf("f %d node %d m %.3f p (%.3f %.3f %.3f) v (%.2f %.2f %.2f) |v| %.2f\n", m_frame_index, i, n.mass, n.p.x, n.p.y, n.p.z, n.v.x, n.v.y, n.v.z, length(n.v));
             }
         }
-        if (Vehicle* v = m_game.player_vehicle(); v && m_frame_index % 30 == 0 && getenv("BL_WHEELDBG")) {
+        if (Vehicle* v = m_game.player_vehicle(); v && m_frame_index % (getenv("BL_WHEELEVERY") ? atoi(getenv("BL_WHEELEVERY")) : 30) == 0 && getenv("BL_WHEELDBG")) {
             const auto& b = *v->body;
             for (const auto& w : b.wheels) {
                 vec3 a0 = b.nodes[w.axle0].p, a1 = b.nodes[w.axle1].p, ax = normalize(a1 - a0);
@@ -516,7 +535,9 @@ void App::frame(float dt) {
                 // toe (the axle turned about the vertical against the body's side axis) and camber (its tilt)
                 const vec3 f = v->forward(), l = v->left();
                 const float side = dot(ax, l) >= 0 ? 1.0f : -1.0f;
-                const float toe = std::atan2(dot(ax, f) * side, std::fabs(dot(ax, l))) * kRad2Deg, camber = std::asin(clampf(ax.y * side, -1, 1)) * kRad2Deg;
+                // (camber against the body's up, not the world's: the body's roll is not the wheel's)
+                const float toe = std::atan2(dot(ax, f) * side, std::fabs(dot(ax, l))) * kRad2Deg,
+                            camber = std::asin(clampf(dot(ax, v->up()) * side, -1, 1)) * kRad2Deg;
                 printf("    wheel r=%.3f (min %.3f max %.3f, def %.3f) axle %.3f speed %.1f torque %.0f brake %.0f hub y %.2f tyre ymin %.3f toe %.2f camber %.2f deg\n",
                        rs / w.nodes.size(), rmin, rmax, w.radius, length(a1 - a0), w.speed, w.last_torque, w.brake, a0.y, ymin, toe, camber);
             }
@@ -675,6 +696,9 @@ void App::frame(float dt) {
             printf("fem f%d %-24s tris %4zu torn %3d dented %4d peak %.2f failed %d sleep %d fastest %.3f centre (%.3f %.3f %.3f) lowest %.3f\n", m_frame_index,
                    b->name.c_str(), f.tris.size(), f.tris_torn, dented, peak, f.solve_failures, (int)b->sleeping, fast, c.x, c.y, c.z, low);
             if (getenv("BL_FEMFAST")) printf("    fastest node at (%.3f %.3f %.3f)\n", fp.x - c.x, fp.y - c.y, fp.z - c.z);
+            if (getenv("BL_FEMDENT")) // (the dented triangles: their index in the truck's fem_tris, the plastic stretch)
+                for (const phys::FrameTri& t : f.tris)
+                    if (t.broken || t.dmg > 0) printf("    dent %d %.4f%s\n", t.tag, t.dmg, t.broken ? " torn" : "");
         }
     if (const char* en = getenv("BL_ENERGYDBG")) // (a body's energy every frame: its motion as a whole, the rest, its height)
         for (auto& b : m_game.world.bodies())
@@ -790,10 +814,66 @@ void App::frame(float dt) {
             if (!v->body->fem.empty())
                 printf(" | frame: %zu members, %d splits, %d torn, %d failed solves, %d clamps", v->body->fem.elems.size(), v->body->fem.splits, v->body->fem.broken,
                        v->body->fem.solve_failures, v->body->fem.clamps);
+            if (const char* wn = getenv("BL_WHEELNODES")) { // (diagnostics: wheel n's axle nodes and the frame members at them)
+                const phys::SoftBody& b = *v->body;
+                const int k = atoi(wn);
+                if (k >= 0 && k < (int)b.wheels.size()) {
+                    const auto& w = b.wheels[k];
+                    const vec3 fw = v->forward(), upv = v->up(), lf = normalize_or(cross(upv, fw), vec3(1, 0, 0)), o = v->position();
+                    auto loc = [&](uint32_t n) { const vec3 d = b.nodes[n].p - o; return vec3(dot(d, fw), dot(d, upv), dot(d, lf)); };
+                    const vec3 a0 = loc(w.axle0), a1 = loc(w.axle1);
+                    printf("\n  wheel %d axle0 %u (%.2f %.2f %.2f) axle1 %u (%.2f %.2f %.2f)", k, w.axle0, a0.x, a0.y, a0.z, w.axle1, a1.x, a1.y, a1.z);
+                    for (size_t ei = 0; ei < b.fem.elems.size(); ei++) {
+                        const phys::FrameElement& e = b.fem.elems[ei];
+                        const uint32_t na = b.fem.node[e.a], nb = b.fem.node[e.b];
+                        if (na != w.axle0 && nb != w.axle0 && na != w.axle1 && nb != w.axle1) continue;
+                        const vec3 pa = loc(na), pb = loc(nb);
+                        printf("\n    member %zu %u-%u (%.2f %.2f %.2f)-(%.2f %.2f %.2f) Mp %.0f ends %d/%d level %d torn %d dmg %.3f broken %d", ei, na, nb, pa.x, pa.y, pa.z, pb.x,
+                               pb.y, pb.z, b.fem.sections[e.section].Mp, e.end_a, e.end_b, e.level, e.torn, e.damage, (int)e.broken);
+                    }
+                }
+            }
+            if (getenv("BL_SUSPDBG")) { // (diagnostics: the wheels' beams bent for good, the frame's members bent for good)
+                const phys::SoftBody& b = *v->body;
+                std::vector<char> in(b.nodes.size(), 0);
+                float wmax = 0;
+                int wbent = 0;
+                for (size_t k = 0; k < b.wheels.size(); k++) {
+                    const auto& w = b.wheels[k];
+                    std::fill(in.begin(), in.end(), 0);
+                    for (uint32_t n : w.nodes) in[n] = 1;
+                    for (uint32_t n : w.rim) in[n] = 1;
+                    in[w.axle0] = in[w.axle1] = 1;
+                    for (const phys::Beam& bm : b.beams)
+                        if (in[bm.a] && in[bm.b] && bm.L0 > 0 && !(bm.flags & phys::BF_BROKEN)) {
+                            const float pl = std::fabs(bm.L / bm.L0 - 1.0f);
+                            wmax = std::max(wmax, pl), wbent += pl > 0.01f;
+                        }
+                }
+                int bent = 0;
+                float dmax = 0;
+                std::vector<std::pair<float, size_t>> worst;
+                for (size_t ei = 0; ei < b.fem.elems.size(); ei++) {
+                    const phys::FrameElement& e = b.fem.elems[ei];
+                    if (e.broken) continue;
+                    bent += e.damage > 2e-3f, dmax = std::max(dmax, e.damage);
+                    if (e.damage > 2e-3f) worst.push_back({e.damage, ei});
+                }
+                printf(" | up %.2f | wheels: %d beams bent >1%%, most %.1f%% | frame: %d members bent (most %.3f rad)", v->up().y, wbent, wmax * 100.0f, bent, dmax);
+                // (the worst: their section's plastic moment and where, in the car's axes: forward, up, left)
+                std::sort(worst.rbegin(), worst.rend());
+                const vec3 fw = v->forward(), upv = v->up(), lf = normalize_or(cross(upv, fw), vec3(1, 0, 0)), o = v->position();
+                for (size_t k = 0; k < worst.size() && k < 4; k++) {
+                    const phys::FrameElement& e = b.fem.elems[worst[k].second];
+                    const vec3 m = (b.nodes[b.fem.node[e.a]].p + b.nodes[b.fem.node[e.b]].p) * 0.5f - o;
+                    printf(" [%.3f Mp %.0f at %.2f %.2f %.2f]", worst[k].first, b.fem.sections[e.section].Mp, dot(m, fw), dot(m, upv), dot(m, lf));
+                }
+            }
             if (const phys::FemFrame& f = v->body->fem; !f.tris.empty()) { // (its FEM triangles: how many torn out, dented for good)
                 int dented = 0;
                 for (const phys::FrameTri& t : f.tris) dented += !t.broken && t.dmg > 0;
                 printf(" | tris %zu, %d torn, %d dented", f.tris.size(), f.tris_torn, dented);
+                if (!f.mounts.empty()) printf(", mounts %d of %zu let go", f.mounts_broken, f.mounts.size());
             }
             if (!v->body->welds.empty()) {
                 // (and how the panels shake on their welds: the welded nodes' centre against the frame's point, rms and most)
@@ -822,14 +902,19 @@ void App::frame(float dt) {
         }
     if (m_opt.launch_kmh > 0 && m_frame_index == 5)
         if (Vehicle* v = m_game.player_vehicle()) v->launch(v->forward() * (m_opt.launch_kmh / 3.6f));
-    if (!m_opt.action.empty() && m_frame_index == 5) {
-        for (const SceneAction& a : m_game.scene_actions)
-            if (a.label.find(m_opt.action) != std::string::npos) {
-                log_info("scene action: %s", a.label.c_str());
-                a.run(m_game);
-                break;
-            }
-    }
+    if (!m_opt.action.empty()) // (the scene's actions by their labels' parts: "label[@frame]; ..." - at frame 5 by default)
+        for (const std::string& item : split_any(m_opt.action, ";")) {
+            const size_t at = item.rfind('@');
+            const std::string label = trim(item.substr(0, at));
+            const int frame = at == std::string::npos ? 5 : atoi(item.c_str() + at + 1);
+            if (m_frame_index != frame || label.empty()) continue;
+            for (const SceneAction& a : m_game.scene_actions)
+                if (a.label.find(label) != std::string::npos) {
+                    log_info("scene action: %s", a.label.c_str());
+                    a.run(m_game);
+                    break;
+                }
+        }
     if (!m_opt.laser.empty()) {
         // test: a laser sweep across the screen: "x0,y0,x1,y1[,first frame,frames]" in screen fractions (y down)
         float x0 = 0.3f, y0 = 0.5f, x1 = 0.7f, y1 = 0.5f, f0 = 30, nf = 30;

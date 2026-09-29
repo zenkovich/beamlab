@@ -391,8 +391,11 @@ void Game::draw_debug(Renderer& r) {
                 if (e.end_a > 0 && e.end_a < 6 && Lm > 1e-4f) r.point(a + (c - a) * std::min(0.2f, 0.06f / Lm), jcol[e.end_a]);
                 if (e.end_b > 0 && e.end_b < 6 && Lm > 1e-4f) r.point(c + (a - c) * std::min(0.2f, 0.06f / Lm), jcol[e.end_b]);
             }
-            // triangle elements (FEM shells): their edges, steel blue, orange where the plate has yielded; by stress their
-            // load against the yield, green -> red
+            // triangle elements (FEM shells): their edges, blue, orange where the plate has yielded; by stress their load
+            // against the yield, green -> red. On the plate's face towards the camera (the plate is drawn as a slab of
+            // its thickness round the elements' plane: 1 px lines in that plane were inside it, hidden), a little further
+            // with distance for the depth buffer's precision
+            const float tw = std::max(2.0f, debug.beam_px * 1.5f);
             for (const phys::FrameTri& t : b.fem.tris) {
                 if (t.broken) continue;
                 uint32_t col;
@@ -400,9 +403,14 @@ void Game::draw_debug(Renderer& r) {
                     const float u = clampf(t.util, 0, 1);
                     col = Renderer::rgba(0.2f + 0.8f * u, 0.9f - 0.7f * u, 0.2f);
                 } else {
-                    col = t.dmg > 0 ? Renderer::rgba(1.0f, 0.55f, 0.15f) : Renderer::rgba(0.45f, 0.62f, 0.95f);
+                    col = t.dmg > 0 ? Renderer::rgba(1.0f, 0.5f, 0.05f) : Renderer::rgba(0.15f, 0.45f, 1.0f);
                 }
-                for (int k = 0; k < 3; k++) r.line(b.nodes[b.fem.node[t.n[k]]].p, b.nodes[b.fem.node[t.n[(k + 1) % 3]]].p, col);
+                const vec3 p0 = b.nodes[b.fem.node[t.n[0]]].p, p1 = b.nodes[b.fem.node[t.n[1]]].p, p2 = b.nodes[b.fem.node[t.n[2]]].p;
+                const vec3 n = normalize_or(cross(p1 - p0, p2 - p0), vec3(0));
+                const vec3 to_cam = m_last_cam.pos - (p0 + p1 + p2) * (1.0f / 3);
+                const vec3 up = n * ((dot(to_cam, n) >= 0 ? 1.0f : -1.0f) *
+                                     (0.5f * b.fem.shell_sections[t.section].t + 0.002f + 0.0008f * length(to_cam)));
+                r.thick_line(p0 + up, p1 + up, col, tw), r.thick_line(p1 + up, p2 + up, col, tw), r.thick_line(p2 + up, p0 + up, col, tw);
             }
             // triangle elements: each edge once, on the face towards the camera. Pale blue (not the beams' grey: they are
             // no beams), the authored border brighter; plastically stretched or shortened (> 1%) orange; cracks and cuts

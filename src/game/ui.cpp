@@ -12,6 +12,7 @@
 
 #include <GLFW/glfw3.h>
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <ctime>
 #include <unistd.h>
@@ -181,46 +182,129 @@ void App::ui_main_menu() {
     }
     ImGui::Separator();
 
-    // ---- scene selector
+    // (a dropdown's arrow at the right end of a menu bar's selector: the menu item's rect kept from a frame it was closed
+    // - an open one's BeginMenu has made its popup the current window - drawn into the menu bar's draw list)
+    struct ArrowAt {
+        ImVec2 mn, mx;
+    };
+    auto dropdown_arrow = [](ImDrawList* bar, bool open, ArrowAt& at) {
+        if (!open) at.mn = ImGui::GetItemRectMin(), at.mx = ImGui::GetItemRectMax();
+        const float h = at.mx.y - at.mn.y, sz = ImGui::GetFontSize();
+        if (h > 0)
+            ImGui::RenderArrow(bar, ImVec2(at.mx.x - sz * 1.15f, at.mn.y + (h - sz) * 0.5f + sz * 0.05f), ImGui::GetColorU32(ImGuiCol_Text), ImGuiDir_Down, 0.7f);
+    };
+    // ---- scene selector: a menu of the categories (a category "A/B" is a submenu B of A), the current one's name on it
     const auto& scenes = scene_registry();
     ImGui::TextDisabled("World");
-    ImGui::SetNextItemWidth(200);
     const char* cur_scene = m_game.scene_index >= 0 ? scenes[m_game.scene_index].name.c_str() : "-";
-    if (ImGui::BeginCombo("##scene", cur_scene, ImGuiComboFlags_HeightLarge)) {
-        std::string last_cat;
-        for (int i = 0; i < (int)scenes.size(); i++) {
-            if (scenes[i].category != last_cat) {
-                ImGui::SeparatorText(scenes[i].category.c_str());
-                last_cat = scenes[i].category;
+    {
+        char label[160];
+        snprintf(label, sizeof label, "%s     ###scenemenu", cur_scene); // (room for the dropdown's arrow)
+        static ArrowAt at;
+        ImDrawList* bar = ImGui::GetWindowDrawList();
+        const bool open = ImGui::BeginMenu(label);
+        dropdown_arrow(bar, open, at);
+        if (open) {
+            // the items of one menu: the scenes of `path`, then its submenus in the order they first come
+            std::function<void(const std::string&)> items = [&](const std::string& path) {
+                std::vector<std::string> subs;
+                for (int i = 0; i < (int)scenes.size(); i++) {
+                    const std::string& c = scenes[i].category;
+                    if (c == path) {
+                        // (the submenu's name off the item's: "Frame Car: Head-on" in Frame Car is "Head-on")
+                        std::string name = scenes[i].name;
+                        const std::string leaf = path.substr(path.rfind('/') == std::string::npos ? 0 : path.rfind('/') + 1);
+                        if (name.rfind(leaf + ": ", 0) == 0) name = name.substr(leaf.size() + 2);
+                        if (ImGui::MenuItem(name.c_str(), nullptr, i == m_game.scene_index)) select_scene(i);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", scenes[i].description.c_str());
+                    } else if (c.size() > path.size() + 1 && c.compare(0, path.size() + 1, path + "/") == 0) {
+                        const std::string sub = c.substr(0, c.find('/', path.size() + 1));
+                        if (std::find(subs.begin(), subs.end(), sub) == subs.end()) subs.push_back(sub);
+                    }
+                }
+                for (const std::string& sub : subs)
+                    if (ImGui::BeginMenu(sub.substr(path.size() + 1).c_str())) {
+                        items(sub);
+                        ImGui::EndMenu();
+                    }
+            };
+            std::vector<std::string> tops;
+            for (const SceneInfo& sc : scenes) {
+                const std::string t = sc.category.substr(0, sc.category.find('/'));
+                if (std::find(tops.begin(), tops.end(), t) == tops.end()) tops.push_back(t);
             }
-            bool sel = i == m_game.scene_index;
-            if (ImGui::Selectable(scenes[i].name.c_str(), sel)) select_scene(i);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", scenes[i].description.c_str());
+            for (const std::string& t : tops)
+                if (ImGui::BeginMenu(t.c_str())) {
+                    items(t);
+                    ImGui::EndMenu();
+                }
+            ImGui::EndMenu();
         }
-        ImGui::EndCombo();
     }
-    // ---- vehicle selector
+    // ---- vehicle selector: a menu of the kinds of vehicle, a vehicle of several variants a submenu of them
     const auto& vehs = vehicle_registry();
     ImGui::TextDisabled("Vehicle");
-    ImGui::SetNextItemWidth(260);
     const VehicleEntry* cur = find_vehicle(m_game.selected_vehicle);
     // (scenes without a player vehicle: free camera only)
     ImGui::BeginDisabled(m_game.no_player_vehicle);
     const char* shown = m_game.no_player_vehicle ? "- (free camera)" : cur ? cur->title.c_str() : "-";
-    if (ImGui::BeginCombo("##vehicle", shown, ImGuiComboFlags_HeightLargest)) {
-        std::string last_group;
-        for (const auto& e : vehs) {
-            if (e.group != last_group) {
-                ImGui::SeparatorText(e.group.c_str());
-                last_group = e.group;
+    {
+        char label[200];
+        snprintf(label, sizeof label, "%s     ###vehiclemenu", shown);
+        static ArrowAt at;
+        ImDrawList* bar = ImGui::GetWindowDrawList();
+        const bool open = ImGui::BeginMenu(label);
+        dropdown_arrow(bar, open, at);
+        if (open) {
+            static const char* kKinds[] = {"Cars", "SUVs, vans, pickups", "Off-road", "Trucks", "Buses", "BeamLab test cars", "Editor models", "Trailers and loads",
+                                           "Other"};
+            auto kind_of = [](const VehicleEntry& e) {
+                static const std::pair<const char*, int> folders[] = {
+                    {"audi_80", 0}, {"audi_quattro", 0}, {"bmw_e36", 0}, {"bmw_e39_m5", 0}, {"dodge_viper", 0}, {"mercedes_clk", 0}, {"seat_ibiza", 0},
+                    {"toyota_ae86", 0}, {"ford_f250_2014", 1}, {"ford_f_1999", 1}, {"mercedes_vito", 1}, {"mercedes_w460", 1}, {"mitsubishi_pajero", 1},
+                    {"trophy_truck_v2", 2}, {"autocar_xpeditor", 3}, {"freightliner_fla", 3}, {"kenworth_wrecker", 3}, {"kme_predator", 3}, {"lcf_trucks", 3},
+                    {"tatra_815_6x6", 3}, {"thomas_hdx_bus", 4}, {"man_caetano_enigma", 4}, {"frame_car", 5}, {"buggy", 5}, {"shell_car", 5}, {"sheet_car", 5},
+                    {"yaris_biw", 5}, {"editor", 6}};
+                if (!e.drivable) return 7;
+                for (const auto& [f, k] : folders)
+                    if (e.folder == f) return k;
+                return 8;
+            };
+            for (int k = 0; k < (int)(sizeof kKinds / sizeof kKinds[0]); k++) {
+                bool any = false;
+                for (const auto& e : vehs) any |= kind_of(e) == k;
+                if (!any || !ImGui::BeginMenu(kKinds[k])) continue;
+                std::vector<std::string> done; // (the folders listed)
+                for (const auto& e : vehs) {
+                    if (kind_of(e) != k || std::find(done.begin(), done.end(), e.folder) != done.end()) continue;
+                    done.push_back(e.folder);
+                    std::vector<const VehicleEntry*> vs;
+                    for (const auto& x : vehs)
+                        if (x.folder == e.folder && kind_of(x) == k) vs.push_back(&x);
+                    auto item = [&](const VehicleEntry& x) {
+                        ImGui::PushID(x.id.c_str());
+                        if (ImGui::MenuItem(x.title.c_str(), nullptr, cur && cur->id == x.id)) select_vehicle(x.id, true);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", x.type.c_str(), path_filename(x.file).c_str());
+                        ImGui::PopID();
+                    };
+                    if (vs.size() == 1 || k == 6) { // (one variant, or the editor's own models: each on its own)
+                        for (const VehicleEntry* x : vs) item(*x);
+                    } else {
+                        // (the folder's name without its authors, who are in the tooltip)
+                        const size_t par = e.group.rfind(" (");
+                        const std::string name = par != std::string::npos && e.group.back() == ')' ? e.group.substr(0, par) : e.group;
+                        const bool open_sub = ImGui::BeginMenu((name + "##" + e.folder).c_str());
+                        if (!open_sub && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.group.c_str());
+                        if (open_sub) {
+                            for (const VehicleEntry* x : vs) item(*x);
+                            ImGui::EndMenu();
+                        }
+                    }
+                }
+                ImGui::EndMenu();
             }
-            bool sel = cur && cur->id == e.id;
-            ImGui::PushID(e.id.c_str());
-            if (ImGui::Selectable(e.title.c_str(), sel)) select_vehicle(e.id, true);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", e.type.c_str(), path_filename(e.file).c_str());
-            ImGui::PopID();
+            ImGui::EndMenu();
         }
-        ImGui::EndCombo();
     }
     ImGui::EndDisabled();
     if (ImGui::Button("Reset")) {
