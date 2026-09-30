@@ -9,25 +9,13 @@
 
 namespace bl::phys {
 
-int SoftBody::add_volume(const std::string& name, const std::vector<uint32_t>& anchors, const std::vector<vec3>& points, float break_rms) {
-    std::vector<uint32_t> an;
-    for (uint32_t a : anchors)
-        if (a < nodes.size() && std::find(an.begin(), an.end(), a) == an.end()) an.push_back(a);
-    if (an.size() < 3 || points.size() < 4 || points.size() > 64) return -1;
-    CollisionVolume cv;
-    cv.name = name;
-    cv.anchors = an;
-    cv.break_rms = break_rms > 0 ? break_rms : 0.12f;
-    vec3 c0(0);
-    for (uint32_t a : an) c0 += nodes[a].p;
-    c0 = c0 / (float)an.size();
-    for (uint32_t a : an) cv.rest.push_back(nodes[a].p - c0);
-    for (vec3 p : points) cv.verts.push_back(p - c0);
-    // the hull's faces: the planes through three of its points with all the others behind (brute force: a few dozen)
-    const std::vector<vec3>& V = cv.verts;
+bool convex_hull(const std::vector<vec3>& V, std::vector<vec4>& planes, std::vector<std::vector<uint8_t>>& faces) {
+    planes.clear(), faces.clear();
     const int n = (int)V.size();
+    if (n < 4 || n > 255) return false;
+    // the faces: the planes through three of the points with all the others behind (brute force: a few dozen points)
     float span = 0;
-    for (const vec3& p : V) span = std::max(span, length(p));
+    for (const vec3& p : V) span = std::max(span, length(p - V[0]));
     const float eps = 1e-4f * std::max(1.0f, span);
     for (int i = 0; i < n; i++)
         for (int j = i + 1; j < n; j++)
@@ -45,12 +33,15 @@ int SoftBody::add_volume(const std::string& name, const std::vector<uint32_t>& a
                 if (above && below) continue;
                 if (above) nn = -nn, d = -d; // (all behind: the outward normal)
                 bool dup = false;
-                for (const vec4& pl : cv.planes) dup |= dot(pl.xyz(), nn) > 0.9999f && std::fabs(pl.w - d) < eps;
-                if (!dup) cv.planes.push_back(vec4(nn, d));
+                for (const vec4& pl : planes) dup |= dot(pl.xyz(), nn) > 0.9999f && std::fabs(pl.w - d) < eps;
+                if (!dup) planes.push_back(vec4(nn, d));
             }
-    if (cv.planes.size() < 4) return -1;
-    // each face's vertices in order round its centre (the debug view's outline)
-    for (const vec4& pl : cv.planes) {
+    if (planes.size() < 4) {
+        planes.clear();
+        return false;
+    }
+    // each face's points in order round its centre (the debug views' outline)
+    for (const vec4& pl : planes) {
         const vec3 nn = pl.xyz();
         std::vector<uint8_t> on;
         vec3 fc(0);
@@ -63,8 +54,26 @@ int SoftBody::add_volume(const std::string& name, const std::vector<uint32_t>& a
             const vec3 da = V[a] - fc, db = V[b] - fc;
             return std::atan2(dot(da, t), dot(da, u)) < std::atan2(dot(db, t), dot(db, u));
         });
-        cv.faces.push_back(on);
+        faces.push_back(on);
     }
+    return true;
+}
+
+int SoftBody::add_volume(const std::string& name, const std::vector<uint32_t>& anchors, const std::vector<vec3>& points, float break_rms) {
+    std::vector<uint32_t> an;
+    for (uint32_t a : anchors)
+        if (a < nodes.size() && std::find(an.begin(), an.end(), a) == an.end()) an.push_back(a);
+    if (an.size() < 3 || points.size() < 4 || points.size() > 64) return -1;
+    CollisionVolume cv;
+    cv.name = name;
+    cv.anchors = an;
+    cv.break_rms = break_rms > 0 ? break_rms : 0.12f;
+    vec3 c0(0);
+    for (uint32_t a : an) c0 += nodes[a].p;
+    c0 = c0 / (float)an.size();
+    for (uint32_t a : an) cv.rest.push_back(nodes[a].p - c0);
+    for (vec3 p : points) cv.verts.push_back(p - c0);
+    if (!convex_hull(cv.verts, cv.planes, cv.faces)) return -1;
     volumes.push_back(std::move(cv));
     return (int)volumes.size() - 1;
 }
@@ -139,13 +148,36 @@ void SoftBody::place_volumes() {
 int SoftBody::find_volume_parts() {
     static const bool off = getenv("BL_VOLPARTS_OFF") != nullptr; // (diagnostics: the volumes against the other bodies alone)
     if (volumes.empty() || off) return 0;
-    // the parts: components with triangles (panels, not the suspension's tubes) with a part's side of a mount in them
+    // the parts: the components with a part's side of a mount in them
     const int nc = fem.components();
     std::vector<char> part(std::max(nc, 0), 0);
     for (const FrameMount& m : fem.mounts)
-        if (const int c = fem.component_of(m.b); c >= 0 && fem.component_tris(c) > 0) part[c] = 1;
+        if (const int c = fem.component_of(m.b); c >= 0) part[c] = 1;
     std::vector<int> comp(nodes.size(), -1);
     for (uint32_t i = 0; i < nodes.size(); i++) comp[i] = fem.component_of(i);
+    // ... and the sheets welded to them: a sheet (its nodes joined through its shells) with a weld on a part's frame
+    // node goes with that part
+    if (!shells.empty() && !welds.empty()) {
+        std::vector<uint32_t> up(nodes.size());
+        for (uint32_t i = 0; i < up.size(); i++) up[i] = i;
+        auto find = [&](uint32_t x) {
+            while (up[x] != x) x = up[x] = up[up[x]];
+            return x;
+        };
+        std::vector<char> in_sheet(nodes.size(), 0);
+        for (const Shell& s : shells) {
+            for (int k = 0; k < 3; k++) in_sheet[s.n[k]] = 1;
+            for (int k = 1; k < 3; k++) up[find(s.n[k])] = find(s.n[0]);
+        }
+        std::vector<int> sheet(nodes.size(), -1);
+        for (const Weld& w : welds) {
+            const int c = w.anchor < comp.size() ? comp[w.anchor] : -1;
+            if (c < 0 || !part[c]) continue;
+            for (uint32_t k = w.first; k < w.first + w.count && k < weld_nodes.size(); k++) sheet[find(weld_nodes[k])] = c;
+        }
+        for (uint32_t i = 0; i < nodes.size(); i++)
+            if (comp[i] < 0 && in_sheet[i]) comp[i] = sheet[find(i)];
+    }
     static const bool dbg = getenv("BL_VOLDBG") != nullptr; // (diagnostics: the components and what each volume holds off)
     if (dbg)
         for (int c = 0; c < nc; c++) {
@@ -185,6 +217,11 @@ int SoftBody::find_volume_parts() {
         }
     }
     return inside;
+}
+
+void SoftBody::copy_node_refs(uint32_t like, uint32_t id) {
+    for (CollisionVolume& cv : volumes)
+        if (std::find(cv.parts.begin(), cv.parts.end(), like) != cv.parts.end()) cv.parts.push_back(id);
 }
 
 void SoftBody::remap_node_refs(const std::function<int64_t(uint32_t)>& map) {

@@ -824,6 +824,7 @@ void World::collide_volumes(Island& isl, float dt, bool bodies) {
             // its body's parts (a door pushed in, the hood folded back): their nodes out of it, the reaction on its anchors
             if (a_moves)
                 for (uint32_t i : V.parts) {
+                    if (i >= A.nodes.size()) continue;
                     const Node& x = A.nodes[i];
                     if (x.inv_mass <= 0) continue;
                     if (x.p.x < V.mn.x || x.p.x > V.mx.x || x.p.y < V.mn.y || x.p.y > V.mx.y || x.p.z < V.mn.z || x.p.z > V.mx.z) continue;

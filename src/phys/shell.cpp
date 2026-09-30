@@ -221,6 +221,7 @@ struct ShellOps {
         if (!b.node_base_mass.empty()) b.node_base_mass.push_back(0.0f); // (a copy or a midpoint: the sheet's alone)
         b.node_shells.emplace_back();
         dirty_node(id);
+        b.copy_node_refs(like, id); // (a part's sheet: the new node held off the volumes too)
         return id;
     }
     void write_tri(const Shell& s) {

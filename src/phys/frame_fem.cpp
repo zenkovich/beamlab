@@ -2068,8 +2068,7 @@ uint32_t clone_node(SoftBody& b, uint32_t like) {
     if (b.topo_log.nodes.size() < 100000) b.topo_log.nodes.push_back({id, like});
     else b.topo_log.overflow = true;
     b.contacter_count = -1;
-    for (CollisionVolume& cv : b.volumes) // (a part's node: its copy held off the volumes too)
-        if (std::find(cv.parts.begin(), cv.parts.end(), like) != cv.parts.end()) cv.parts.push_back(id);
+    b.copy_node_refs(like, id); // (a part's node: its copy held off the volumes too)
     return id;
 }
 

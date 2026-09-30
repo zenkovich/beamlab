@@ -237,6 +237,10 @@ struct CollisionVolume {
     }
 };
 
+// The convex hull of up to 255 points (a collision volume's; the model editor draws it): its faces' planes (n outwards,
+// w = d: inside n . x <= d) and each face's points in order round it. False if they span no volume (under 4 faces).
+bool convex_hull(const std::vector<vec3>& points, std::vector<vec4>& planes, std::vector<std::vector<uint8_t>>& faces);
+
 // Triangle element (sheets): three nodes held by the triangle's own three edge springs (solved like beams, with
 // plastic yield), bending hinges to the neighbours across its edges, drawn and collided as one face. It never
 // breaks as a whole:
@@ -525,8 +529,11 @@ public:
     void push_volume(CollisionVolume& cv, vec3 p, vec3 f); // a force f at p on it, onto its anchors (the force array)
     // Each volume's parts (after fem.finalize): the nodes of the frame's components held on by mounts (a part's side of
     // one) other than its anchors' - the hood, doors, lid, fenders, bumpers, not the body-in-white or the suspension -
-    // less the ones inside it as built. Returns those left out (inside) over all volumes.
+    // and of the sheets welded to them (a door's skin on its frame), less the ones inside it as built. Returns those left
+    // out (inside) over all volumes.
     int find_volume_parts();
+    // a node copied (a crack's, a sheet's midpoint: id from like): the copy held off the volumes where the node is
+    void copy_node_refs(uint32_t like, uint32_t id);
     // The body's nodes renumbered (map: old -> new, -1 gone): the volumes follow (one whose anchor is gone is off), and
     // the grab's nodes.
     void remap_node_refs(const std::function<int64_t(uint32_t)>& map);
