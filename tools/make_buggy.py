@@ -9,7 +9,9 @@ the rear clip (the engine cradle, the trailing arms' pivot beam, the rear shock 
 bumper). The body is aluminium sheet (triangle elements) welded on: the roof and the floor pan on the cage; the nose, the
 side panels and the engine cover are frames of their own, their skins welded to them, bolted on at a distance (mounts)
 and letting go past their bolts' strength - each a component of the frame solved on its own. A light bar on the roof,
-headlights on the nose, tail lights on the rear bumper.
+headlights on the nose, tail lights on the rear bumper. Two collision volumes (phys::CollisionVolume: convex hulls
+riding on the cage) stand for the crew in the cockpit and the engine, the transaxle and the fuel cell behind it, and
+keep other bodies and the racer's own panels out of them.
 
 Long-travel suspension: at the front double wishbones on ball joints, 0.6 m of travel, a coil-over from the lower ball
 joint to the shock tower, a steering rack behind the axle (the frame car's: a bar sliding along its housing, a hydro,
@@ -398,6 +400,23 @@ for s in (1, -1):
     hull_tri(RF(s), RR(s), MH(s, 1.30))
     hull_quad(MH(s, Y0), MH(s, 1.30), TT(s), TL(s))                                  # the rear's sides
 orient_hull()
+
+# ---- the collision volumes (phys::CollisionVolume): what fills the racer, as convex hulls riding on the cage, close
+# under its panels (a few centimetres off their frames) - the crew and the seats in the cockpit (on its floor, the door
+# bars' ends and the harness bar; inside the side panels, under the roof, behind the nose), the engine, the transaxle
+# and the fuel cell behind the main hoop (on the rear lower rails, the floor's rear cross, the rear shock hoop's posts;
+# under the engine cover). The nose is left hollow (the steering, the front suspension). They keep other bodies and
+# the racer's own panels (the nose, the sides, the cover) out
+cab_an = ([k for k in body_ids if abs(nodes[k][1] - Y0) < 0.005 and X_MH - 0.01 <= nodes[k][0] <= X_FW + 0.01] +
+          [fem_get(p) for s in (1, -1) for p in (FW(s, Y_DOOR), MH(s, Y_DOOR), MH(s, 1.30))])
+volume("cabin", cab_an, [(x, y, s * z) for x, y, z in ((0.72, 0.60, 0.70), (-0.52, 0.60, 0.70), (0.72, 0.83, 0.70), (-0.52, 0.83, 0.70),
+                                                        (0.73, 1.05, 0.67), (0.20, 1.72, 0.58), (-0.52, 1.72, 0.58)) for s in (1, -1)], 0.15)
+eng_an = (body_nodes_on([[TRB(s), TL(s)] for s in (1, -1)] + [[TRB(s), TRT(s)] for s in (1, -1)] + [[TRB(-1), TRB(1)]]) +
+          [fem_get(MH(s, 1.30)) for s in (1, -1)])
+# (its top on the rear upper rails' line: the cover's frame stands 3 cm over them)
+ru = lambda x: RU(1, (X_MH - x) / (X_MH - X_TAIL))
+volume("engine", eng_an, [(x, y, s * z) for x, y, z in ((-0.62, 0.60, 0.55), (-0.95, 0.60, 0.40), (-2.12, 0.82, 0.40), (-0.62, ru(-0.62)[1], ru(-0.62)[2] - 0.03),
+                                                         (-2.12, ru(-2.12)[1], ru(-2.12)[2] - 0.03)) for s in (1, -1)])
 
 # ---------------------------------------------------------------------------------------------------------- write
 centre, back, left = fem_get((0.10, Y0, 0.0), 0.002), fem_get((X_MH, Y0, 0.0), 0.002), fem_get((0.10, Y0, ZC), 0.002)

@@ -26,6 +26,10 @@ frame solved on its own, beside the body's:
 - the mirrors: plastic boxes on an arm of plastic tube on three feet on the front door, that bends and tears off.
 The head and tail lights are little glass boxes, every node on beams to four frame nodes round the box, that tear.
 
+Three collision volumes (phys::CollisionVolume: convex hulls riding on the body's frame nodes) stand for what fills
+the car - the engine in its bay, the seats and occupants in the cabin, the load in the boot - and keep other bodies and
+the car's own parts (with their skins) out of it.
+
 Suspension: double wishbones of tube on ball joints at the frame, the upright (the stub and a steering arm welded
 together) on ball joints at their ends (the ball joints damped: a wishbone torn loose does not swing freely). A
 coil-over from the lower ball joint to the tower carries the car, a travel stop beside it ends the wheel's travel. At
@@ -589,6 +593,32 @@ for s in (1, -1):
         hull_quad(g[0][0], g[nu][0], g[nu][DOOR_NV], g[0][DOOR_NV], d["part"])
         hull_quad(g[0][DOOR_NV], g[nu][DOOR_NV], d["top1"], d["top0"], d["part"])
 orient_hull()
+
+# ---- the collision volumes (phys::CollisionVolume): what fills the car, as convex hulls riding on the body's frame,
+# close under its parts (a few centimetres off their frames): the engine bay's (on the floor rails, the towers and the
+# firewall's feet; under the hood's frame and ribs, inside the fenders and the bumper), the cabin's (on its floor, the A
+# and B pillars; inside the doors, under the roof, behind the windscreen), the boot's (on the rear rails, the towers,
+# the crash beam, the rear posts; under the tailgate, over the bumper). They keep other bodies and the car's own parts
+# (the hood, the doors, the fenders, the tailgate, the bumpers) out: a hood let go rests on the engine
+VOL_GAP = 0.03
+hood_pts = [(min(nodes[k][0], 1.84), nodes[k][1] - VOL_GAP, math.copysign(abs(nodes[k][2]) - VOL_GAP, nodes[k][2]))
+            for k in fem_ids if node_part.get(k) == "hood"]
+eng_an = (body_nodes_on([[(XF, Y0, s * ZR), (XR, Y0, s * ZR)] for s in (1, -1)], ((0.9, 1.8), (Y0, Y0))) +
+          body_nodes_on([[(x, Y0, s * ZR), (x, 0.66, s * ZR)] for x in (1.45, 1.15) for s in (1, -1)]) +
+          [fem_get((XA, y, s * ZS)) for y in (Y0, YB) for s in (1, -1)])
+volume("engine", eng_an, hood_pts + [(x, 0.33, s * 0.45) for x in (0.92, 1.84) for s in (1, -1)])
+cab_an = ([k for k in body_ids if abs(nodes[k][1] - Y0) < 0.005 and XC - 0.01 <= nodes[k][0] <= XA + 0.01] +
+          [fem_get((x, YB, s * ZS)) for x in (XA, XB) for s in (1, -1)])
+volume("cabin", cab_an, [(x, y, s * z) for x, y, z in ((0.80, 0.34, 0.77), (-0.88, 0.34, 0.77), (0.80, 0.92, 0.77), (-0.88, 0.92, 0.77),
+                                                        (0.30, 1.33, 0.63), (-0.86, 1.33, 0.63)) for s in (1, -1)], 0.15)
+boot_an = (body_nodes_on([[(XF, Y0, s * ZR), (XR, Y0, s * ZR)] for s in (1, -1)] + [[(XR, Y0, -0.70), (XR, Y0, 0.70)]], ((XR, XC - 0.02), (Y0, Y0))) +
+           body_nodes_on([[(x, Y0, s * ZR), (x, 0.66, s * ZR)] for x in (-1.15, -1.45) for s in (1, -1)]) +
+           [fem_get(p) for s in (1, -1) for p in ((XC, YB, s * ZS), (-1.82, 0.93, s * 0.74))])
+# (its top on the tailgate's opening, the D pillars' line: the tailgate's frame stands 3 cm out of it; its rear ahead
+# of the bumper's top, which reaches in over the rear panel)
+d_line = lambda x: YR_R + (0.93 - YR_R) * (X_RR - x) / (X_RR + 1.82)
+volume("boot", boot_an, [(x, y, s * z) for x, y, z in ((-0.95, 0.34, 0.66), (-1.65, 0.34, 0.60), (-0.93, d_line(-0.93), 0.62), (-1.69, d_line(-1.69), 0.68))
+                         for s in (1, -1)])
 
 # ---------------------------------------------------------------------------------------------------------- write
 centre, back, left = fem_node((XB, Y0, 0.0)), fem_node((XC, Y0, 0.0)), fem_node((XB, Y0, ZS))

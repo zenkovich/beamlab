@@ -2081,10 +2081,34 @@ static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt)
                                        frame_car_clear(gg), frame_car_stunt(gg, kRoughField + vec3(0, 0.6f, -40), 0, 0.0f, quat(), vec3(0), vec3(0));
                                    }});
     }
-    if (std::string(vid).find("shell_car") != std::string::npos)
-        g.scene_actions.push_back({"Let the latches go (hood, trunk lid, doors)", [](Game& gg) {
-                                       if (Vehicle* car = gg.player_vehicle()) car->body->fem.release_latches(*car->body);
-                                   }});
+    g.scene_actions.push_back({"Let the latches go (hood, trunk lid, doors)", [](Game& gg) {
+                                   Vehicle* car = gg.player_vehicle();
+                                   if (!car) return;
+                                   SoftBody& b = *car->body;
+                                   int n = b.fem.release_latches(b);
+                                   // (the Frame Car's latches are beams between a part's frame and the body's: they go too)
+                                   for (Beam& bm : b.beams) {
+                                       if (bm.flags & BF_BROKEN) continue;
+                                       const int ca = b.fem.component_of(bm.a), cb = b.fem.component_of(bm.b);
+                                       if (ca >= 0 && cb >= 0 && ca != cb) bm.flags |= BF_BROKEN, n++;
+                                   }
+                                   log_info("scene: %d latches let go", n);
+                               }});
+    g.scene_actions.push_back({"Let every part go (bolts, hinges, latches)", [](Game& gg) {
+                                   Vehicle* car = gg.player_vehicle();
+                                   if (!car) return;
+                                   SoftBody& b = *car->body;
+                                   int n = 0;
+                                   for (FrameMount& m : b.fem.mounts)
+                                       if (!m.broken) m.broken = true, b.fem.mounts_broken++, n++;
+                                   for (Beam& bm : b.beams) {
+                                       if (bm.flags & BF_BROKEN) continue;
+                                       const int ca = b.fem.component_of(bm.a), cb = b.fem.component_of(bm.b);
+                                       if (ca >= 0 && cb >= 0 && ca != cb) bm.flags |= BF_BROKEN, n++;
+                                   }
+                                   b.wake();
+                                   log_info("scene: %d mounts and latches let go", n);
+                               }});
     g.scene_actions.push_back({"Hang it from a crane (1 m up)", [](Game& gg) {
                                    if (Vehicle* car = gg.player_vehicle()) car->reset(vec3(0, 0, 20), 0), gg.crane_vehicle(car, 1.0f);
                                }});

@@ -240,6 +240,7 @@ fem_ids = []        # the frame nodes (divide_tubes)
 body_ids = []       # the body's
 cell = {}           # (a grid of the frame nodes, 5 cm)
 mounts = []         # (body node, part node, kind): the parts on the body (see MOUNTS in a generator)
+volumes = []        # (name, anchors, hull points (design space), break rms): the collision volumes (`collision_volumes`)
 latches = []        # (node, anchor, strength)
 straps = []         # (node, anchor, short bound, long bound)
 stats = {"on_member": 0}
@@ -321,6 +322,68 @@ def fem_near(p, r, part="body"):
                     if d < bd and node_part[k] == part:
                         best, bd = k, d
     return best
+
+
+def body_nodes_on(polylines, box=None):
+    """the body's frame nodes on these polylines (their ends too), within box ((x0, x1), (y0, y1)) if given: a
+    collision volume's anchors"""
+    out = set()
+    for k in body_ids:
+        p = nodes[k]
+        if box and not (box[0][0] - 1e-6 <= p[0] <= box[0][1] + 1e-6 and box[1][0] - 1e-6 <= p[1] <= box[1][1] + 1e-6):
+            continue
+        for pl in polylines:
+            if any(v_len(v_sub(p, q)) < 0.002 for q in pl) or any(on_segment(p, a, b) is not None for a, b in zip(pl, pl[1:])):
+                out.add(k)
+                break
+    return sorted(out)
+
+
+def volume(name, anchors, points, rms=0.12):
+    """a collision volume (phys::CollisionVolume): the convex hull of the points (design space, both sides given)
+    riding on the anchors (the body's frame nodes)"""
+    assert len(anchors) >= 3, (name, len(anchors))
+    volumes.append((name, sorted(set(anchors)), points, rms))
+
+
+def hull_planes(pts):
+    """the convex hull's faces of these points as planes (n, d: inside n . x <= d), brute force as phys::convex_hull"""
+    out, n = [], len(pts)
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                nn = v_cross(v_sub(pts[j], pts[i]), v_sub(pts[k], pts[i]))
+                if v_len(nn) < 1e-9:
+                    continue
+                nn = v_norm(nn)
+                d = v_dot(nn, pts[i])
+                s = [v_dot(nn, q) - d for q in pts]
+                if max(s) > 1e-5 and min(s) < -1e-5:
+                    continue
+                if max(s) > 1e-5:
+                    nn, d = v_mul(nn, -1.0), -d
+                if not any(v_dot(nn, m) > 0.9999 and abs(d - e) < 1e-4 for m, e in out):
+                    out.append((nn, d))
+    return out
+
+
+def volume_clearances():
+    """each collision volume's clearance to the parts (their frames' and their skins' nodes): [(name, {part: the
+    least distance of its nodes outside the hull, negative: inside})]"""
+    part_of = {k: p for k, p in node_part.items() if p != "body"}
+    for pan in panels:
+        if pan.part != "body":
+            for k in pan.nodes:
+                part_of[k] = pan.part
+    res = []
+    for name, an, pts, rms in volumes:
+        planes = hull_planes(pts)
+        gap = {}
+        for k, part in part_of.items():
+            g = max(v_dot(nn, nodes[k]) - d for nn, d in planes)
+            gap[part] = min(gap.get(part, 1e9), g)
+        res.append((name, gap))
+    return res
 
 
 def fem_get(p, r=0.07, part="body"):
@@ -621,6 +684,12 @@ def write(path, v):
         f.write("contacters\n")
         for i in range(len(nodes)):
             f.write("%d\n" % i)
+        if volumes:
+            f.write("collision_volumes\n;(BeamLab) volume name, break rms (m) - its anchors (frame nodes) - its hull's points (x, y, z)\n")
+            for name, an, pts, rms in volumes:
+                f.write("volume %s, %.2f\nanchors %s\n" % (name, rms, ", ".join(str(a) for a in an)))
+                for x, y, z in pts:
+                    f.write("vertex %.3f, %.3f, %.3f\n" % (-x, y, z))
         f.write("welds\n;anchor (a frame node), sheet node, radius m, strength N, stiffness N/m (0: the step's), anchor2, t (a point on a member)\n")
         mat_of = {k: pan.mat for pan in panels for k in pan.nodes}
         for w in welds:
@@ -669,3 +738,8 @@ def summary(path, all_tris, doors=0):
         path, len(nodes), n_fem, sum(len(p.nodes) for p in panels), len(members), len(all_tris), len(panels), len(welds), stats["on_member"], CFG["weld_brk"], len(lamps),
         len(lamp_mounts), doors))
     print("frame nodes by part: " + ", ".join("%s %d" % kv for kv in sorted(parts.items())))
+    if volumes:
+        print("collision volumes: " + ", ".join("%s (%d anchors)" % (v[0], len(v[1])) for v in volumes))
+        for name, gap in volume_clearances():   # (the parts near them: how far off, cm; below 0 inside - not held off)
+            near = sorted((g, p) for p, g in gap.items() if g < 0.15)
+            print("  %s: %s" % (name, ", ".join("%s %.1f" % (p, g * 100) for g, p in near) or "no part within 15 cm"))

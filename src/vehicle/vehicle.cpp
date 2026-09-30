@@ -148,6 +148,7 @@ std::unique_ptr<Vehicle> Vehicle::create(const VehicleEntry& e, World& world, ve
     v->m_spawn_frames = body->frames;
     v->m_spawn_joints = body->joints;
     v->m_spawn_fem = body->fem;
+    v->m_spawn_volumes = body->volumes;
     v->m_spawn_info = body->info; // (a torn frame's debris switches nodes off: a reset turns them on)
     v->m_mass = body->total_mass();
 
@@ -173,6 +174,8 @@ void Vehicle::reset(vec3 pos, float yaw_deg) {
     b.joints = m_spawn_joints;
     b.welds = m_spawn_welds;
     b.fem = m_spawn_fem;
+    b.volumes = m_spawn_volumes;
+    for (phys::CollisionVolume& cv : b.volumes) cv.q = quat(); // (their fits from the rest pose again)
     if (!m_sheet && !m_spawn_info.empty()) {
         b.info = m_spawn_info;
         b.force.assign(b.nodes.size(), vec3(0));
@@ -413,6 +416,10 @@ void Vehicle::make_sheet_body(const ShellMaterial& mat, float kg_m2, MaterialPtr
     if (bad_welds) log_warn("vehicle '%s': %d welds on no sheet node", name.c_str(), bad_welds);
     if (!b.welds.empty()) log_info("vehicle '%s': the sheet on %zu welds (%zu nodes held), membrane %.3g N/m, %d short steps", name.c_str(), b.welds.size(), b.weld_nodes.size(), b.shell_mat.membrane, 1 << b.shell_min_shift);
     m_spawn_welds = b.welds;
+    if (!b.volumes.empty()) { // (the parts' skins welded on now: held off the collision volumes with their frames)
+        if (const int in = b.find_volume_parts(); in > 0) log_warn("vehicle '%s': %d nodes of the parts inside its collision volumes (not held off)", name.c_str(), in);
+        m_spawn_volumes = b.volumes;
+    }
 
     m_mass = 0;
     for (const Node& n : b.nodes) m_mass += n.mass;

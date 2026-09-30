@@ -1876,6 +1876,36 @@ contacters
 658
 659
 660
+collision_volumes
+;(BeamLab) volume name, break rms (m) - its anchors (frame nodes) - its hull's points (x, y, z)
+volume cabin, 0.15
+anchors 459, 468, 469, 470, 471, 476, 479, 480, 497, 499, 500, 509, 510, 511, 512, 517, 520, 521, 538, 540, 541, 542, 543, 544, 545, 546
+vertex -0.720, 0.600, 0.700
+vertex -0.720, 0.600, -0.700
+vertex 0.520, 0.600, 0.700
+vertex 0.520, 0.600, -0.700
+vertex -0.720, 0.830, 0.700
+vertex -0.720, 0.830, -0.700
+vertex 0.520, 0.830, 0.700
+vertex 0.520, 0.830, -0.700
+vertex -0.730, 1.050, 0.670
+vertex -0.730, 1.050, -0.670
+vertex -0.200, 1.720, 0.580
+vertex -0.200, 1.720, -0.580
+vertex 0.520, 1.720, 0.580
+vertex 0.520, 1.720, -0.580
+volume engine, 0.12
+anchors 472, 473, 474, 475, 480, 495, 496, 513, 514, 515, 516, 521, 536, 537
+vertex 0.620, 0.600, 0.550
+vertex 0.620, 0.600, -0.550
+vertex 0.950, 0.600, 0.400
+vertex 0.950, 0.600, -0.400
+vertex 2.120, 0.820, 0.400
+vertex 2.120, 0.820, -0.400
+vertex 0.620, 1.289, 0.621
+vertex 0.620, 1.289, -0.621
+vertex 2.120, 1.062, 0.430
+vertex 2.120, 1.062, -0.430
 welds
 ;anchor (a frame node), sheet node, radius m, strength N, stiffness N/m (0: the step's), anchor2, t (a point on a member)
 519, 0, 0.170, 2500, 0

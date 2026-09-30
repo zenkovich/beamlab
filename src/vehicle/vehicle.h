@@ -122,6 +122,7 @@ private:
     std::vector<phys::Joint> m_spawn_joints;
     std::vector<phys::Weld> m_spawn_welds;  // (the sheet's welds on the frame as built: make_sheet_body)
     phys::FemFrame m_spawn_fem;             // the frame elements as built (rest orientations: definition space)
+    std::vector<phys::CollisionVolume> m_spawn_volumes; // the collision volumes as built (a reset puts them back whole)
     std::unique_ptr<ShellVisual> m_sheet;   // sheet body (make_sheet_body): its visual, and the pristine sheet for resets
     std::unique_ptr<FrameVisual> m_frame;   // the frame elements' tubes
     bool m_sheet_first = true;
