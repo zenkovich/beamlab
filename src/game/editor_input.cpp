@@ -425,6 +425,7 @@ ModelEditor::Pick ModelEditor::pick_point(bool has_anchor, vec3 anchor, bool nod
 void ModelEditor::set_tool(Tool t) {
     tool_cancel();
     m_tool = t;
+    if (t == Tool::Volume && active_volume() < 0 && !m_model.volumes.empty()) m_vol = 0, m_vol_point = -1; // (the first one to work on)
     m_gfx_pick = 0;
     m_status.clear();
 }
@@ -443,6 +444,15 @@ void ModelEditor::op_revert() {
 
 void ModelEditor::tool_cancel() {
     if (m_op && (m_tool == Tool::Move || m_tool == Tool::Rotate || m_tool == Tool::Scale)) op_revert();
+    if (m_drag == Drag::VolumePoint) { // (the dragged point back where it was)
+        const int v = active_volume();
+        if (v >= 0 && m_vol_point >= 0 && m_vol_point < (int)m_model.volumes[v].verts.size()) {
+            m_model.volumes[v].verts[m_vol_point] = m_vol_p0;
+            if (m_vol_drag_twin >= 0 && m_vol_drag_twin < (int)m_model.volumes[v].verts.size()) m_model.volumes[v].verts[m_vol_drag_twin] = m_vol_twin_p0;
+        }
+        if (m_drag_pushed && !m_undo.empty()) m_undo.pop_back();
+        m_drag = Drag::None;
+    }
     if (m_drag == Drag::MoveFree || m_drag == Drag::MoveAxis) {
         if (m_drag_pushed) op_restore(), m_undo.pop_back();
         m_drag = Drag::None;
@@ -899,6 +909,63 @@ void ModelEditor::tool_input() {
         }
         break;
     }
+    // ---- collision volumes: a point of one (any volume's: that one active) dragged, a node clicked an anchor or no
+    // more, Ctrl+click a point added; with symmetry the mirrors too
+    case Tool::Volume: {
+        if (m_vol >= (int)M.volumes.size()) m_vol = (int)M.volumes.size() - 1;
+        // the point under the mouse (the active volume's first)
+        m_vol_hover = m_vol_hover_point = -1;
+        if (in_view && m_drag == Drag::None) {
+            float bd = 12.0f * 12.0f;
+            for (int pass = 0; pass < 2; pass++)
+                for (int v = 0; v < (int)M.volumes.size(); v++) {
+                    if ((pass == 0) != (v == m_vol)) continue;
+                    for (int k = 0; k < (int)M.volumes[v].verts.size(); k++) {
+                        vec2 s;
+                        if (!project(m_active_view, to_world(M.volumes[v].verts[k]), s)) continue;
+                        const float d = d2(s, m_mouse);
+                        if (d < bd) bd = d, m_vol_hover = v, m_vol_hover_point = k;
+                    }
+                }
+        }
+        if (click && m_vol_hover_point >= 0 && !ctrl) {
+            m_vol = m_vol_hover, m_vol_point = m_vol_hover_point;
+            m_vol_drag_twin = m_symmetry ? volume_point_twin(m_vol, m_vol_point) : -1;
+            m_vol_p0 = M.volumes[m_vol].verts[m_vol_point];
+            m_vol_twin_p0 = m_vol_drag_twin >= 0 ? M.volumes[m_vol].verts[m_vol_drag_twin] : vec3(0);
+            m_drag_start = m_mouse;
+            m_drag_pushed = false;
+            m_drag = Drag::VolumePoint;
+        } else if (click && ctrl && m_pick.valid()) {
+            if (active_volume() < 0) m_status = "No volume: select frame nodes and make one (New in the options)";
+            else volume_add_point(m_vol, m_pick.p);
+        } else if (click && shift && m_pick.kind == PK_Node) {
+            if (active_volume() < 0) m_status = "No volume: select frame nodes and make one (New in the options)";
+            else volume_toggle_anchor(m_vol, m_pick.node);
+        } else if (click) {
+            m_vol_point = -1;
+            if (m_pick.kind == PK_Node) m_status = "Shift+click a node: an anchor of the volume, or no more; Ctrl+click: a point of it here";
+        }
+        if (m_drag == Drag::VolumePoint) {
+            const int v = active_volume();
+            if (v < 0 || m_vol_point < 0 || m_vol_point >= (int)M.volumes[v].verts.size()) {
+                m_drag = Drag::None;
+            } else if (down && d2(m_mouse, m_drag_start) > 9.0f) {
+                m_pick = pick_point(true, m_vol_p0, true);
+                if (m_pick.valid()) {
+                    if (!m_drag_pushed) push_undo(), m_drag_pushed = true;
+                    const vec3 p = m_pick.p;
+                    M.volumes[v].verts[m_vol_point] = p;
+                    if (m_vol_drag_twin >= 0 && m_vol_drag_twin < (int)M.volumes[v].verts.size()) M.volumes[v].verts[m_vol_drag_twin] = vec3(p.x, p.y, -p.z);
+                    char s[96];
+                    snprintf(s, sizeof s, "Point %d at %.3f, %.3f, %.3f", m_vol_point, p.x, p.y, p.z);
+                    m_status = s;
+                }
+            }
+            if (release) m_drag = Drag::None;
+        }
+        break;
+    }
     // ---- merge: click a node, then the node it goes into
     case Tool::Merge: {
         if (click && m_pick.kind == PK_Node) {
@@ -1211,10 +1278,14 @@ void ModelEditor::hotkeys() {
     if (pressed(ImGuiKey_Escape)) {
         if (m_gfx_pick) m_gfx_pick = 0;
         else if (m_op || m_chain >= 0 || !m_picks.empty() || m_drag != Drag::None) tool_cancel();
+        else if (m_tool == Tool::Volume && m_vol_point >= 0) m_vol_point = -1;
         else if (m_tool != Tool::Select) set_tool(Tool::Select);
         else clear_selection();
     }
-    if ((pressed(ImGuiKey_Delete) || pressed(ImGuiKey_Backspace)) && !vcb_active() && m_vcb.empty()) delete_selection();
+    if ((pressed(ImGuiKey_Delete) || pressed(ImGuiKey_Backspace)) && !vcb_active() && m_vcb.empty()) {
+        if (m_tool == Tool::Volume && active_volume() >= 0 && m_vol_point >= 0) volume_remove_point(active_volume(), m_vol_point);
+        else delete_selection();
+    }
     if (io.KeyAlt) {
         // the graphics: Alt+G only the graphics' nodes shown (or all again), Alt+H hides / shows the selected part,
         // Alt+Shift+H shows every part
@@ -1242,7 +1313,7 @@ void ModelEditor::hotkeys() {
                              {ImGuiKey_C, Tool::Circle},     {ImGuiKey_P, Tool::PushPull}, {ImGuiKey_M, Tool::Move},  {ImGuiKey_O, Tool::Rotate},
                              {ImGuiKey_K, Tool::Scale},      {ImGuiKey_U, Tool::Tape},   {ImGuiKey_E, Tool::Erase},  {ImGuiKey_T, Tool::Tri},
                              {ImGuiKey_Y, Tool::Shell},      {ImGuiKey_J, Tool::Shock},  {ImGuiKey_H, Tool::Rod},    {ImGuiKey_B, Tool::Wheel},
-                             {ImGuiKey_Q, Tool::FemTri}};
+                             {ImGuiKey_Q, Tool::FemTri},     {ImGuiKey_Z, Tool::Volume}};
     for (const K& k : keys)
         if (pressed(k.key)) set_tool(k.tool);
     if (pressed(ImGuiKey_G)) m_snap = !m_snap;

@@ -258,8 +258,8 @@ void App::gather_input(float dt, VehicleInput& vin, CameraInput& cin) {
     mat4 inv = inverse(c.viewproj);
     vec4 a = inv * vec4(ndc.x, ndc.y, -1, 1), b = inv * vec4(ndc.x, ndc.y, 1, 1);
     vec3 ro = a.xyz() / a.w, rd = normalize(b.xyz() / b.w - ro);
-    // cursor hit point for the tool indicator
-    if (mouse_free || m_lmb_held) m_game.update_cursor(ro, rd);
+    // cursor hit point for the tool indicator (the UI hidden - a screenshot, a recording - none but while a tool is held)
+    if ((mouse_free && !m_hide_ui) || m_lmb_held) m_game.update_cursor(ro, rd);
     else m_game.cursor_valid = false;
     switch (m_game.tool) {
     case Tool::Grab:

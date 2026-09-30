@@ -194,7 +194,7 @@ void ModelEditor::draw(Renderer& r, int view) {
     auto P = [&](int n) { return to_world(M.nodes[n].p); };
     // the skeleton's opacity (the Graphics tab: the beams and nodes give way to the meshes; 0: only the selected and the
     // hovered are drawn); the lines give way a little to the graphics anyway
-    const float skel = m_skel_alpha * (m_show_gfx && m_preview ? 0.75f : 1.0f);
+    const float skel = m_skel_alpha * (m_show_gfx && m_preview ? 0.75f : 1.0f) * (m_tool == Tool::Volume ? 0.45f : 1.0f); // (the Volume tool: the hulls stand out)
     const bool skel_off = skel < 0.02f;
     auto hi_of = [&](Elem k, int i) { return elem_selected(k, i) ? 1 : (m_hover_kind == k && m_hover_elem == i ? 2 : 0); };
     // widths (points): the display setting; the selected and the hovered wider, held ends and shocks a little wider
@@ -290,6 +290,29 @@ void ModelEditor::draw(Renderer& r, int view) {
             r.thick_line(P(sn.node), mid, cs, bw), square(r, vf, P(sn.node), cs, 5);
         }
     }
+    // the collision volumes: their hulls' edges (magenta, as the game's collision view); with the Volume tool the active
+    // one bright, its points (the selected and the hovered lit), its anchors ringed, the nodes inside it marked
+    {
+        const bool tool = m_tool == Tool::Volume;
+        const int av = active_volume();
+        for (int v = 0; v < (int)M.volumes.size(); v++) {
+            const VolumeHull& h = volume_hull(v);
+            const std::vector<vec3>& pts = M.volumes[v].verts;
+            const bool act = tool && v == av;
+            const uint32_t c = h.ok ? Renderer::rgba(1.0f, 0.25f, 0.85f, act ? 1.0f : tool ? 0.55f : 0.4f) : Renderer::rgba(0.95f, 0.25f, 0.2f, act ? 1.0f : 0.5f);
+            const float w = act ? 3.5f : 1.5f;
+            if (h.ok)
+                for (const auto& f : h.faces)
+                    for (size_t k = 0; k < f.size(); k++) r.thick_line(to_world(pts[f[k]]), to_world(pts[f[(k + 1) % f.size()]]), c, w);
+            if (!act) continue;
+            for (int n : M.volumes[v].anchors)
+                if (n >= 0 && n < (int)M.nodes.size() && node_shown(n)) ring(r, vf, P(n), Renderer::rgba(1.0f, 0.25f, 0.85f, 1.0f), 8, 14, 2.0f);
+            if (m_vol_show_inside)
+                for (int n : volume_nodes_inside(v))
+                    if (node_shown(n) && std::find(M.volumes[v].anchors.begin(), M.volumes[v].anchors.end(), n) == M.volumes[v].anchors.end())
+                        ring(r, vf, P(n), Renderer::rgba(1.0f, 0.6f, 0.1f, 1.0f), 5, 10, 1.5f);
+        }
+    }
     for (int i = 0; i < (int)M.wheels.size(); i++) {
         if (!elem_shown(Elem::Wheel, i)) continue;
         const edit::Wheel& w = M.wheels[i];
@@ -368,6 +391,19 @@ void ModelEditor::draw(Renderer& r, int view) {
             ring(r, vf, c + e, hi ? kHoverCol : kAxisCol[a], 4, 8);
         }
     }
+    // the Volume tool's points (over the nodes): the active volume's, the selected and the hovered lit
+    if (m_tool == Tool::Volume)
+        for (int v = 0; v < (int)M.volumes.size(); v++) {
+            const bool act = v == active_volume();
+            const std::vector<vec3>& pts = M.volumes[v].verts;
+            for (int k = 0; k < (int)pts.size(); k++) {
+                const bool sel = act && k == m_vol_point, hov = v == m_vol_hover && k == m_vol_hover_point;
+                if (!act && !hov) continue;
+                const vec3 p = to_world(pts[k]);
+                square(r, vf, p, Renderer::rgba(0.1f, 0.02f, 0.08f, 1.0f), sel || hov ? 8.0f : 6.0f);
+                square(r, vf, p, sel ? kSelCol : hov ? kHoverCol : Renderer::rgba(1.0f, 0.25f, 0.85f, 1.0f), sel || hov ? 6.0f : 4.5f);
+            }
+        }
     draw_tool_preview(r, view);
     draw_graphics_binding(r, view);
 }

@@ -4,7 +4,7 @@
 // the graphics preview), editor_input.cpp (views, camera, picking with inference, the tools), editor_draw.cpp (the
 // frame), editor_ui.cpp (panels and icons).
 //   Tools (SketchUp-like): Select, Line (beams, nodes made where a click lands off a node), Node, Rectangle, Circle,
-//   Push/Pull, Move, Rotate, Scale, Tape measure, Eraser, Triangle, Shell, Shock, Rod, Wheel. Points snap to nodes,
+//   Push/Pull, Move, Rotate, Scale, Tape measure, Eraser, Triangle, Shell, Shock, Rod, Wheel, Collision volume. Points snap to nodes,
 //   beam midpoints and edges, the red / green / blue axes from the last point, the reference mesh and the work plane
 //   of the view; a typed number (a length, "w,h", an angle, a factor) finishes the operation (Enter).
 //   Camera: WASD / Q E fly (the 3D view) or pan (the others), right drag orbits, middle drag pans, the wheel zooms.
@@ -54,14 +54,14 @@ public:
         Select, Line, Node, Rect, Circle, PushPull, Move, Rotate, Scale, Tape, Erase, Tri, Shell, Shock, Rod, Wheel,
         Undo, Redo, Save, Drive, Physics, Close, Eye, EyeOff, Lock, Unlock, Plus, Trash, Edit, Copy, Quad, Grid, Floor,
         Symmetry, Snap, Frame, Chain, Pairs, Fill, Mirror, Connected, Grow, Invert, Hide, Show, Triangulate, Mesh, Link, Ids,
-        Width, Blast, Shoot, Laser, Merge, Joint, Divide, FemTri, Count
+        Width, Blast, Shoot, Laser, Merge, Joint, Divide, FemTri, Volume, Count
     };
 
 private:
     enum class Mode { Edit, Deform, Physics, Drive };
-    enum class Tool { Select, Line, Node, Rect, Circle, PushPull, Move, Rotate, Scale, Tape, Erase, Tri, Shell, Shock, Rod, Wheel, Merge, Joint, FemTri, Count };
+    enum class Tool { Select, Line, Node, Rect, Circle, PushPull, Move, Rotate, Scale, Tape, Erase, Tri, Shell, Shock, Rod, Wheel, Merge, Joint, FemTri, Volume, Count };
     enum class Elem { None, Beam, Shock, Hydro, Tri, Wheel, Joint };
-    enum class Drag { None, Box, MoveFree, MoveAxis, Orbit, Pan, SplitX, SplitY, SplitXY, Grab, Erase };
+    enum class Drag { None, Box, MoveFree, MoveAxis, Orbit, Pan, SplitX, SplitY, SplitXY, Grab, Erase, VolumePoint };
     struct View {                    // a view of the model: the perspective one orbits, the others are orthographic
         float yaw = 0.9f, pitch = 0.35f, dist = 7.0f;
         vec3 target{0, 0.6f, 0};
@@ -141,6 +141,30 @@ private:
     bool joint_hover(int& beam, int& end) const;
     // the selected beams (and their twins) cut into n equal beams each (a frame element's joints stay at its ends)
     void divide_selected_beams(int n);
+    // collision volumes (Model::volumes, the Volume tool): the active one (m_vol, -1: none), its hull (the game's
+    // phys::convex_hull, cached), a point's mirror twin (-1: none, or on the plane), the nodes inside it; the edits
+    struct VolumeHull {
+        std::vector<vec3> pts;       // (the points it was made of)
+        std::vector<vec4> planes;
+        std::vector<std::vector<uint8_t>> faces;
+        bool ok = false;
+    };
+    const VolumeHull& volume_hull(int v) const;
+    int volume_point_twin(int v, int k) const;
+    std::vector<int> volume_nodes_inside(int v) const;
+    int active_volume() const { return m_vol >= 0 && m_vol < (int)m_model.volumes.size() ? m_vol : -1; }
+    void volume_from_selection();                // a new volume: the selected nodes its anchors, a box inside them its hull
+    void volume_box_from_selection(int v);       // its hull: the box of the selected nodes, inset
+    void volume_points_from_selection(int v);    // its hull: the selected nodes' points (those on the hull kept)
+    void volume_anchors_from_selection(int v, int how); // 0 set, 1 add, 2 remove
+    void volume_toggle_anchor(int v, int node);  // (with symmetry the twin too)
+    void volume_add_point(int v, vec3 p);        // (with symmetry the mirror too)
+    void volume_remove_point(int v, int k);      // (and its twin)
+    void volume_offset(int v, float d);          // each point moved d out from the centre
+    void volume_mirror(int v);                   // the missing mirror points added: symmetric
+    void volume_prune(int v);                    // the points inside the hull dropped
+    void delete_volume(int v);
+    void ui_volumes();
     void finish_merge(const std::vector<std::vector<int>>& groups, const std::vector<vec3>& at, const char* what);
     void set_view(int preset);       // 0 3D, 1 front, 2 side, 3 top
     bool node_shown(int n) const;    // visible and not hidden
@@ -379,6 +403,13 @@ private:
     float m_merge_tol = 0.01f;       // merge by distance: nodes closer than this (m)
     int m_joint_type = 1;            // the joint tool's joint (phys::FrameJoint)
     int m_divide_n = 2;              // divide the selected beams into this many
+    // the Volume tool: the active volume, its selected point, the point under the mouse (its volume), the drag's twin
+    // and start positions; the new volumes' inset from their nodes' box; the nodes inside the active one lit
+    int m_vol = -1, m_vol_point = -1, m_vol_hover = -1, m_vol_hover_point = -1, m_vol_drag_twin = -1;
+    vec3 m_vol_p0{0, 0, 0}, m_vol_twin_p0{0, 0, 0};
+    float m_vol_inset = 0.08f;
+    bool m_vol_show_inside = true;
+    mutable std::vector<VolumeHull> m_vol_hulls;
     bool m_shell_beams = false;      // shell faces (rectangle, circle, push / pull) get beams too: off, the shells hold themselves
     int m_rect_div[2] = {1, 1};
     int m_circle_sides = 12;

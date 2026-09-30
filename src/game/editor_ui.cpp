@@ -53,8 +53,9 @@ const ToolInfo kTools[] = {
     {"Merge", "Ctrl+J: the selected", I::Merge, "Click a node, then the node it goes into: the elements on the first go to the second (with symmetry the twins too); Ctrl+J merges the selected nodes into one, the options merge the nodes closer than a distance"},
     {"Joint", "", I::Joint, "Frame elements (FEM beams): click near an end of one to join it to its node with the joint chosen below (welded, ball, hinges, swivel, elastic); Shift+click: its preset's joint again; with symmetry the twin's end too"},
     {"FEM triangle", "Q", I::FemTri, "Three nodes: a FEM triangle, a shell element of the frame (membrane and bending, plastic past the yield, torn past the elongation) of the FEM shell chosen below; it makes its own collision surface. The Rectangle, Circle and Push / Pull tools make them too (Faces: FEM triangles)"},
+    {"Collision volume", "Z", I::Volume, "What fills a car (the engine, the cabin, the load): a convex hull riding on frame nodes. New (below) makes one of the selected nodes; drag its points (with symmetry their mirrors too), Ctrl+click adds a point, Delete takes the selected one off; Shift+click a node to make it an anchor or take it off; a point of another volume makes that one active"},
 };
-static_assert(sizeof(kTools) / sizeof(kTools[0]) == 19, "one entry per tool");
+static_assert(sizeof(kTools) / sizeof(kTools[0]) == 20, "one entry per tool");
 // one line each: what the tool does (the tooltips have more)
 const char* kToolShort[] = {
     "Click or drag a box to select (Shift adds); drag to move",
@@ -76,6 +77,7 @@ const char* kToolShort[] = {
     "A node, then the node it goes into",
     "Click near a frame element's end: its joint",
     "Three nodes: a FEM triangle (a shell element of the frame)",
+    "Drag its points; Shift+click nodes: its anchors; Ctrl+click: a point",
 };
 
 const char* kViewNames[] = {"3D", "Front", "Side", "Top"};
@@ -371,6 +373,17 @@ void ModelEditor::draw_icon(ImDrawList* dl, Icon icon, float x, float y, float s
         arrow(0.3f, 0.34f, 0.6f, 0.47f), arrow(0.3f, 0.66f, 0.6f, 0.53f);
         dot(0.8f, 0.5f, 0.13f);
         break;
+    case Icon::Volume: { // (a box in perspective, its corners)
+        const float a[8][2] = {{0.14f, 0.36f}, {0.64f, 0.36f}, {0.64f, 0.86f}, {0.14f, 0.86f}, {0.36f, 0.14f}, {0.86f, 0.14f}, {0.86f, 0.64f}, {0.36f, 0.64f}};
+        dl->AddQuadFilled(P(a[0][0], a[0][1]), P(a[1][0], a[1][1]), P(a[2][0], a[2][1]), P(a[3][0], a[3][1]), cf);
+        for (int k = 0; k < 4; k++) {
+            L(a[k][0], a[k][1], a[(k + 1) % 4][0], a[(k + 1) % 4][1]);
+            L(a[4 + k][0], a[4 + k][1], a[4 + (k + 1) % 4][0], a[4 + (k + 1) % 4][1]);
+            L(a[k][0], a[k][1], a[4 + k][0], a[4 + k][1]);
+        }
+        dot(0.64f, 0.36f, 0.06f), dot(0.36f, 0.64f, 0.06f);
+        break;
+    }
     case Icon::Joint: // (a beam, a ring round its end at a node)
         L(0.12f, 0.82f, 0.62f, 0.32f, th * 1.6f);
         dl->AddCircle(P(0.72f, 0.24f), 0.17f * s, c, 0, th);
@@ -794,7 +807,7 @@ void ModelEditor::ui_tools() {
     static const Group groups[] = {
         {"Select and change", {Tool::Select, Tool::Move, Tool::Rotate, Tool::Scale, Tool::Merge, Tool::Erase, Tool::Tape}},
         {"Draw", {Tool::Line, Tool::Node, Tool::Rect, Tool::Circle, Tool::PushPull}},
-        {"Add", {Tool::Tri, Tool::Shell, Tool::FemTri, Tool::Shock, Tool::Rod, Tool::Wheel, Tool::Joint}},
+        {"Add", {Tool::Tri, Tool::Shell, Tool::FemTri, Tool::Shock, Tool::Rod, Tool::Wheel, Tool::Joint, Tool::Volume}},
     };
     const float bs = 32.0f;
     for (const Group& g : groups) {
@@ -804,6 +817,7 @@ void ModelEditor::ui_tools() {
         bool first = true;
         for (Tool t : g.tools) {
             if (!first) ImGui::SameLine(0, 4);
+            if (!first && ImGui::GetContentRegionAvail().x < bs + 8) ImGui::NewLine(); // (the row full: on to the next)
             first = false;
             const int i = (int)t;
             char id[16], tip[400];
@@ -823,7 +837,7 @@ void ModelEditor::ui_tool_options() {
     // only the tools that have options show them
     const bool any = m_tool == Tool::Line || m_tool == Tool::Node || m_tool == Tool::Rect || m_tool == Tool::Circle || m_tool == Tool::Move || m_tool == Tool::Rotate ||
                      m_tool == Tool::Scale || m_tool == Tool::Shell || m_tool == Tool::PushPull || m_tool == Tool::Merge || m_tool == Tool::Joint ||
-                     m_tool == Tool::FemTri;
+                     m_tool == Tool::FemTri || m_tool == Tool::Volume;
     auto shell_mat = [&]() {
         std::vector<std::string> names;
         for (int i = 0; i < m_model.shell_preset_count(); i++) names.push_back(m_model.shell_preset(i).name + " (" + m_model.shell_preset(i).material + ")");
@@ -865,6 +879,10 @@ void ModelEditor::ui_tool_options() {
         static const char* p[] = {"ground", "side (x y)", "front (y z)"};
         ImGui::Combo("##plane", &m_plane_mode, p, 3);
     };
+    if (m_tool == Tool::Volume) {
+        ui_volumes();
+        return;
+    }
     if (!props_begin("##toolopts")) return;
     switch (m_tool) {
     case Tool::Line: {
@@ -1442,6 +1460,7 @@ void ModelEditor::ui_properties() {
             row("Shocks, rods, joints", std::to_string(M.shocks.size()) + ", " + std::to_string(M.hydros.size()) + ", " + std::to_string(M.joints.size()));
             if (!M.welds.empty() || !M.mounts.empty() || !M.slidenodes.empty())
                 row("Welds, mounts, slides", std::to_string(M.welds.size()) + ", " + std::to_string(M.mounts.size()) + ", " + std::to_string(M.slidenodes.size()));
+            if (!M.volumes.empty()) row("Collision volumes", std::to_string(M.volumes.size()));
             row("Meshes", std::to_string(M.flexbodies.size() + M.props.size()));
             row("Folder", M.home);
             props_end();
