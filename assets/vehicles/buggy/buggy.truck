@@ -679,7 +679,7 @@ set_default_minimass -1
 beams
 ;main
 set_beam_defaults 3000000, 400, 80000, 700000, 0.05, tracks/beam, 0
-set_frame_section Chromoly, tube, 0.0450, 0.0030, rigid
+set_frame_section ChromolyHT, tube, 0.0508, 0.0035, rigid
 459, 460, F
 464, 465, F
 459, 468, F
@@ -753,7 +753,7 @@ set_frame_section Chromoly, tube, 0.0450, 0.0030, rigid
 552, 481, F
 ;pickup
 set_beam_defaults 3000000, 400, 80000, 700000, 0.05, tracks/beam, 0
-set_frame_section Chromoly, tube, 0.0500, 0.0040, rigid
+set_frame_section ChromolyHT, tube, 0.0500, 0.0040, rigid
 460, 461, F
 461, 462, F
 462, 463, F
@@ -770,7 +770,7 @@ set_frame_section Chromoly, tube, 0.0500, 0.0040, rigid
 527, 524, F
 ;pivot
 set_beam_defaults 3000000, 400, 80000, 700000, 0.05, tracks/beam, 0
-set_frame_section Chromoly, tube, 0.0450, 0.0035, rigid
+set_frame_section ChromolyHT, tube, 0.0500, 0.0040, rigid
 461, 466, F
 463, 467, F
 466, 487, F
@@ -799,7 +799,7 @@ set_frame_section Chromoly, tube, 0.0450, 0.0035, rigid
 513, 659, F, rigid, ball
 ;cage
 set_beam_defaults 3000000, 400, 80000, 700000, 0.05, tracks/beam, 0
-set_frame_section Chromoly, tube, 0.0380, 0.0025, rigid
+set_frame_section ChromolyHT, tube, 0.0445, 0.0030, rigid
 484, 465, F
 460, 477, F
 464, 483, F
@@ -839,7 +839,7 @@ set_frame_section Chromoly, tube, 0.0380, 0.0025, rigid
 512, 480, F
 ;light
 set_beam_defaults 3000000, 400, 80000, 700000, 0.05, tracks/beam, 0
-set_frame_section Chromoly, tube, 0.0320, 0.0020, rigid
+set_frame_section ChromolyHT, tube, 0.0380, 0.0025, rigid
 467, 484, F
 496, 494, F
 508, 525, F
@@ -857,7 +857,7 @@ set_frame_section Chromoly, tube, 0.0320, 0.0020, rigid
 560, 482, F
 ;rack
 set_beam_defaults 3000000, 400, 80000, 700000, 0.05, tracks/beam, 0
-set_frame_section Steel, tube, 0.0350, 0.0050, rigid
+set_frame_section Chromoly, tube, 0.0380, 0.0060, rigid
 530, 561, F
 561, 489, F
 635, 636, F
@@ -865,7 +865,7 @@ set_frame_section Steel, tube, 0.0350, 0.0050, rigid
 635, 647, F
 ;panel
 set_beam_defaults 3000000, 400, 80000, 700000, 0.05, tracks/beam, 0
-set_frame_section Aluminium, tube, 0.0220, 0.0020, rigid
+set_frame_section Aluminium, tube, 0.0250, 0.0025, rigid
 562, 563, F
 563, 564, F
 564, 565, F
@@ -970,7 +970,7 @@ set_frame_section Chromoly, tube, 0.0450, 0.0035, rigid, 0, 0, 3.0
 659, 660, F
 ;brace
 set_beam_defaults 3000000, 400, 80000, 700000, 0.05, tracks/beam, 0
-set_frame_section Chromoly, tube, 0.0380, 0.0030, rigid
+set_frame_section Chromoly, tube, 0.0420, 0.0035, rigid
 461, 634, F, ball, rigid
 631, 630, F, ball, rigid
 630, 632, F, rigid, ball
@@ -1174,12 +1174,12 @@ set_beam_defaults 150000, 60, 2500, 2500, 0.01, tracks/beam, 0
 458, 534, i
 shocks
 ;n1, n2, spring, damp, short bound, long bound, precompression, options
-set_beam_defaults 257747, 58731, 400000, 99999999999999999999999999999999999999999, 0.05, tracks/beam, 0
-631, 483, 18364, 2391, 0.429, 0.000, 1.162, n
-643, 524, 18364, 2391, 0.429, 0.000, 1.162, n
-set_beam_defaults 502834, 94566, 400000, 99999999999999999999999999999999999999999, 0.05, tracks/beam, 0
-639, 496, 24785, 3737, 0.397, 0.000, 1.181, n
-651, 537, 24785, 3737, 0.397, 0.000, 1.181, n
+set_beam_defaults 270634, 61668, 400000, 99999999999999999999999999999999999999999, 0.05, tracks/beam, 0
+631, 483, 19283, 2511, 0.429, 0.000, 1.162, n
+643, 524, 19283, 2511, 0.429, 0.000, 1.162, n
+set_beam_defaults 527727, 99248, 400000, 99999999999999999999999999999999999999999, 0.05, tracks/beam, 0
+639, 496, 26012, 3922, 0.397, 0.000, 1.181, n
+651, 537, 26012, 3922, 0.397, 0.000, 1.181, n
 set_beam_defaults 20000000, 200000, 400000, 99999999999999999999999999999999999999999, 0.05, tracks/beam, 0
 631, 483, 0, 0, 0.430, 0.165, 1.0, i
 639, 496, 0, 0, 0.361, 0.173, 1.0, i
@@ -1196,13 +1196,12 @@ slidenodes
 ;the rack's ends slide along its housing
 635, 530, 561, 489, S2000000, T0
 647, 530, 561, 489, S2000000, T0
-wheels
-;radius, width, rays, node1, node2, rigidity, braking, propulsion, arm, mass, spring, damping, face, band
-set_beam_defaults 3000000, 400, 400000, 99999999999999999999999999999999999999999, 0.05, tracks/beam, 0
-0.49, 0.34, 20, 629, 630, 9999, 1, 0, 483, 60.0, 105000.0, 840.0, tracks/wheelface tracks/wheelband
-0.49, 0.34, 20, 637, 638, 9999, 1, 1, 493, 60.0, 105000.0, 840.0, tracks/wheelface tracks/wheelband
-0.49, 0.34, 20, 641, 642, 9999, 1, 0, 524, 60.0, 105000.0, 840.0, tracks/wheelface tracks/wheelband
-0.49, 0.34, 20, 649, 650, 9999, 1, 1, 534, 60.0, 105000.0, 840.0, tracks/wheelface tracks/wheelband
+ringwheels
+;(BeamLab) radius, rim radius, width, node1, node2, braking, propulsion, arm, mass, tyre stiffness (N/m, 2 cm in), damping (N s/m), grip
+0.49, 0.190, 0.34, 629, 630, 1, 0, 483, 45.0, 150000.0, 1500.0, 1.1
+0.49, 0.190, 0.34, 637, 638, 1, 1, 493, 45.0, 150000.0, 1500.0, 1.1
+0.49, 0.190, 0.34, 641, 642, 1, 0, 524, 45.0, 150000.0, 1500.0, 1.1
+0.49, 0.190, 0.34, 649, 650, 1, 1, 534, 45.0, 150000.0, 1500.0, 1.1
 engine
 ;min rpm, max rpm, torque, differential, reverse, neutral, gears...
 900.0, 6500.0, 850.0, 4.9, 3.0, 1.0, 2.9, 1.8, 1.3, 1.0, -1.0
@@ -1878,34 +1877,138 @@ contacters
 660
 collision_volumes
 ;(BeamLab) volume name, break rms (m) - its anchors (frame nodes) - its hull's points (x, y, z)
-volume cabin, 0.15
-anchors 459, 468, 469, 470, 471, 476, 479, 480, 497, 499, 500, 509, 510, 511, 512, 517, 520, 521, 538, 540, 541, 542, 543, 544, 545, 546
-vertex -0.720, 0.600, 0.700
-vertex -0.720, 0.600, -0.700
-vertex 0.520, 0.600, 0.700
-vertex 0.520, 0.600, -0.700
-vertex -0.720, 0.830, 0.700
-vertex -0.720, 0.830, -0.700
-vertex 0.520, 0.830, 0.700
-vertex 0.520, 0.830, -0.700
-vertex -0.730, 1.050, 0.670
-vertex -0.730, 1.050, -0.670
-vertex -0.200, 1.720, 0.580
-vertex -0.200, 1.720, -0.580
-vertex 0.520, 1.720, 0.580
-vertex 0.520, 1.720, -0.580
 volume engine, 0.12
-anchors 472, 473, 474, 475, 480, 495, 496, 513, 514, 515, 516, 521, 536, 537
-vertex 0.620, 0.600, 0.550
-vertex 0.620, 0.600, -0.550
-vertex 0.950, 0.600, 0.400
-vertex 0.950, 0.600, -0.400
-vertex 2.120, 0.820, 0.400
-vertex 2.120, 0.820, -0.400
-vertex 0.620, 1.289, 0.621
-vertex 0.620, 1.289, -0.621
-vertex 2.120, 1.062, 0.430
-vertex 2.120, 1.062, -0.430
+anchors 472, 473, 474, 475, 513, 514, 515, 516
+vertex 0.980, 0.620, 0.220
+vertex 0.980, 0.620, -0.220
+vertex 1.550, 0.660, 0.220
+vertex 1.550, 0.660, -0.220
+vertex 0.980, 0.860, 0.330
+vertex 0.980, 0.860, -0.330
+vertex 1.550, 0.880, 0.330
+vertex 1.550, 0.880, -0.330
+vertex 0.980, 1.200, 0.200
+vertex 0.980, 1.200, -0.200
+vertex 1.550, 1.120, 0.200
+vertex 1.550, 1.120, -0.200
+color 0.16, 0.17, 0.18
+volume transaxle, 0.12
+anchors 472, 473, 474, 475, 513, 514, 515, 516
+vertex 1.580, 0.680, 0.240
+vertex 1.580, 0.680, -0.240
+vertex 2.050, 0.760, 0.180
+vertex 2.050, 0.760, -0.180
+vertex 1.580, 1.000, 0.240
+vertex 1.580, 1.000, -0.240
+vertex 2.050, 0.960, 0.180
+vertex 2.050, 0.960, -0.180
+color 0.42, 0.43, 0.45
+volume fuel_cell, 0.12
+anchors 471, 472, 479, 480, 495, 497, 498, 512, 513, 520, 521, 536, 538, 539, 546
+vertex 0.600, 0.600, 0.400
+vertex 0.600, 0.600, -0.400
+vertex 0.920, 0.600, 0.400
+vertex 0.920, 0.600, -0.400
+vertex 0.600, 1.292, 0.400
+vertex 0.600, 1.292, -0.400
+vertex 0.920, 1.244, 0.400
+vertex 0.920, 1.244, -0.400
+volume bay_left, 0.12
+anchors 472, 473, 474, 475, 492, 493, 494, 495, 496
+vertex 2.120, 1.050, 0.420
+vertex 1.127, 1.213, 0.557
+vertex 1.375, 1.175, 0.525
+vertex 1.705, 1.125, 0.483
+vertex 0.980, 0.620, 0.360
+vertex 0.980, 0.620, 0.400
+vertex 2.100, 0.840, 0.360
+vertex 2.100, 0.840, 0.400
+vertex 0.980, 1.215, 0.360
+vertex 2.100, 1.045, 0.360
+volume front_left, 0.12
+anchors 466, 467, 476, 477, 483, 484, 486, 487, 488
+vertex -0.750, 1.050, 0.020
+vertex -0.750, 1.050, 0.203
+vertex -0.750, 1.050, 0.437
+vertex -0.750, 1.050, 0.670
+vertex -1.050, 1.110, 0.558
+vertex -1.500, 1.200, 0.390
+vertex -1.500, 1.200, 0.020
+vertex -1.760, 1.100, 0.382
+vertex -2.060, 0.950, 0.370
+vertex -2.060, 0.950, 0.020
+vertex -2.060, 0.630, 0.103
+vertex -2.060, 0.630, 0.370
+vertex -1.043, 1.147, 0.020
+vertex -1.345, 1.193, 0.020
+vertex -1.770, 1.127, 0.020
+vertex -2.026, 1.016, 0.020
+vertex -0.800, 0.990, 0.020
+vertex -0.800, 0.990, 0.400
+vertex -1.950, 0.990, 0.020
+vertex -1.950, 0.990, 0.400
+volume seat_left, 0.15
+anchors 459, 468, 469, 470, 471, 476, 479, 480, 497, 499, 543, 544, 545, 546
+vertex -0.720, 0.600, 0.030
+vertex 0.520, 0.600, 0.030
+vertex -0.720, 0.600, 0.700
+vertex 0.520, 0.600, 0.700
+vertex -0.720, 0.830, 0.700
+vertex 0.520, 0.830, 0.700
+vertex -0.730, 1.050, 0.670
+vertex -0.730, 1.050, 0.030
+vertex -0.200, 1.720, 0.030
+vertex 0.520, 1.720, 0.030
+vertex -0.200, 1.720, 0.580
+vertex 0.520, 1.720, 0.580
+volume bay_right, 0.12
+anchors 513, 514, 515, 516, 533, 534, 535, 536, 537
+vertex 2.120, 1.050, -0.420
+vertex 1.127, 1.213, -0.557
+vertex 1.375, 1.175, -0.525
+vertex 1.705, 1.125, -0.483
+vertex 0.980, 0.620, -0.360
+vertex 0.980, 0.620, -0.400
+vertex 2.100, 0.840, -0.360
+vertex 2.100, 0.840, -0.400
+vertex 0.980, 1.215, -0.360
+vertex 2.100, 1.045, -0.360
+volume front_right, 0.12
+anchors 507, 508, 517, 518, 524, 525, 527, 528, 529
+vertex -0.750, 1.050, -0.670
+vertex -0.750, 1.050, -0.437
+vertex -0.750, 1.050, -0.203
+vertex -0.750, 1.050, -0.020
+vertex -1.050, 1.110, -0.558
+vertex -1.500, 1.200, -0.390
+vertex -1.500, 1.200, -0.020
+vertex -1.760, 1.100, -0.382
+vertex -2.060, 0.950, -0.370
+vertex -2.060, 0.950, -0.020
+vertex -2.060, 0.630, -0.370
+vertex -2.060, 0.630, -0.103
+vertex -1.043, 1.147, -0.020
+vertex -1.345, 1.193, -0.020
+vertex -1.770, 1.127, -0.020
+vertex -2.026, 1.016, -0.020
+vertex -0.800, 0.990, -0.020
+vertex -0.800, 0.990, -0.400
+vertex -1.950, 0.990, -0.020
+vertex -1.950, 0.990, -0.400
+volume seat_right, 0.15
+anchors 500, 509, 510, 511, 512, 517, 520, 521, 538, 540, 541, 542, 545, 546
+vertex -0.720, 0.600, -0.030
+vertex 0.520, 0.600, -0.030
+vertex -0.720, 0.600, -0.700
+vertex 0.520, 0.600, -0.700
+vertex -0.720, 0.830, -0.700
+vertex 0.520, 0.830, -0.700
+vertex -0.730, 1.050, -0.670
+vertex -0.730, 1.050, -0.030
+vertex -0.200, 1.720, -0.030
+vertex 0.520, 1.720, -0.030
+vertex -0.200, 1.720, -0.580
+vertex 0.520, 1.720, -0.580
 welds
 ;anchor (a frame node), sheet node, radius m, strength N, stiffness N/m (0: the step's), anchor2, t (a point on a member)
 519, 0, 0.170, 2500, 0

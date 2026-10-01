@@ -247,7 +247,7 @@ check("frame car: into the wall at 60 km/h", bool(toe and fr) and max(toe[2:]) <
 # ---- the Buggy (a desert racer's cage, long-travel wishbones and trailing arms, anti-roll bars of FEM tubes): the Frame
 # Car's tests on it, and its own - the whoops and the jump on the gravel lane, a drive over the offroad scene's hills
 def frame_line(out):
-    m = re.findall(r"frame: (\d+) members, (\d+) splits, (\d+) torn, (\d+) failed solves, (\d+) clamps \| welds: (\d+) of (\d+) broken", out)
+    m = re.findall(r"frame: (\d+) members, (\d+) splits, (\d+) torn, (\d+) failed solves, (\d+) clamps.*?\| welds: (\d+) of (\d+) broken", out)
     return tuple(int(x) for x in m[-1]) if m else None
 
 

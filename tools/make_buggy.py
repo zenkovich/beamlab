@@ -9,9 +9,10 @@ the rear clip (the engine cradle, the trailing arms' pivot beam, the rear shock 
 bumper). The body is aluminium sheet (triangle elements) welded on: the roof and the floor pan on the cage; the nose, the
 side panels and the engine cover are frames of their own, their skins welded to them, bolted on at a distance (mounts)
 and letting go past their bolts' strength - each a component of the frame solved on its own. A light bar on the roof,
-headlights on the nose, tail lights on the rear bumper. Two collision volumes (phys::CollisionVolume: convex hulls
-riding on the cage) stand for the crew in the cockpit and the engine, the transaxle and the fuel cell behind it, and
-keep other bodies and the racer's own panels out of them.
+headlights on the nose, tail lights on the rear bumper. Collision volumes (phys::CollisionVolume: convex hulls riding
+on the cage round each) stand for what fills it, in zones - the V8 and the transaxle (drawn), the fuel cell, the engine
+bay's sides, the front clip's sides, the two seats - and keep other bodies and the racer's own panels out of them. Ring
+tyres (phys::Wheel::ring): 39" on 15" beadlock rims (NODE_WHEELS=1: RoR's wheels of nodes as before).
 
 Long-travel suspension: at the front double wishbones on ball joints, 0.6 m of travel, a coil-over from the lower ball
 joint to the shock tower, a steering rack behind the axle (the frame car's: a bar sliding along its housing, a hydro,
@@ -59,29 +60,33 @@ GRID = 0.14
 # the masses: the engine and transaxle on the rear rails in the cradle, the fuel cell (60 gal) behind the seats, the
 # crew, seats and gear on the cockpit's floor, two spare tyres on the rear upper rails; the dry mass spread over the
 # members by their length. About 1450 kg ready to race, 40 / 60 front to rear
-ENGINE_KG, FUEL_KG, CREW_KG, SPARE_KG, DRY_KG = 360.0, 160.0, 220.0, 60.0, 80.0
+ENGINE_KG, FUEL_KG, CREW_KG, SPARE_KG, DRY_KG = 360.0, 160.0, 220.0, 60.0, 80.0   # (the dry mass on the members' nodes: taken off for the
+# heavier cage's tubes, its light suspension nodes rang under the coil-overs - 54 plastic hinges driving in circles)
 # the suspension: wheel travel (m) up from the design height (where it stands) and down, the ride frequency (Hz), the
 # damping ratio; the shocks' preload carries the static load at their design length (STATIC: N per shock, measured
 # with BL_SHOCKDBG at rest - the spring's k (L - len) - and the rates it was measured at, iterated twice)
 TRAVEL = {True: (0.46, 0.21), False: (0.52, 0.26)}        # front 26", rear 30" (Class 1)
 BUMP_STOP, BUMP_STOP_G = 0.10, 8.0   # the last 10 cm up in the bump stops (their spring and damping growing), 8 x the static load at the end
 RIDE_HZ, ZETA = {True: 1.10, False: 0.95}, 0.45   # (soft: the springs still push at full droop, no tender spring here)
-STATIC = {True: 2700.0, False: 5050.0}
+STATIC = {True: 2835.0, False: 5300.0}   # (5% up with the heavier cage: 1535 kg)
 
+# (the cage of quenched and tempered 4130, 2" x 0.138 main tubes, 1.75" x 0.120 the rest - of normalized 4130 at 1.75" x
+# 0.120 and 1.5" x 0.098 it bent all over landing a jump, its cage 6 cm out of shape, 12 at most; bigger tubes alone
+# took a fifth off that)
 SECTIONS = {  # name: (material, shape, outer, wall, joints[, break force N[, the released joint's damping N m s/rad]])
-    "main": ("Chromoly", "tube", 0.045, 0.0030, "rigid"),     # floor rails and sills, the main hoop, A pillars, roof rails
-    "cage": ("Chromoly", "tube", 0.038, 0.0025, "rigid"),     # the clips' rails, door bars, towers, bows, bumpers
-    "light": ("Chromoly", "tube", 0.032, 0.0020, "rigid"),    # braces, the pivot rails' posts
-    "panel": ("Aluminium", "tube", 0.022, 0.0020, "rigid"),   # the nose's, the side panels' and the engine cover's frames
+    "main": ("ChromolyHT", "tube", 0.0508, 0.0035, "rigid"),  # floor rails and sills, the main hoop, A pillars, roof rails
+    "cage": ("ChromolyHT", "tube", 0.0445, 0.0030, "rigid"),  # the clips' rails, door bars, towers, bows, bumpers
+    "light": ("ChromolyHT", "tube", 0.038, 0.0025, "rigid"),  # braces, the pivot rails' posts
+    "panel": ("Aluminium", "tube", 0.025, 0.0025, "rigid"),   # the nose's, the side panels' and the engine cover's frames
     "arm": ("Chromoly", "tube", 0.045, 0.0035, "rigid", 0.0, 3.0),   # the front wishbones
     "tarm": ("Chromoly", "tube", 0.055, 0.0040, "rigid", 0.0, 3.0),  # the trailing arms
-    "brace": ("Chromoly", "tube", 0.038, 0.0030, "rigid"),     # the arms' and the hub carriers' triangulating braces (in tension
+    "brace": ("Chromoly", "tube", 0.042, 0.0035, "rigid"),     # the arms' and the hub carriers' triangulating braces (in tension
                                                                # and compression: a light tube)
-    "pivot": ("Chromoly", "tube", 0.045, 0.0035, "rigid"),     # the front arms' pivot rails and posts, the anti-roll bars' bearings
-    "pickup": ("Chromoly", "tube", 0.050, 0.0040, "rigid"),    # the front lower rail between the lower wishbone's pivots
+    "pivot": ("ChromolyHT", "tube", 0.050, 0.0040, "rigid"),   # the front arms' pivot rails and posts, the anti-roll bars' bearings
+    "pickup": ("ChromolyHT", "tube", 0.050, 0.0040, "rigid"),  # the front lower rail between the lower wishbone's pivots
     "hub": ("Steel", "tube", 0.060, 0.0080, "rigid", 0.0, 3.0),      # uprights and hubs
     "tierod": ("Chromoly", "tube", 0.032, 0.0050, "ball"),
-    "rack": ("Steel", "tube", 0.035, 0.0050, "rigid"),
+    "rack": ("Chromoly", "tube", 0.038, 0.0060, "rigid"),     # (steel 35 x 5 bent on the jump)
     "arbf": ("SpringSteel", "tube", 0.030, 0.0040, "rigid"),  # the anti-roll bars' torsion tubes, front and rear (spring steel:
     "arbr": ("SpringSteel", "tube", 0.030, 0.0040, "rigid"),  # chromoly ones took a set in the ruts; 26 mm at the rear: with the hubs triangulated it rolled on the circle instead of spinning)
 }
@@ -401,22 +406,39 @@ for s in (1, -1):
     hull_quad(MH(s, Y0), MH(s, 1.30), TT(s), TL(s))                                  # the rear's sides
 orient_hull()
 
-# ---- the collision volumes (phys::CollisionVolume): what fills the racer, as convex hulls riding on the cage, close
-# under its panels (a few centimetres off their frames) - the crew and the seats in the cockpit (on its floor, the door
-# bars' ends and the harness bar; inside the side panels, under the roof, behind the nose), the engine, the transaxle
-# and the fuel cell behind the main hoop (on the rear lower rails, the floor's rear cross, the rear shock hoop's posts;
-# under the engine cover). The nose is left hollow (the steering, the front suspension). They keep other bodies and
-# the racer's own panels (the nose, the sides, the cover) out
-cab_an = ([k for k in body_ids if abs(nodes[k][1] - Y0) < 0.005 and X_MH - 0.01 <= nodes[k][0] <= X_FW + 0.01] +
-          [fem_get(p) for s in (1, -1) for p in (FW(s, Y_DOOR), MH(s, Y_DOOR), MH(s, 1.30))])
-volume("cabin", cab_an, [(x, y, s * z) for x, y, z in ((0.72, 0.60, 0.70), (-0.52, 0.60, 0.70), (0.72, 0.83, 0.70), (-0.52, 0.83, 0.70),
-                                                        (0.73, 1.05, 0.67), (0.20, 1.72, 0.58), (-0.52, 1.72, 0.58)) for s in (1, -1)], 0.15)
-eng_an = (body_nodes_on([[TRB(s), TL(s)] for s in (1, -1)] + [[TRB(s), TRT(s)] for s in (1, -1)] + [[TRB(-1), TRB(1)]]) +
-          [fem_get(MH(s, 1.30)) for s in (1, -1)])
-# (its top on the rear upper rails' line: the cover's frame stands 3 cm over them)
+# ---- the collision volumes (phys::CollisionVolume): what fills the racer, as convex hulls riding on the cage round
+# them (their anchors: its nodes near each), in zones that each follow their own part of the cage as it deforms, close
+# under the panels (a few centimetres off their frames): the V8 and the transaxle behind the main hoop (drawn; on the
+# rear lower rails), the fuel cell behind the seats, the left and the right side of the engine bay (the rails and the
+# rear shock hoop, from the engine to the cover's edge), the left and the right front clip under the nose (the upper
+# rails and the shock towers, over the upper arms: the nose's frame points 3 cm down), the two seats' spaces in the
+# cockpit (inside the side panels, under the roof). They keep other bodies and the racer's own panels (the nose, the
+# sides, the cover) out
+VOL_GAP = 0.03
+ENGINE_COL, BOX_COL = (0.16, 0.17, 0.18), (0.42, 0.43, 0.45)
 ru = lambda x: RU(1, (X_MH - x) / (X_MH - X_TAIL))
-volume("engine", eng_an, [(x, y, s * z) for x, y, z in ((-0.62, 0.60, 0.55), (-0.95, 0.60, 0.40), (-2.12, 0.82, 0.40), (-0.62, ru(-0.62)[1], ru(-0.62)[2] - 0.03),
-                                                         (-2.12, ru(-2.12)[1], ru(-2.12)[2] - 0.03)) for s in (1, -1)])
+rail_an = body_nodes_on([[TRB(s), TL(s)] for s in (1, -1)] + [[TRB(-1), TRB(1)]])
+volume("engine", rail_an, [(x, y, s * z) for x, y, z in ((-0.98, 0.62, 0.22), (-1.55, 0.66, 0.22), (-0.98, 0.86, 0.33), (-1.55, 0.88, 0.33),
+                                                           (-0.98, 1.20, 0.20), (-1.55, 1.12, 0.20)) for s in (1, -1)], 0.12, ENGINE_COL)
+volume("transaxle", rail_an, [(x, y, s * z) for x, y, z in ((-1.58, 0.68, 0.24), (-2.05, 0.76, 0.18), (-1.58, 1.00, 0.24), (-2.05, 0.96, 0.18))
+                              for s in (1, -1)], 0.12, BOX_COL)
+volume("fuel_cell", body_near(((-1.0, X_MH + 0.05), (Y0 - 0.01, 1.35), (-ZC - 0.01, ZC + 0.01))),
+       [(x, y, s * z) for x, y, z in ((-0.60, 0.60, 0.40), (-0.92, 0.60, 0.40), (-0.60, ru(-0.60)[1], 0.40), (-0.92, ru(-0.92)[1], 0.40)) for s in (1, -1)])
+cover = [nodes[k] for k in fem_ids if node_part.get(k) == "cover"]
+nose = [nodes[k] for k in fem_ids if node_part.get(k) == "nose"]
+for s, side in ((1, "left"), (-1, "right")):
+    zs = (0.0, 1.3) if s > 0 else (-1.3, 0.0)
+    top = [(max(p[0], -2.12), p[1] - VOL_GAP, s * (abs(p[2]) - VOL_GAP)) for p in cover if p[2] * s > 0.36 and p[0] < -0.95]
+    pts = top + [(x, y, s * z) for x, y in ((-0.98, 0.62), (-2.10, 0.84)) for z in (0.36, 0.40)] + [(x, ru(x)[1] - 0.02, s * 0.36) for x in (-0.98, -2.10)]
+    volume("bay_" + side, body_near(((-2.25, -0.90), (Y0 - 0.01, 1.60), zs)), pts)
+    top = [(min(p[0], 2.06), p[1] - VOL_GAP, s * max(0.02, abs(p[2]) - VOL_GAP)) for p in nose if p[2] * s > -0.01]   # (3 cm off its front face too)
+    pts = top + [(x, 0.99, s * z) for x in (0.80, 1.95) for z in (0.02, 0.40)]
+    volume("front_" + side, body_near(((0.70, 2.30), (0.85, 1.30), zs)), pts)
+    cab = [(x, y, s * z) for x, y, z in ((0.72, 0.60, 0.03), (-0.52, 0.60, 0.03), (0.72, 0.60, 0.70), (-0.52, 0.60, 0.70), (0.72, 0.83, 0.70),
+                                          (-0.52, 0.83, 0.70), (0.73, 1.05, 0.67), (0.73, 1.05, 0.03), (0.20, 1.72, 0.03), (-0.52, 1.72, 0.03),
+                                          (0.20, 1.72, 0.58), (-0.52, 1.72, 0.58))]
+    volume("seat_" + side, [k for k in body_ids if abs(nodes[k][1] - Y0) < 0.005 and X_MH - 0.01 <= nodes[k][0] <= X_FW + 0.01 and nodes[k][2] * s >= -0.01] +
+           [fem_get(p) for p in (FW(s, Y_DOOR), MH(s, Y_DOOR), MH(s, 1.30))], cab, 0.15)
 
 # ---------------------------------------------------------------------------------------------------------- write
 centre, back, left = fem_get((0.10, Y0, 0.0), 0.002), fem_get((X_MH, Y0, 0.0), 0.002), fem_get((0.10, Y0, ZC), 0.002)
@@ -520,11 +542,16 @@ for a, b, front in shocks:
 shocks_text += "set_beam_defaults 3000000, 20000, 400000, 99999999999999999999999999999999999999999, 0.05, tracks/beam, 0\n"
 for a, b, lo, hi in stops:
     shocks_text += "%d, %d, 0, 0, %.3f, %.3f, 1.0, i\n" % (a, b, lo, hi)
-wheels_text = "wheels\n;radius, width, rays, node1, node2, rigidity, braking, propulsion, arm, mass, spring, damping, face, band\n"
-wheels_text += "set_beam_defaults 3000000, 400, 400000, 99999999999999999999999999999999999999999, 0.05, tracks/beam, 0\n"
-for n1, n2, arm, front in wheels:   # (the rear wheels driven)
-    # (20 rays: 14 on a 39" tyre were 22 cm facets that caught the ground sliding sideways; the tread's springs the same in all)
-    wheels_text += "%.2f, %.2f, 20, %d, %d, 9999, 1, %d, %d, 60.0, 105000.0, 840.0, tracks/wheelface tracks/wheelband\n" % (WHEEL_R, WHEEL_W, n1, n2, 0 if front else 1, arm)
+if os.environ.get("NODE_WHEELS"):   # (NODE_WHEELS=1: RoR's wheels of nodes and spokes, as before the ring tyres)
+    wheels_text = "wheels\n;radius, width, rays, node1, node2, rigidity, braking, propulsion, arm, mass, spring, damping, face, band\n"
+    wheels_text += "set_beam_defaults 3000000, 400, 400000, 99999999999999999999999999999999999999999, 0.05, tracks/beam, 0\n"
+    for n1, n2, arm, front in wheels:   # (the rear wheels driven)
+        # (20 rays: 14 on a 39" tyre were 22 cm facets that caught the ground sliding sideways; the tread's springs the same in all)
+        wheels_text += "%.2f, %.2f, 20, %d, %d, 9999, 1, %d, %d, 60.0, 105000.0, 840.0, tracks/wheelface tracks/wheelband\n" % (WHEEL_R, WHEEL_W, n1, n2, 0 if front else 1, arm)
+else:   # ring tyres (phys::Wheel::ring): 39" off-road tyres on 15" beadlock rims, 45 kg, soft (low pressure); the rear driven
+    wheels_text = "ringwheels\n;(BeamLab) radius, rim radius, width, node1, node2, braking, propulsion, arm, mass, tyre stiffness (N/m, 2 cm in), damping (N s/m), grip\n"
+    for n1, n2, arm, front in wheels:
+        wheels_text += "%.2f, 0.190, %.2f, %d, %d, 1, %d, %d, 45.0, 150000.0, 1500.0, 1.1\n" % (WHEEL_R, WHEEL_W, n1, n2, 0 if front else 1, arm)
 engine_text = ("engine\n;min rpm, max rpm, torque, differential, reverse, neutral, gears...\n900.0, 6500.0, 850.0, 4.9, 3.0, 1.0, 2.9, 1.8, 1.3, 1.0, -1.0\n"
                "engoption\n0.12, c, 1000.0, 0.3, 0.4, 0.3\nbrakes\n6000\n")
 housing = [fem_get((RACK_X, Y_RACK, -ZF), 0.002), fem_get((RACK_X, Y_RACK, 0.0), 0.002), fem_get((RACK_X, Y_RACK, ZF), 0.002)]

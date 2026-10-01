@@ -76,10 +76,13 @@ void validate_structure(const Document& d) {
     }
     CHECK(ne == (int)d.nodes_explicit.size(), "explicit slots %d != nodes_explicit %zu", ne, d.nodes_explicit.size());
     CHECK(nc == (int)d.cinecams.size(), "cinecam slots %d != cinecams %zu", nc, d.cinecams.size());
-    int expect_first = -1, wheel_nodes = 0;
+    int expect_first = -1, wheel_nodes = 0, prev_count = 1;
     for (size_t wi = 0; wi < d.wheels.size(); wi++) {
         const WheelDef& w = d.wheels[wi];
-        CHECK(w.first_node > expect_first, "wheel %zu first_node %d not increasing", wi, w.first_node);
+        // (a ring tyre has no nodes: the wheel after it starts where it would have)
+        CHECK(w.first_node > expect_first || (w.first_node == expect_first && (prev_count == 0 || w.node_count() == 0)), "wheel %zu first_node %d not increasing", wi,
+              w.first_node);
+        prev_count = w.node_count();
         CHECK(w.first_node >= 0 && w.first_node + w.node_count() <= total, "wheel %zu range out of bounds", wi);
         if (w.first_node < 0 || w.first_node + w.node_count() > total) continue;
         for (int k = 0; k < w.node_count(); k++) {

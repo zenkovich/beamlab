@@ -330,14 +330,77 @@ void VehicleVisual::build(const ror::Document& d, const SoftBody& b, std::vector
         }
     }
 
+    // ---- the collision volumes drawn as solids (an engine block, a gearbox)
+    m_cur_part = -1;
+    for (int vi = 0; vi < (int)b.volumes.size(); vi++) {
+        const CollisionVolume& cv = b.volumes[vi];
+        if (cv.color.x < 0 || cv.faces.empty()) continue;
+        Solid s;
+        s.vol = vi;
+        vec3 mid(0);
+        for (const vec3& p : cv.verts) mid += p / (float)cv.verts.size();
+        std::vector<uint32_t> idx;
+        for (const auto& f : cv.faces) {
+            if (f.size() < 3) continue;
+            vec3 n = cross(cv.verts[f[1]] - cv.verts[f[0]], cv.verts[f[2]] - cv.verts[f[0]]);
+            n = normalize_or(dot(n, cv.verts[f[0]] - mid) < 0 ? -n : n, vec3(0, 1, 0));
+            const uint32_t base = (uint32_t)s.pos.size();
+            for (uint8_t k : f) s.pos.push_back(cv.verts[k]), s.nrm.push_back(n);
+            // (the face's points go round it counter-clockwise seen from outside)
+            const bool ccw = dot(cross(cv.verts[f[1]] - cv.verts[f[0]], cv.verts[f[2]] - cv.verts[f[0]]), n) > 0;
+            for (uint32_t k = 1; k + 1 < (uint32_t)f.size(); k++)
+                ccw ? idx.insert(idx.end(), {base, base + k, base + k + 1}) : idx.insert(idx.end(), {base, base + k + 1, base + k});
+        }
+        s.first = alloc((uint32_t)s.pos.size());
+        for (uint32_t& i : idx) i += s.first;
+        auto m = std::make_shared<Material>();
+        m->name = "volume " + cv.name;
+        m->color = vec4(cv.color, 1.0f);
+        m->specular = 0.12f, m->gloss = 16.0f; // (cast iron, not a mirror: its flat faces caught the sun white)
+        add_tris(m, idx);
+        m_solids.push_back(std::move(s));
+    }
     // ---- wheels
     for (int wi = 0; wi < (int)b.wheels.size(); wi++) {
         const Wheel& w = b.wheels[wi];
         if (w.tag < 0 || w.tag >= (int)d.wheels.size()) continue;
         const ror::WheelDef& wd = d.wheels[w.tag];
+        m_cur_part = part_code(PART_WHEEL, w.tag);
+        if (w.ring) {
+            RingTyre t;
+            t.wheel = wi;
+            t.segs = 2 * std::max(8, w.ring_n);
+            const int S = t.segs;
+            t.tyre = alloc((uint32_t)((S + 1) * kProfile));
+            t.rim = alloc((uint32_t)(2 * (S + 2)));
+            std::vector<uint32_t> ti, light, dark;
+            for (int i = 0; i < S; i++)
+                for (int k = 0; k + 1 < kProfile; k++) {
+                    const uint32_t a0 = t.tyre + i * kProfile + k, a1 = a0 + kProfile;
+                    ti.insert(ti.end(), {a0, a1, a0 + 1, a1, a1 + 1, a0 + 1}); // (facing out: the shader turns a back face's normal round)
+                }
+            for (int side = 0; side < 2; side++) {
+                const uint32_t c0 = t.rim + side * (S + 2);
+                for (int i = 0; i < S; i++) {
+                    auto& list = (i * 10 / S) % 2 ? dark : light; // (five spokes)
+                    if (side == 0) list.insert(list.end(), {c0, c0 + 2 + i, c0 + 1 + i});
+                    else list.insert(list.end(), {c0, c0 + 1 + i, c0 + 2 + i});
+                }
+            }
+            auto mat = [&](const char* name, vec3 col, float spec, float gloss) {
+                auto m = std::make_shared<Material>();
+                m->name = name, m->color = vec4(col, 1.0f), m->specular = spec, m->gloss = gloss;
+                m->double_sided = true;
+                return m;
+            };
+            add_tris(mat("ring tyre", vec3(0.15f, 0.15f, 0.155f), 0.25f, 18.0f), ti); // (rubber: dark grey, a soft sheen)
+            add_tris(mat("ring rim", vec3(0.66f, 0.68f, 0.72f), 0.6f, 60.0f), light);
+            add_tris(mat("ring rim dark", vec3(0.22f, 0.23f, 0.25f), 0.3f, 30.0f), dark);
+            m_rings.push_back(t);
+            continue;
+        }
         const int n = (int)w.nodes.size() / 2;
         if (n < 3) continue;
-        m_cur_part = part_code(PART_WHEEL, w.tag);
         if (wd.type == ror::WheelDef::WHEELS || wd.type == ror::WheelDef::WHEELS2) {
             bool w2 = wd.type == ror::WheelDef::WHEELS2;
             MaterialPtr face = material(wd.face_material, true), band = material(wd.band_material, true);
@@ -444,6 +507,76 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
     m_bounds.expand(1.0f);
     const Node* nd = b.nodes.data();
     Vertex* V = m_verts.data();
+    // the solids: where their volumes are placed, else fitted to their anchors (spawned, off after a crush)
+    for (const Solid& s : m_solids) {
+        if (s.vol >= (int)b.volumes.size()) continue;
+        const CollisionVolume& cv = b.volumes[s.vol];
+        vec3 c(0);
+        quat q = cv.q;
+        if (cv.placed) {
+            c = cv.c;
+        } else if (!cv.anchors.empty() && cv.rest.size() == cv.anchors.size()) {
+            for (uint32_t a : cv.anchors) c += nd[a].p / (float)cv.anchors.size();
+            mat3 A(vec3(0), vec3(0), vec3(0));
+            for (size_t i = 0; i < cv.anchors.size(); i++) A = A + outer(nd[cv.anchors[i]].p - c, cv.rest[i]);
+            for (int it = 0; it < 30; it++) { // (the best rotation: Mueller's iteration, as SoftBody::place_volumes)
+                const mat3 R = to_mat3(q);
+                const vec3 om = cross(R.c[0], A.c[0]) + cross(R.c[1], A.c[1]) + cross(R.c[2], A.c[2]);
+                const float den = std::fabs(dot(R.c[0], A.c[0]) + dot(R.c[1], A.c[1]) + dot(R.c[2], A.c[2])) + 1e-9f;
+                const vec3 w = om / den;
+                const float wl = length(w);
+                if (!(wl > 1e-7f)) break;
+                q = normalize(quat::axis_angle(w / wl, wl) * q);
+            }
+        }
+        const mat3 R = to_mat3(q);
+        for (size_t k = 0; k < s.pos.size(); k++) V[s.first + k].pos = c + R * s.pos[k], V[s.first + k].normal = R * s.nrm[k];
+    }
+    // the ring tyres: the section swept round the axle on the rim's angle, the tread where the ring's points are pressed in
+    // and sheared (between them: halfway), the sidewalls bulging as it is pressed
+    for (const RingTyre& t : m_rings) {
+        const Wheel& w = b.wheels[t.wheel];
+        const vec3 a0 = nd[w.axle0].p, a1 = nd[w.axle1].p, c = (a0 + a1) * 0.5f, ax = normalize_or(a1 - a0, vec3(0, 0, 1));
+        vec3 e1 = w.ref - ax * dot(w.ref, ax);
+        e1 = normalize_or(e1, normalize(any_perpendicular(ax)));
+        const vec3 e2 = cross(ax, e1);
+        const float R = w.radius, W = w.width, rim = std::min(w.rim_radius, 0.95f * R), wall = R - rim;
+        // (the section: lateral, radial from the rim; its normal)
+        static const float PS[kProfile] = {-0.46f, -0.5f, -0.5f, -0.44f, -0.30f, 0.30f, 0.44f, 0.5f, 0.5f, 0.46f};
+        const float PR[kProfile] = {0.0f, 0.35f, 0.75f, 0.97f, 1.0f, 1.0f, 0.97f, 0.75f, 0.35f, 0.0f};
+        const float PN[kProfile][2] = {{-1, -0.2f}, {-1, 0}, {-0.9f, 0.3f}, {-0.5f, 0.85f}, {0, 1}, {0, 1}, {0.5f, 0.85f}, {0.9f, 0.3f}, {1, 0}, {1, -0.2f}};
+        const int S = t.segs, NP = (int)w.squash.size();
+        for (int i = 0; i <= S; i++) {
+            const float th = w.angle + 2.0f * kPi * (float)i / (float)S;
+            const vec3 d = e1 * std::cos(th) + e2 * std::sin(th);
+            float sq = 0;
+            vec3 sh(0);
+            if (NP > 0) { // (the ring has half the segments: its points on the even ones, the odd ones halfway)
+                const int k0 = (i / 2) % NP, k1 = (k0 + (i & 1)) % NP;
+                sq = 0.5f * (w.squash[k0] + w.squash[k1]);
+                sh = (w.shift[k0] + w.shift[k1]) * 0.5f;
+            }
+            Vertex* rv = V + t.tyre + i * kProfile;
+            for (int k = 0; k < kProfile; k++) {
+                const float tread = k >= 3 && k <= 6 ? 1.0f : k == 2 || k == 7 ? 0.5f : k == 1 || k == 8 ? 0.2f : 0.0f;
+                const float r = rim + PR[k] * wall - sq * tread;
+                const float bulge = (k == 1 || k == 2 || k == 7 || k == 8) ? 0.5f * sq * (PS[k] < 0 ? -1.0f : 1.0f) : 0.0f;
+                rv[k].pos = c + ax * (PS[k] * W + bulge) + d * r + sh * tread;
+                rv[k].normal = normalize(ax * PN[k][0] + d * PN[k][1]);
+            }
+        }
+        for (int side = 0; side < 2; side++) {
+            Vertex* rv = V + t.rim + side * (S + 2);
+            const vec3 face = c + ax * ((side ? 0.46f : -0.46f) * W);
+            rv[0].pos = face - ax * ((side ? 0.08f : -0.08f) * W); // (the hub dished in)
+            rv[0].normal = side ? ax : -ax;
+            for (int i = 0; i <= S; i++) {
+                const float th = w.angle + 2.0f * kPi * (float)i / (float)S;
+                rv[1 + i].pos = face + (e1 * std::cos(th) + e2 * std::sin(th)) * rim;
+                rv[1 + i].normal = side ? ax : -ax;
+            }
+        }
+    }
     // cab: node positions + smooth normals
     if (m_cab_count) {
         for (uint32_t i = 0; i < m_cab_count; i++) {

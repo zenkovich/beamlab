@@ -89,6 +89,23 @@ private:
     struct CabTri {
         uint32_t a, b, c;
     };
+    // a collision volume drawn as a solid (phys::CollisionVolume::color: an engine block, a gearbox): its hull's faces
+    // fanned, flat shaded, placed where the volume is (or fitted to its anchors while it is not placed)
+    struct Solid {
+        int vol;                     // index into the body's volumes
+        uint32_t first;
+        std::vector<vec3> pos, nrm;  // (from the anchors' centre at rest, as the volume's points)
+    };
+    std::vector<Solid> m_solids;
+    // a ring tyre (phys::Wheel::ring): the tyre's section swept round (kProfile points across it, two segments per
+    // point of the ring), its tread pressed in and sheared as the ring's points are; the rim's two faces, their spokes
+    struct RingTyre {
+        int wheel;
+        uint32_t tyre, rim;          // first vertices: the tyre's ((segs + 1) x kProfile), the rims' (2 x (1 + segs + 1))
+        int segs;
+    };
+    static constexpr int kProfile = 10;
+    std::vector<RingTyre> m_rings;
 
     MaterialPtr material(const std::string& name, bool double_sided = false);
     const OgreMesh* mesh(const std::string& file);

@@ -34,7 +34,7 @@ float TorqueCurve::eval(float rpm) const {
 }
 
 // ------------------------------------------------------------------ differentials (RoR Differentials.cpp)
-void Differential::compute(float in, float s0, float s1, float dt, float& o0, float& o1) {
+void Differential::compute(float in, float s0, float s1, float dt, float& o0, float& o1, float stiff) {
     switch (modes.empty() ? OPEN : modes[mode % modes.size()]) {
     case SPLIT:
         o0 = o1 = in * 0.5f;
@@ -47,14 +47,14 @@ void Differential::compute(float in, float s0, float s1, float dt, float& o0, fl
         break;
     }
     case VISCOUS:
-        o0 = in * 0.5f - (s0 - s1) * 10000.0f;
-        o1 = in * 0.5f + (s0 - s1) * 10000.0f;
+        o0 = in * 0.5f - (s0 - s1) * 10000.0f * stiff;
+        o1 = in * 0.5f + (s0 - s1) * 10000.0f * stiff;
         break;
     case LOCKED:
         delta_rot += (s0 - s1) * dt;
         delta_rot = clampf(delta_rot, -0.05f, 0.05f);
-        o0 = in * 0.5f - delta_rot * 1e6f - (s0 - s1) * 1e4f;
-        o1 = in * 0.5f + delta_rot * 1e6f + (s0 - s1) * 1e4f;
+        o0 = in * 0.5f - (delta_rot * 1e6f + (s0 - s1) * 1e4f) * stiff;
+        o1 = in * 0.5f + (delta_rot * 1e6f + (s0 - s1) * 1e4f) * stiff;
         break;
     }
 }
@@ -370,6 +370,15 @@ void Drivetrain::update(float dt, const VehicleInput& in, SoftBody& b) {
     }
 
     // ---- torque distribution (RoR CalcDifferentials)
+    // (a ring tyre's rim alone takes the differential's coupling at the step: a tenth of the node wheels' inertia, the
+    // coupling of 1e4 N m per m/s between two of them was unstable - their torques swung +-30 kN m, the wheels spun; kept
+    // under half the rim's limit I / (dt R))
+    auto stiff_of = [&](const Wheel& a, const Wheel& c) {
+        float s = 1.0f;
+        for (const Wheel* w : {&a, &c})
+            if (w->ring) s = std::min(s, 0.5f * w->inertia / (dt * std::max(0.05f, w->radius) * 1e4f));
+        return s;
+    };
     if (has_engine && !propelled.empty()) {
         float T = clutch_torque / (float)propelled.size();
         if (axles_section) T *= 2.0f;
@@ -385,7 +394,7 @@ void Drivetrain::update(float dt, const VehicleInput& in, SoftBody& b) {
             float in_t = a0.torque + a1.torque + b0.torque + b1.torque;
             float sa = 0.5f * (a0.speed + a1.speed), sb = 0.5f * (b0.speed + b1.speed);
             float oa, ob;
-            ad.diff.compute(in_t, sa, sb, dt, oa, ob);
+            ad.diff.compute(in_t, sa, sb, dt, oa, ob, std::min(stiff_of(a0, a1), stiff_of(b0, b1)));
             a0.torque = a1.torque = oa * 0.5f;
             b0.torque = b1.torque = ob * 0.5f;
         }
@@ -393,7 +402,7 @@ void Drivetrain::update(float dt, const VehicleInput& in, SoftBody& b) {
             Wheel& w0 = b.wheels[wd.w0];
             Wheel& w1 = b.wheels[wd.w1];
             float in_t = w0.torque + w1.torque, o0, o1;
-            wd.diff.compute(in_t, w0.speed, w1.speed, dt, o0, o1);
+            wd.diff.compute(in_t, w0.speed, w1.speed, dt, o0, o1, stiff_of(w0, w1));
             w0.torque = o0;
             w1.torque = o1;
         }

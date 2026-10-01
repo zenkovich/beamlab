@@ -49,7 +49,7 @@ enum class Kw : uint8_t {
     NONE,
     // blocks with a handler here
     AXLES, BEAMS, BRAKES, CAB, CAMERAS, CINECAM, COMMANDS, COMMANDS2, CONTACTERS, ENGINE, ENGOPTION, FIXES, JOINTS, SHELLS, WELDS, MOUNTS, FEM_TRIS,
-    COLLISION_VOLUMES,
+    COLLISION_VOLUMES, RINGWHEELS,
     FLEXBODIES, FLEXBODYWHEELS, GLOBALS, GUISETTINGS, HYDROS, MANAGEDMATERIALS, MESHWHEELS, MESHWHEELS2, MINIMASS,
     NODES, NODES2, PROPS, ROPES, SHOCKS, SHOCKS2, SHOCKS3, TEXCOORDS, TIES, TORQUECURVE, WHEELDETACHERS, WHEELS,
     WHEELS2,
@@ -108,7 +108,7 @@ const KwInfo kKeywords[] = {
     {"guisettings", Kw::GUISETTINGS, false}, {"help", Kw::HELP, false}, {"hideinchooser", Kw::HIDEINCHOOSER, false},
     {"hookgroup", Kw::HOOKGROUP, false}, {"hooks", Kw::HOOKS, false}, {"hydros", Kw::HYDROS, false},
     {"importcommands", Kw::IMPORTCOMMANDS, false}, {"interaxles", Kw::INTERAXLES, false},
-    {"joints", Kw::JOINTS, false}, {"welds", Kw::WELDS, false}, {"mounts", Kw::MOUNTS, false}, {"fem_tris", Kw::FEM_TRIS, false}, {"collision_volumes", Kw::COLLISION_VOLUMES, false}, {"lockgroups", Kw::LOCKGROUPS, false}, {"lockgroup_default_nolock", Kw::LOCKGROUP_DEFAULT_NOLOCK, false},
+    {"joints", Kw::JOINTS, false}, {"welds", Kw::WELDS, false}, {"mounts", Kw::MOUNTS, false}, {"fem_tris", Kw::FEM_TRIS, false}, {"collision_volumes", Kw::COLLISION_VOLUMES, false}, {"ringwheels", Kw::RINGWHEELS, false}, {"lockgroups", Kw::LOCKGROUPS, false}, {"lockgroup_default_nolock", Kw::LOCKGROUP_DEFAULT_NOLOCK, false},
     {"managedmaterials", Kw::MANAGEDMATERIALS, false}, {"materialflarebindings", Kw::MATERIALFLAREBINDINGS, false},
     {"meshwheels", Kw::MESHWHEELS, false}, {"meshwheels2", Kw::MESHWHEELS2, false},
     {"minimass", Kw::MINIMASS, false}, {"nodecollision", Kw::NODECOLLISION, false}, {"nodes", Kw::NODES, false},
@@ -840,6 +840,7 @@ void Parser::data_line() {
     case Kw::WHEELS2:
     case Kw::MESHWHEELS:
     case Kw::MESHWHEELS2:
+    case Kw::RINGWHEELS:
     case Kw::FLEXBODYWHEELS: parse_wheel(); return;
     case Kw::ENGINE: parse_engine(); return;
     case Kw::TORQUECURVE: parse_torquecurve(); return;
@@ -960,13 +961,14 @@ void Parser::data_line() {
         md().mounts.push_back(m);
         return;
     }
-    case Kw::COLLISION_VOLUMES: { // (BeamLab) "volume name[, break rms m]", then its "anchors n1, n2, ..." and its hull's "vertex x, y, z"
+    case Kw::COLLISION_VOLUMES: { // (BeamLab) "volume name[, break rms m[, crush force N]]", then its "anchors n1, n2, ..." and its hull's "vertex x, y, z"
         std::string key(tok_[0]);
         for (char& c : key) c = (char)std::tolower((unsigned char)c);
         if (key == "volume") {
             Document::VolumeDef v;
             if (ntok_ > 1) v.name = std::string(tok_[1]);
             if (ntok_ > 2) v.break_rms = f(2);
+            if (ntok_ > 3) v.break_force = std::max(0.0f, f(3));
             md().volumes.push_back(v);
             return;
         }
@@ -980,6 +982,9 @@ void Parser::data_line() {
         } else if (key == "vertex") {
             if (!need(4)) return;
             v.verts.push_back(vec3(f(1), f(2), f(3)));
+        } else if (key == "color") {
+            if (!need(4)) return;
+            v.color = vec3(f(1), f(2), f(3));
         } else {
             warn_at(line_no_, "collision_volumes: unknown line '%.*s'", (int)tok_[0].size(), tok_[0].data());
         }
@@ -1367,9 +1372,24 @@ void Parser::parse_wheel() {
     case Kw::WHEELS2: w.type = WheelDef::WHEELS2; min = 17; break;
     case Kw::MESHWHEELS: w.type = WheelDef::MESHWHEELS; break;
     case Kw::MESHWHEELS2: w.type = WheelDef::MESHWHEELS2; break;
+    case Kw::RINGWHEELS: w.type = WheelDef::RINGWHEELS; min = 11; break;
     default: w.type = WheelDef::FLEXBODYWHEELS; break;
     }
     if (!need(min)) return;
+    if (w.type == WheelDef::RINGWHEELS) { // (BeamLab) radius, rim radius, width, node1, node2, braking, propulsion, arm, mass,
+        // the tyre's stiffness (N/m, pressed in 2 cm on the flat), its damping (N s/m)[, its grip]: a rigid rim, a flexible tyre
+        w.radius = f(0), w.rim_radius = f(1), w.width = f(2);
+        w.n1 = ref(3), w.n2 = ref(4);
+        w.braking = std::clamp(ival(5), 0, 4), w.propulsion = std::clamp(ival(6), 0, 2);
+        w.arm = ref(7), w.mass = f(8), w.spring = f(9), w.damp = f(10);
+        if (ntok_ > 11) w.grip = f(11);
+        w.rays = 0;
+        w.nd = nd_, w.bd = bd_, w.line = line_no_;
+        w.first_node = (int)doc_.nodes.size();
+        doc_.wheels.push_back(std::move(w));
+        wheel_mod_.push_back(cur_);
+        return;
+    }
     const bool legacy = w.type == WheelDef::WHEELS;
     w.rays = ival(legacy ? 2 : 3);
     if (w.rays < 1 || w.rays > kMaxRays) {
@@ -1443,6 +1463,7 @@ void Parser::parse_wheel() {
         if (ntok_ > i + 5) w.rim_mesh = std::string(tok_[i + 5]);
         if (ntok_ > i + 6) w.tyre_material = std::string(tok_[i + 6]);
         break;
+    case WheelDef::RINGWHEELS: break; // (parsed above)
     }
     w.nd = nd_;
     w.bd = bd_;

@@ -107,7 +107,9 @@ public:
     void set_node_position(int i, vec3 p);
     float ghost = 1.0f;
     VehicleVisual* visual() { return m_visual.get(); }
+    const FrameVisual* frame_visual() const { return m_frame.get(); }
     const std::vector<std::string>& load_warnings() const { return m_warnings; }
+    const std::vector<phys::Node>& spawn_nodes() const { return m_spawn_nodes; } // (as built, in the definition's space)
 
 private:
     friend class VehicleBuilder;

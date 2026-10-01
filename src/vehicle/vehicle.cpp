@@ -245,6 +245,16 @@ void Vehicle::reset(vec3 pos, float yaw_deg) {
         if (g - p.y > lift && getenv("BL_LIFTDBG")) fprintf(stderr, "lift: node %zu p (%.3f %.3f %.3f) ground %.3f -> lift %.3f\n", i, p.x, p.y, p.z, g, g - p.y);
         lift = std::max(lift, g - p.y);
     }
+    for (Wheel& w : b.wheels) { // (a ring tyre's bottom: no node of its own there)
+        if (!w.ring) continue;
+        const vec3 c = (b.nodes[w.axle0].p + b.nodes[w.axle1].p) * 0.5f;
+        const float g = m_world ? ground_height_at(*m_world, c.x, c.z, top + 20.0f) : 0.0f;
+        lift = std::max(lift, g - (c.y - w.radius));
+        w.spin = w.angle = 0;
+        std::fill(w.shear.begin(), w.shear.end(), vec3(0));
+        std::fill(w.squash.begin(), w.squash.end(), 0.0f);
+        std::fill(w.shift.begin(), w.shift.end(), vec3(0));
+    }
     if (lift > -1e8f)
         for (auto& n : b.nodes) n.p.y += lift + 0.03f;
     b.compute_aabb();
@@ -278,6 +288,7 @@ void Vehicle::launch(vec3 v) {
         vec3 omega = cross(up, v) / std::max(0.05f, w.radius);
         for (uint32_t ni : w.nodes) b.nodes[ni].v = v + cross(omega, b.nodes[ni].p - hub);
         for (uint32_t ni : w.rim) b.nodes[ni].v = v + cross(omega, b.nodes[ni].p - hub);
+        if (w.ring) w.spin = dot(omega, normalize(b.nodes[w.axle1].p - b.nodes[w.axle0].p)); // (a ring tyre rolls on)
         w.speed = w.avg_speed = length(v);
     }
     m_drive->speed = length(v);
@@ -352,16 +363,19 @@ void Vehicle::update_visuals() {
 }
 
 void Vehicle::draw(Renderer& r, InstanceCollector&, const DebugView& dbg) {
+    // (the x-ray view, F6: the frame's plates and the sheet see-through, its members, the machinery and the wheels as
+    // they are - what is inside the body)
+    const float xray = dbg.xray ? std::clamp(dbg.xray_alpha, 0.02f, 1.0f) : 1.0f;
     if (m_visual && !dbg.hide_meshes) m_visual->draw(r, ghost);
     if (m_frame && !dbg.hide_meshes && ghost > 0.001f) {
         m_frame->upload();
-        m_frame->draw(r, ghost); // (the editor's preview: see-through as its meshes)
+        m_frame->draw(r, ghost, xray * ghost); // (the editor's preview: see-through as its meshes)
     }
     if (m_sheet) {
         m_sheet->upload(m_sheet_first);
         m_sheet_first = false;
         static const bool no_panels = getenv("BL_NOPANELS") != nullptr; // (the frame alone: pictures of its tubes)
-        if (!dbg.hide_meshes && ghost > 0.001f && !no_panels) m_sheet->draw(r);
+        if (!dbg.hide_meshes && ghost > 0.001f && !no_panels) m_sheet->draw(r, xray);
     }
 }
 

@@ -635,7 +635,7 @@ void FrameVisual::update(const phys::SoftBody& b) {
         Vertex* v = &verts[e * kSides * 2];
         const vec3 a = b.nodes[f.node[m.a]].p, c = b.nodes[f.node[m.b]].p;
         const float L = length(c - a);
-        if (m.broken || !(L > 1e-5f)) {
+        if (m.broken || m.hidden || !(L > 1e-5f)) {
             for (int k = 0; k < kSides * 2; k++) v[k].pos = a; // (nothing to draw)
             continue;
         }
@@ -650,19 +650,21 @@ void FrameVisual::update(const phys::SoftBody& b) {
             v[k + kSides] = {p1 + n * r, n, vec2((float)k / kSides, L)};
         }
     }
-    // the plates: per triangle its two faces (6 vertices, the back one wound the other way), rebuilt as triangles tear out
-    if (f.tris.empty()) return;
-    size_t live = 0;
+    // the plates: per triangle its two faces (6 vertices, the back one wound the other way), rebuilt as triangles tear out;
+    // after the frame's triangles its loose ones (FemFrame::loose_tris: fragments torn off, on body nodes, flat)
+    const size_t nt = f.tris.size(), nl = f.loose_tris.size();
+    if (nt == 0 && nl == 0) return;
+    size_t live = nl;
     for (const phys::FrameTri& t : f.tris) live += !t.broken;
-    if (plate_built != f.tris.size() * 1000003 + live) {
-        plate_built = f.tris.size() * 1000003 + live;
-        plate_verts.assign(f.tris.size() * 6, Vertex{});
+    if (plate_built != (nt + nl) * 1000003 + live) {
+        plate_built = (nt + nl) * 1000003 + live;
+        plate_verts.assign((nt + nl) * 6, Vertex{});
         plate_idx.clear();
         plate_ranges.assign(f.shell_sections.size(), {0, 0});
         for (size_t sec = 0; sec < f.shell_sections.size(); sec++) { // (by section: each drawn in its material)
             plate_ranges[sec].first = (int)plate_idx.size();
-            for (size_t i = 0; i < f.tris.size(); i++) {
-                if (f.tris[i].broken || f.tris[i].section != sec) continue;
+            for (size_t i = 0; i < nt + nl; i++) {
+                if (i < nt ? (f.tris[i].broken || f.tris[i].section != sec) : f.loose_tris[i - nt].section != sec) continue;
                 const uint32_t o = (uint32_t)(i * 6);
                 plate_idx.insert(plate_idx.end(), {o, o + 1, o + 2, o + 3, o + 5, o + 4});
             }
@@ -671,8 +673,8 @@ void FrameVisual::update(const phys::SoftBody& b) {
         plate_rebuilt = true;
     }
     node_normal.assign(f.node.size(), vec3(0));
-    std::vector<vec3> fn(f.tris.size(), vec3(0));
-    for (size_t i = 0; i < f.tris.size(); i++) {
+    std::vector<vec3> fn(nt, vec3(0));
+    for (size_t i = 0; i < nt; i++) {
         const phys::FrameTri& t = f.tris[i];
         if (t.broken) continue;
         const vec3 a = b.nodes[f.node[t.n[0]]].p, c = b.nodes[f.node[t.n[1]]].p, d = b.nodes[f.node[t.n[2]]].p;
@@ -682,7 +684,7 @@ void FrameVisual::update(const phys::SoftBody& b) {
     }
     for (vec3& n : node_normal) n = normalize_or(n, vec3(0, 1, 0));
     const float kCrease = 0.82f; // (cos 35 degrees)
-    for (size_t i = 0; i < f.tris.size(); i++) {
+    for (size_t i = 0; i < nt; i++) {
         const phys::FrameTri& t = f.tris[i];
         if (t.broken) continue;
         const float h = 0.5f * f.shell_sections[t.section].t;
@@ -693,6 +695,20 @@ void FrameVisual::update(const phys::SoftBody& b) {
             const vec2 uv(p.x + p.y * 0.3f, p.z + p.y * 0.7f);
             v[k] = {p + fn[i] * h, n, uv};
             v[3 + k] = {p - fn[i] * h, -n, uv};
+        }
+    }
+    for (size_t i = 0; i < nl; i++) {
+        const phys::FemFrame::LooseTri& t = f.loose_tris[i];
+        if (t.n[0] >= b.nodes.size() || t.n[1] >= b.nodes.size() || t.n[2] >= b.nodes.size()) continue;
+        const vec3 a = b.nodes[t.n[0]].p, c = b.nodes[t.n[1]].p, d = b.nodes[t.n[2]].p;
+        const vec3 n = normalize_or(cross(c - a, d - a), vec3(0, 1, 0));
+        const float h = t.section < f.shell_sections.size() ? 0.5f * f.shell_sections[t.section].t : 0.0f;
+        Vertex* v = &plate_verts[(nt + i) * 6];
+        for (int k = 0; k < 3; k++) {
+            const vec3 p = b.nodes[t.n[k]].p;
+            const vec2 uv(p.x + p.y * 0.3f, p.z + p.y * 0.7f);
+            v[k] = {p + n * h, n, uv};
+            v[3 + k] = {p - n * h, -n, uv};
         }
     }
 }
@@ -734,17 +750,23 @@ void FrameVisual::upload() {
     }
 }
 
-void FrameVisual::draw(Renderer& r, float alpha) const {
-    auto see = [&](const Material* m) -> const Material* {
-        if (!m || alpha >= 0.999f) return m;
-        auto& g = ghosts[m];
-        if (!g) g = std::make_unique<Material>(*m);
-        g->blend = true, g->cast_shadow = false, g->double_sided = true, g->alpha_ref = 0.0f;
-        g->color = vec4(m->color.x, m->color.y, m->color.z, m->color.w * alpha);
-        return g.get();
-    };
-    if (mesh.valid() && mat && !verts.empty()) r.draw_mesh(&mesh, see(mat.get()), mat4());
+namespace {
+// a see-through copy of a material (cached in `ghosts`), alpha 1 the material itself
+const Material* see_through(std::unordered_map<const Material*, std::unique_ptr<Material>>& ghosts, const Material* m, float alpha) {
+    if (!m || alpha >= 0.999f) return m;
+    auto& g = ghosts[m];
+    if (!g) g = std::make_unique<Material>(*m);
+    g->blend = true, g->cast_shadow = false, g->double_sided = true, g->alpha_ref = 0.0f;
+    g->color = vec4(m->color.x, m->color.y, m->color.z, m->color.w * alpha);
+    return g.get();
+}
+} // namespace
+
+void FrameVisual::draw(Renderer& r, float alpha, float plate_alpha) const {
+    if (mesh.valid() && mat && !verts.empty()) r.draw_mesh(&mesh, see_through(ghosts, mat.get(), alpha), mat4());
     if (!plate_mesh.valid() || plate_idx.empty()) return;
+    const float pa = plate_alpha < 0 ? alpha : plate_alpha;
+    auto see = [&](const Material* m) { return see_through(ghosts, m, pa); };
     const Material* base = see((plate_mat ? plate_mat : frame_plate_material()).get());
     bool own = false;
     for (size_t sec = 0; sec < plate_ranges.size(); sec++) own |= sec < section_mats.size() && section_mats[sec] && plate_ranges[sec].second > 0;
@@ -759,14 +781,14 @@ void FrameVisual::draw(Renderer& r, float alpha) const {
     }
 }
 
-void ShellVisual::draw(Renderer& r) const {
+void ShellVisual::draw(Renderer& r, float alpha) const {
     if (ranges.size() <= 1) {
-        r.draw_mesh(&mesh, mat.get(), mat4());
+        r.draw_mesh(&mesh, see_through(ghosts, mat.get(), alpha), mat4());
     } else {
         for (size_t m = 0; m < ranges.size(); m++) {
             if (ranges[m].second <= 0) continue;
             const Material* mm = m < mats.size() && mats[m] ? mats[m].get() : mat.get();
-            r.draw_mesh(&mesh, mm, mat4(), ranges[m].first, ranges[m].second);
+            r.draw_mesh(&mesh, see_through(ghosts, mm, alpha), mat4(), ranges[m].first, ranges[m].second);
         }
     }
     for (const auto& f : fx)
@@ -777,12 +799,13 @@ void DynamicObject::update_visuals() {
     if (prepare_visuals()) upload_visuals();
 }
 
-void DynamicObject::draw(Renderer& r, InstanceCollector& ic) {
+void DynamicObject::draw(Renderer& r, InstanceCollector& ic, float xray) {
     if (rigid)
         for (auto& p : rigid->parts) r.draw_mesh(p.mesh, p.mat, rigid->model);
     for (auto& s : surfaces) r.draw_mesh(&s->mesh, s->mat.get(), mat4());
-    if (sheet) sheet->draw(r);
-    if (frame) frame->draw(r);
+    const float see = xray > 0 ? xray : 1.0f;
+    if (sheet) sheet->draw(r, see);
+    if (frame) frame->draw(r, 1.0f, see);
     if (tree) {
         r.draw_mesh(&tree->bark_mesh, tree->bark.get(), mat4());
         if (tree->leaf_mesh.valid() && tree->leaf) r.draw_mesh(&tree->leaf_mesh, tree->leaf.get(), mat4());

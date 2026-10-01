@@ -339,11 +339,16 @@ def body_nodes_on(polylines, box=None):
     return sorted(out)
 
 
-def volume(name, anchors, points, rms=0.12):
+def volume(name, anchors, points, rms=0.12, color=None):
     """a collision volume (phys::CollisionVolume): the convex hull of the points (design space, both sides given)
-    riding on the anchors (the body's frame nodes)"""
+    riding on the anchors (the body's frame nodes); color: drawn as a solid of it (an engine block)"""
     assert len(anchors) >= 3, (name, len(anchors))
-    volumes.append((name, sorted(set(anchors)), points, rms))
+    volumes.append((name, sorted(set(anchors)), points, rms, color))
+
+
+def body_near(box):
+    """the body's frame nodes in the box ((x0, x1), (y0, y1), (z0, z1)): a zone's anchors"""
+    return sorted(k for k in body_ids if all(box[a][0] - 1e-6 <= nodes[k][a] <= box[a][1] + 1e-6 for a in range(3)))
 
 
 def hull_planes(pts):
@@ -376,7 +381,7 @@ def volume_clearances():
             for k in pan.nodes:
                 part_of[k] = pan.part
     res = []
-    for name, an, pts, rms in volumes:
+    for name, an, pts, rms, col in volumes:
         planes = hull_planes(pts)
         gap = {}
         for k, part in part_of.items():
@@ -686,10 +691,12 @@ def write(path, v):
             f.write("%d\n" % i)
         if volumes:
             f.write("collision_volumes\n;(BeamLab) volume name, break rms (m) - its anchors (frame nodes) - its hull's points (x, y, z)\n")
-            for name, an, pts, rms in volumes:
+            for name, an, pts, rms, col in volumes:
                 f.write("volume %s, %.2f\nanchors %s\n" % (name, rms, ", ".join(str(a) for a in an)))
                 for x, y, z in pts:
                     f.write("vertex %.3f, %.3f, %.3f\n" % (-x, y, z))
+                if col:
+                    f.write("color %.2f, %.2f, %.2f\n" % col)
         f.write("welds\n;anchor (a frame node), sheet node, radius m, strength N, stiffness N/m (0: the step's), anchor2, t (a point on a member)\n")
         mat_of = {k: pan.mat for pan in panels for k in pan.nodes}
         for w in welds:

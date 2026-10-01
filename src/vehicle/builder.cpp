@@ -143,6 +143,7 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
 
     // ---- wheels: generate nodes + beams
     body.wheels.clear();
+    std::vector<float> ring_mass(N, 0.0f); // (the ring tyres' mass on their axle nodes)
     for (const auto& w : d.wheels) {
         int A = w.n1, B = w.n2;
         if (A < 0 || B < 0 || A >= N || B >= N) continue;
@@ -162,6 +163,25 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
         wh.arm = w.arm;
         if (w.arm >= 0 && w.arm < N) wh.near_attach = length2(pos[w.arm] - pos[A]) < length2(pos[w.arm] - pos[B]) ? A : B;
         float node_fric = w.nd.friction > 0 ? w.nd.friction : 1.0f;
+        if (w.type == ror::WheelDef::RINGWHEELS) {
+            // a ring tyre (phys::Wheel::ring): no nodes of its own, its mass on the axle nodes; its stiffness given as the
+            // tyre's pressed 2 cm into the flat (its patch then 2 sqrt(2 R 0.02) long), per area of the tyre
+            wh.ring = true;
+            wh.type = Wheel::W_RING;
+            wh.width = w.width > 0 ? w.width : wh.width;
+            wh.mass = w.mass;
+            wh.inertia = std::max(0.05f, 0.5f * w.mass * w.radius * w.radius);
+            wh.grip = w.grip > 0 ? w.grip : 1.0f;
+            const float patch = (4.0f / 3.0f) * wh.width * std::sqrt(2.0f * w.radius * 0.02f);
+            wh.k_area = (w.spring > 0 ? w.spring : 2.0e5f) / patch;
+            wh.c_area = (w.damp > 0 ? w.damp : 500.0f) / patch;
+            wh.k_shear = 1.5f * wh.k_area;
+            wh.c_shear = 2.5f * wh.c_area;
+            wh.ref = ogre_perpendicular(axis);
+            ring_mass[A] += 0.5f * w.mass, ring_mass[B] += 0.5f * w.mass;
+            body.wheels.push_back(std::move(wh));
+            continue;
+        }
         const auto& bd = w.bd;
         float strength = bd.brk; // unscaled
         float deform = bd.deform_threshold();
@@ -551,6 +571,7 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
         const bool frame_only = frame_node[i] && !plain_node[i];
         if (!frame_only && !(d.minimass_skip_loaded && loaded[i]) && mass[i] < minimass[i]) mass[i] = minimass[i];
         if (mass[i] <= 0) mass[i] = 1.0f;
+        mass[i] += ring_mass[i];
     }
 
     // ---- collision cabs / contact flags
@@ -714,6 +735,7 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
                                                     (uint8_t)(b.end_b >= 0 ? b.end_b : fs.end_b), bi);
             // (the mass it put on its nodes: its share of the dry mass and its own; moved along when it splits or tears)
             body.fem.elems[e].mass = frame_mass[bi];
+            body.fem.elems[e].hidden = b.options.find('i') != std::string::npos; // (option i: not drawn)
         }
     }
     // ---- triangle elements (FEM shells: phys::FrameTri) on frame nodes of their own or the members'
@@ -750,8 +772,22 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
         std::vector<uint32_t> an;
         for (int a : v.anchors)
             if (a >= 0 && a < N) an.push_back((uint32_t)a);
-        if (body.add_volume(v.name, an, v.verts, v.break_rms) < 0)
+        if (const int vi = an.size() >= 3 ? body.add_volume(v.name, an, v.verts, v.break_rms) : -1; vi < 0)
             warnings.push_back(format("collision volume '%s': needs 3 anchors and a hull of 4 points or more", v.name.c_str()));
+        else
+            body.volumes[vi].color = v.color, body.volumes[vi].break_force = v.break_force;
+    }
+    // the ring tyres' volumes: a 16-sided drum of the tyre round each axle, for the other bodies (its tyre meets the
+    // static world itself)
+    for (size_t wi = 0; wi < body.wheels.size(); wi++) {
+        const Wheel& w = body.wheels[wi];
+        if (!w.ring) continue;
+        const vec3 p0 = body.nodes[w.axle0].p, p1 = body.nodes[w.axle1].p, c = (p0 + p1) * 0.5f, ax = normalize(p1 - p0);
+        const vec3 u = normalize(any_perpendicular(ax)), v = cross(ax, u);
+        std::vector<vec3> drum;
+        for (int k = 0; k < 16; k++)
+            for (float s : {-0.5f, 0.5f}) drum.push_back(c + ax * (s * w.width) + (u * std::cos(k * kPi / 8) + v * std::sin(k * kPi / 8)) * w.radius);
+        if (const int vi = body.add_volume(format("tyre%d", (int)wi), {w.axle0, w.axle1}, drum, 1e9f); vi >= 0) body.volumes[vi].tyre = true;
     }
     if (const int in = body.find_volume_parts(); in > 0) // (the parts they hold off: nodes inside one as built are left out)
         warnings.push_back(format("collision volumes: %d nodes of the parts inside them as built (not held off)", in));

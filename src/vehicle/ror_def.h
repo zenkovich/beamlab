@@ -128,7 +128,7 @@ struct CameraDef {
 };
 
 struct WheelDef {
-    enum Type { WHEELS, WHEELS2, MESHWHEELS, MESHWHEELS2, FLEXBODYWHEELS } type = WHEELS;
+    enum Type { WHEELS, WHEELS2, MESHWHEELS, MESHWHEELS2, FLEXBODYWHEELS, RINGWHEELS } type = WHEELS;
     float radius = 0.5f;        // tyre radius (physics ring)
     float rim_radius = 0.0f;
     float width = 0.2f;
@@ -141,6 +141,7 @@ struct WheelDef {
     float mass = 50.0f;
     float spring = 0, damp = 0;         // wheels/meshwheels*: tyre (and rim) spring/damp; wheels2/flexbody: tyre
     float rim_spring = 0, rim_damp = 0; // wheels2 / flexbodywheels
+    float grip = 1.0f;                  // (BeamLab) ringwheels: the tyre's grip, times the ground's friction
     char side = 'l';                    // meshwheels*/flexbodywheels
     std::string face_material, band_material; // wheels / wheels2
     std::string rim_mesh;               // meshwheels*/flexbodywheels
@@ -150,7 +151,7 @@ struct WheelDef {
     int first_node = 0;                 // file-order index of the first generated node
     int detacher_group = 0;
     int line = 0;
-    int node_count() const { return (type == WHEELS2 || type == FLEXBODYWHEELS) ? 4 * rays : 2 * rays; }
+    int node_count() const { return type == RINGWHEELS ? 0 : (type == WHEELS2 || type == FLEXBODYWHEELS) ? 4 * rays : 2 * rays; }
 };
 
 struct EngineDef {
@@ -382,8 +383,10 @@ struct Document {
     struct VolumeDef {
         std::string name;
         float break_rms = 0.12f;
+        float break_force = 0.0f;   // (the volume line's third value, N: its crush force; 0 none)
         std::vector<int> anchors;
         std::vector<vec3> verts;
+        vec3 color{-1, -1, -1};     // `color r, g, b`: drawn as a solid (an engine block, a gearbox); negative: not drawn
     };
     std::vector<VolumeDef> volumes;
     // (BeamLab) `fem_tris`: n1, n2, n3 - triangle elements of the FEM frame (a shell: membrane and bending in the frame's

@@ -64,7 +64,9 @@ struct FrameVisual {
     mutable std::unordered_map<const Material*, std::unique_ptr<Material>> ghosts; // see-through copies of the materials
     void update(const phys::SoftBody& b);
     void upload();
-    void draw(Renderer& r, float alpha = 1.0f) const;   // (alpha below 1: see-through, as the editor's preview draws a vehicle)
+    // (alpha below 1: see-through, as the editor's preview draws a vehicle; plate_alpha the plates' own, the x-ray view's
+    // - negative: alpha)
+    void draw(Renderer& r, float alpha = 1.0f, float plate_alpha = -1.0f) const;
 };
 MaterialPtr frame_plate_material(); // (bare steel plate, shared)
 MaterialPtr frame_tube_material(); // (painted steel tube, shared)
@@ -73,7 +75,8 @@ struct ShellVisual {
     MaterialPtr mat;
     std::vector<MaterialPtr> mats;                    // per Shell::mat (none / null: mat): a sheet of several materials
     std::vector<std::pair<int, int>> ranges;          // per Shell::mat: its indices (first, count) after a rebuild
-    void draw(Renderer& r) const;                     // the sheet (by material) and its artifacts
+    void draw(Renderer& r, float alpha = 1.0f) const; // the sheet (by material) and its artifacts (alpha below 1: see-through)
+    mutable std::unordered_map<const Material*, std::unique_ptr<Material>> ghosts; // (its see-through copies of the materials)
     float thickness = 0.0f;
     float crease_cos = -2.0f;                         // shading normals split where faces meet at more than acos(this)
                                                       // (a drum's ends and wall: 45 degrees); below -1: smooth everywhere
@@ -183,7 +186,7 @@ public:
     bool prepare_visuals();  // CPU part, returns true if an upload is needed (thread safe per object)
     void upload_visuals();   // GL part (main thread)
     void update_visuals();   // both
-    void draw(Renderer& r, struct InstanceCollector& ic);
+    void draw(Renderer& r, struct InstanceCollector& ic, float xray = 0.0f); // (xray > 0: its plates and sheet see-through, that alpha)
 
 private:
     bool m_upload_first = false;

@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace bl {
@@ -32,7 +33,7 @@ struct VehicleInput {
 struct DebugView {
     bool beams = false;
     bool nodes = false;
-    bool stress = false;       // color beams by stress
+    bool stress = true;        // (F8) the beam view coloured by the elements' loads (off: by their deformation)
     bool collision = false;    // collision triangles / capsules
     bool hide_meshes = false;  // skeleton only
     bool contacts = false;
@@ -41,6 +42,11 @@ struct DebugView {
     bool frames = true;        // with the nodes: the joints' frames as small axes
     float beam_px = 1.0f;      // the beams' width on screen (points; the model editor's display setting)
     bool hide_terrain = false; // the ground is not drawn (it still collides): the model editor's floor switch
+    bool xray = false;         // (F6) the FEM plates and the sheets see-through: the body's inside (its members, engine, wheels)
+    float xray_alpha = 0.2f;
+    bool labels = false;       // (off: View menu) with the beams: the ring tyres' load and slip, the most loaded elements' forces and stresses;
+                               // with the volumes their names (close to the camera)
+    bool volumes = false;      // (F7) the collision volumes (a car's engine, its zones, the ring tyres' drums)
 };
 
 enum class Tool { Grab = 0, Destroy = 1, Shoot = 2, Laser = 3 };
@@ -131,6 +137,7 @@ public:
     std::string scene_banner;               // big text at the top centre (running stage time)
     std::vector<SceneAction> scene_actions; // scene-specific Scene menu entries
     std::vector<WorldLabel> labels;         // scene-specific labels in the world
+    std::vector<WorldLabel> debug_labels;   // (the debug view's, remade each frame: volumes' names, ring tyres' load)
     bool no_player_vehicle = false; // scene manages its own vehicles (crash test)
 
     // ---- state
@@ -218,6 +225,7 @@ private:
     std::vector<StaticVisual> m_static_visuals;
     InstanceCollector m_instances;
     Camera m_last_cam;
+    std::unordered_map<const phys::SoftBody*, std::vector<int>> m_vol_hits; // (the debug view: each volume's contacts at the last frame)
     int m_object_counter = 0;
     Vehicle* m_crash_a = nullptr;
     Vehicle* m_crash_b = nullptr;

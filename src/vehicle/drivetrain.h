@@ -20,7 +20,8 @@ struct Differential {
     std::vector<Type> modes{OPEN, LOCKED};
     int mode = 0;
     float delta_rot = 0;
-    void compute(float in, float s0, float s1, float dt, float& o0, float& o1);
+    // (stiff: its viscous and locked couplings scaled by this, from 1 - a ring tyre's light rim takes less at a step)
+    void compute(float in, float s0, float s1, float dt, float& o0, float& o1, float stiff = 1.0f);
 };
 
 struct HydroCtl {
