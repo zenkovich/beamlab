@@ -153,8 +153,10 @@ struct Mount {
 struct Volume {
     std::string name;
     float break_rms = 0.12f;
+    float break_force = 0.0f;       // its crush force (N; 0: none)
     std::vector<int> anchors;
     std::vector<vec3> verts;        // (the hull's points, in the model's space)
+    vec3 color{-1, -1, -1};         // drawn as a solid of this colour in the game (an engine block); negative: not drawn
 };
 
 // a node that slides along a rail of nodes (the truck's `slidenodes`: a steering rack's ends in its housing)
@@ -172,7 +174,7 @@ struct Joint {                      // a beam with orientation: the child node i
 };
 
 struct Wheel {
-    int type = 0;                   // ror::WheelDef::Type: wheels, wheels2, meshwheels, meshwheels2, flexbodywheels
+    int type = 0;                   // ror::WheelDef::Type: wheels, wheels2, meshwheels, meshwheels2, flexbodywheels, ringwheels
     float radius = 0.35f, rim_radius = 0.2f, width = 0.2f;
     int rays = 12;
     int n1 = -1, n2 = -1;           // axle nodes
@@ -185,6 +187,7 @@ struct Wheel {
     std::string rim_mesh, tyre_material; // mesh wheels (flexbodywheels: the tyre mesh)
     ElemDefaults bd;                // (its beams' strength and set; meshwheels2: the rim beams' spring and damping)
     float friction = 1.0f;          // its nodes' friction (set_node_defaults)
+    float grip = 1.0f;              // ringwheels: the tyre's grip (times the ground's friction)
     bool gfx_hidden = false;        // its tyre and rim not drawn in the editor (not saved)
     int layer = 0;
 };
@@ -304,6 +307,7 @@ struct Model {
     int node_uses(int n) const;
     int nearest_node(vec3 p, float r) const;
     int twin(int n) const;
+    std::vector<int> twins() const; // every node's twin at once
     vec3 centroid() const;
     std::string slug() const;
     // editing: a node's removal takes its beams, shocks, hydros, triangles, wheels and meshes bound to it with it

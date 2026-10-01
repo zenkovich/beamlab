@@ -133,12 +133,19 @@ void Game::load_scene(int index) {
     world.statics = phys::StaticWorld();
     // a piece cracked off a sheet becomes its own object with the sheet's look
     world.on_piece = [this](phys::SoftBody* parent, phys::SoftBody* piece) {
-        if (!piece->fem.empty() && piece->shells.empty()) { // (debris of a torn frame: its tubes)
+        if (!piece->fem.empty() && piece->shells.empty()) { // (debris of a torn frame: its tubes, a torn-off panel's plates)
             auto po = std::make_unique<DynamicObject>();
             po->name = piece->name;
             po->body = piece;
             po->frame = std::make_unique<FrameVisual>();
             po->frame->mat = frame_tube_material();
+            for (const auto& v : vehicles) // (a car's: in its paint)
+                if (v->body == parent && v->frame_visual()) {
+                    const FrameVisual& fv = *v->frame_visual();
+                    if (fv.mat) po->frame->mat = fv.mat;
+                    po->frame->plate_mat = fv.plate_mat;
+                    po->frame->section_mats = fv.section_mats;
+                }
             objects.push_back(std::move(po));
             return;
         }
@@ -268,7 +275,7 @@ void Game::render(Renderer& r, int w, int h, const Camera* cam_override, bool vi
         for (auto& s : m_static_visuals) r.draw_mesh(s.mesh, s.mat.get(), s.model);
         m_instances.begin();
         if (!debug.hide_meshes) {
-            for (auto& o : objects) o->draw(r, m_instances);
+            for (auto& o : objects) o->draw(r, m_instances, debug.xray ? debug.xray_alpha : 0.0f);
         }
         for (auto& v : vehicles) v->draw(r, m_instances, debug);
         m_instances.flush(r);
@@ -332,8 +339,105 @@ void Game::draw_debug(Renderer& r) {
             r.line(p - vec3(0, 0, s), p + vec3(0, 0, s), col);
         }
     }
-    if (!(debug.beams || debug.nodes || debug.collision || debug.islands || debug.wheels)) return;
+    debug_labels.clear();
+    if (!(debug.beams || debug.nodes || debug.collision || debug.islands || debug.wheels || debug.volumes)) {
+        m_vol_hits.clear();
+        return;
+    }
     const float cull2 = 120.0f * 120.0f;
+    const bool labels = debug.labels && (debug.beams || debug.wheels || debug.volumes);
+    // a ring tyre (Wheel::ring): its rim (steel blue, the rigid disc; five spokes turn with it), its tread's three rows of
+    // points as the physics has them - pressed in towards the axle and sheared along the ground - white, orange to red
+    // as far as they are pressed in (of the sidewall's height), the ring as it would be unpressed faint over the patch,
+    // the sidewalls from the rim to the tread; the patch's points and their shear (x10, green); its load and slip
+    auto ring_tyre = [&](const phys::SoftBody& b, const phys::Wheel& w) {
+        const vec3 a0 = b.nodes[w.axle0].p, a1 = b.nodes[w.axle1].p, c = (a0 + a1) * 0.5f, ax = normalize_or(a1 - a0, vec3(0, 0, 1));
+        vec3 e1 = w.ref - ax * dot(w.ref, ax);
+        e1 = normalize_or(e1, normalize(any_perpendicular(ax)));
+        const vec3 e2 = cross(ax, e1);
+        const float R = w.radius, W = w.width, rim = std::min(w.rim_radius, 0.95f * R), wall = std::max(0.01f, R - rim);
+        const int NP = (int)w.squash.size(), N = NP > 0 ? NP : std::max(8, w.ring_n);
+        auto dir = [&](int i) {
+            const float th = w.angle + 2.0f * kPi * (float)i / (float)N;
+            return e1 * std::cos(th) + e2 * std::sin(th);
+        };
+        auto sq = [&](int i) { return NP > 0 ? w.squash[i % N] : 0.0f; };
+        auto sh = [&](int i) { return NP > 0 && (int)w.shift.size() == NP ? w.shift[i % N] : vec3(0); };
+        auto tread = [&](int i, float lat) { return c + ax * lat + dir(i) * (R - sq(i)) + sh(i); };
+        auto press_col = [&](float s, float a) {
+            const float u = clampf(s / wall, 0, 1);
+            return s > 1e-4f ? Renderer::rgba(1.0f, 0.62f - 0.5f * u, 0.15f, a) : Renderer::rgba(0.88f, 0.9f, 0.92f, 0.75f * a);
+        };
+        const uint32_t steel = Renderer::rgba(0.55f, 0.72f, 1.0f);
+        r.line(a0, a1, Renderer::rgba(1, 1, 0));
+        for (int side = 0; side < 2; side++) {
+            const vec3 face = c + ax * ((side ? 0.46f : -0.46f) * W);
+            for (int i = 0; i < N; i++) r.thick_line(face + dir(i) * rim, face + dir(i + 1) * rim, steel, 2.0f);
+            for (int k = 0; k < 5; k++) r.line(face, face + dir(k * N / 5) * rim, steel);
+        }
+        constexpr int kRows = phys::Wheel::kRingRows;
+        for (int j = 0; j < kRows; j++) {
+            const float lat = ((float)j - 0.5f * (kRows - 1)) * W / (float)kRows;
+            for (int i = 0; i < N; i++) {
+                const float s = std::max(sq(i), sq(i + 1));
+                r.thick_line(tread(i, lat), tread(i + 1, lat), press_col(s, 1.0f), s > 1e-4f ? 2.5f : 1.5f);
+                if (j == kRows / 2 && s > 1e-4f) r.line(c + dir(i) * R, c + dir(i + 1) * R, Renderer::rgba(1, 1, 1, 0.3f));
+            }
+        }
+        for (int i = 0; i < N; i += 2) // (the sidewalls: the physics' points on every other one)
+            for (int side = 0; side < 2; side++) {
+                const float f = side ? 1.0f : -1.0f;
+                r.line(c + ax * (0.46f * f * W) + dir(i) * rim, tread(i, f * W / (float)kRows), press_col(sq(i), 0.55f));
+            }
+        vec3 patch(0);
+        int np = 0;
+        for (int i = 0; i < NP; i++) {
+            if (w.squash[i] <= 1e-4f) continue;
+            const vec3 p = tread(i, 0.0f);
+            r.point(p, press_col(w.squash[i], 1.0f));
+            if (i < (int)w.shift.size()) r.line(p, p + w.shift[i] * 10.0f, Renderer::rgba(0.3f, 1.0f, 0.4f));
+            patch += p, np++;
+        }
+        if (np > 0) r.line(patch / (float)np, patch / (float)np + vec3(0, 1, 0) * std::min(1.0f, w.load * 1e-4f), Renderer::rgba(1.0f, 0.4f, 0.3f));
+        if (labels) {
+            const vec3 vc = (b.nodes[w.axle0].v + b.nodes[w.axle1].v) * 0.5f, f = normalize_or(cross(ax, vec3(0, 1, 0)), vec3(1, 0, 0)); // (rolling: vc = spin R f)
+            const float vx = dot(vc, f), vt = w.spin * R;
+            char t[64];
+            if (std::fabs(vx) > 0.5f || std::fabs(vt) > 0.5f)
+                snprintf(t, sizeof(t), "%.1f kN  slip %+.0f%%", w.load * 1e-3f, 100.0f * (vt - vx) / std::max(std::fabs(vx), 1.0f));
+            else
+                snprintf(t, sizeof(t), "%.1f kN", w.load * 1e-3f);
+            debug_labels.push_back({c + vec3(0, R + 0.12f, 0), t, vec4(1.0f, 0.85f, 0.5f, 1)});
+        }
+    };
+    // a body's collision volumes (the volumes view, F7: a car's engine, its bays, seats, trunk): their hulls' edges,
+    // magenta (a drawn one - an engine - pinker), yellow while something is pressing into it, a ring tyre's drum (other
+    // bodies' only) pale blue; their anchors (the nodes they follow) dots; one crushed off: its name in red at its anchors
+    auto volumes = [&](const phys::SoftBody& b) {
+        std::vector<int>& seen = m_vol_hits[&b];
+        seen.resize(b.volumes.size(), -1);
+        for (size_t k = 0; k < b.volumes.size(); k++) {
+            const phys::CollisionVolume& cv = b.volumes[k];
+            const bool hit = seen[k] >= 0 && cv.hits > seen[k];
+            seen[k] = cv.hits;
+            if (cv.broken) {
+                vec3 m(0);
+                for (uint32_t a : cv.anchors) m += b.nodes[a].p;
+                if (labels && !cv.anchors.empty()) debug_labels.push_back({m / (float)cv.anchors.size(), cv.name + " (off)", vec4(1.0f, 0.35f, 0.3f, 1)});
+                continue;
+            }
+            if (!cv.placed || cv.wverts.size() != cv.verts.size()) continue;
+            const uint32_t col = cv.tyre ? Renderer::rgba(0.45f, 0.8f, 1.0f, 0.6f)
+                               : hit     ? Renderer::rgba(1.0f, 0.95f, 0.3f, 1.0f)
+                               : cv.color.x >= 0 ? Renderer::rgba(1.0f, 0.55f, 0.95f, 0.95f) : Renderer::rgba(1.0f, 0.25f, 0.85f, 0.95f);
+            const float px = cv.tyre ? 1.5f : hit ? 3.5f : 2.5f;
+            for (const auto& f : cv.faces)
+                for (size_t e = 0; e < f.size(); e++) r.thick_line(cv.wverts[f[e]], cv.wverts[f[(e + 1) % f.size()]], col, px);
+            if (cv.tyre) continue;
+            for (uint32_t a : cv.anchors) r.point(b.nodes[a].p, Renderer::rgba(1.0f, 0.4f, 0.9f, 0.7f));
+            if (labels) debug_labels.push_back({cv.c, cv.name, vec4(1.0f, 0.6f, 0.95f, 1)});
+        }
+    };
     // Sheets are drawn as slabs of their thickness around the nodes' plane, so their edges and collision triangles (in that
     // plane) would be hidden inside the slab: they are lifted to the face towards the camera (along the node normals of the
     // sheet's mesh), a little further with distance for the depth buffer's precision.
@@ -364,6 +468,35 @@ void Game::draw_debug(Renderer& r) {
             lift[i] = n * ((dot(to_cam, n) >= 0 ? 1.0f : -1.0f) * (h + 0.002f + 0.0008f * d));
         }
     };
+    // the beam view's forces and stresses: the most loaded elements near the camera (a quarter of their limit or more)
+    // named by their load - a member its axial force and its load against its yield (or buckling) limit, a triangle
+    // element its stress and that, a beam its force, a sheet's triangle its stretch against its fracture strain
+    struct Loaded {
+        float util;
+        vec3 at;
+        std::string text;
+    };
+    std::vector<Loaded> loaded;
+    // the load colours (the beam view; F8: its deformation's instead): grey unloaded, full at its limit - a member's and
+    // a beam's blue in tension, red in compression, amber loaded by its bending; a plate's (a triangle element's, a
+    // sheet's) grey to yellow to red
+    const vec3 kIdle(0.52f, 0.55f, 0.60f), kTension(0.15f, 0.45f, 1.0f), kCompression(1.0f, 0.15f, 0.1f), kBending(1.0f, 0.68f, 0.1f);
+    auto ramp = [&](float u, vec3 hi) {
+        u = clampf(u, 0, 1);
+        const vec3 c = kIdle + (hi - kIdle) * u;
+        return Renderer::rgba(c.x, c.y, c.z, 0.6f + 0.4f * u);
+    };
+    auto heat = [&](float u) {
+        u = clampf(u, 0, 1);
+        const vec3 y(1.0f, 0.85f, 0.15f), rd(1.0f, 0.12f, 0.08f), c = u < 0.5f ? kIdle + (y - kIdle) * (2.0f * u) : y + (rd - y) * (2.0f * u - 1.0f);
+        return Renderer::rgba(c.x, c.y, c.z, 0.6f + 0.4f * u);
+    };
+    auto load_label = [&](float util, vec3 at, const char* fmt, float v) {
+        if (!(labels && debug.beams) || util < 0.25f || length2(at - m_last_cam.pos) > 10.0f * 10.0f) return;
+        char t[64];
+        snprintf(t, sizeof(t), fmt, v, std::min(999.0f, 100.0f * util));
+        loaded.push_back({util, at, t});
+    };
     for (auto& bp : world.bodies()) {
         const phys::SoftBody& b = *bp;
         // (an orthographic camera stands far back: nothing is culled by distance)
@@ -375,16 +508,15 @@ void Game::draw_debug(Renderer& r) {
                 if (bm.flags & phys::BF_BROKEN) continue;
                 vec3 a = b.nodes[bm.a].p, c = b.nodes[bm.b].p;
                 uint32_t col;
-                if (debug.stress) {
-                    float s = bm.strength > 0 ? bm.stress / std::max(1.0f, std::min(bm.strength, bm.max_pos)) : 0;
-                    s = clampf(s * 2.0f, -1, 1);
-                    // blue = tension, red = compression, green = idle
-                    col = s > 0 ? Renderer::rgba(0.2f + 0.8f * s, 0.9f - 0.7f * s, 0.2f) : Renderer::rgba(0.2f, 0.9f + 0.7f * s, 0.2f - 0.8f * s);
+                if (debug.stress) { // (its force against its limit: positive compression)
+                    const float s = bm.strength > 0 ? bm.stress / std::max(1.0f, std::min(bm.strength, bm.max_pos)) : 0;
+                    col = ramp(std::fabs(s), s > 0 ? kCompression : kTension);
                 } else {
                     float def = std::fabs(bm.L - bm.L0) / std::max(0.01f, bm.L0);
                     col = def > 0.01f ? Renderer::rgba(1, 0.5f, 0.1f) : ((bm.flags & phys::BF_SHOCK) ? Renderer::rgba(0.3f, 0.6f, 1) : Renderer::rgba(0.85f, 0.85f, 0.85f, 0.8f));
                 }
                 debug.beam_px > 1.0f ? r.thick_line(a, c, col, debug.beam_px) : r.line(a, c, col);
+                if (bm.strength > 0) load_label(std::fabs(bm.stress) / std::max(1.0f, std::min(bm.strength, bm.max_pos)), (a + c) * 0.5f, "%.1f kN  %.0f%%", -bm.stress * 1e-3f);
             }
             // frame elements (FEM): thicker; steel blue, orange once bent for good, by stress their load against the
             // yield (or buckling) limit, green -> red
@@ -392,13 +524,19 @@ void Game::draw_debug(Renderer& r) {
                 if (e.broken) continue;
                 const vec3 a = b.nodes[b.fem.node[e.a]].p, c = b.nodes[b.fem.node[e.b]].p;
                 uint32_t col;
-                if (debug.stress) {
-                    const float u = clampf(e.util, 0, 1);
-                    col = Renderer::rgba(0.2f + 0.8f * u, 0.9f - 0.7f * u, 0.2f);
+                if (debug.stress) { // (its load against its yield or buckling limit; by its axial force's sign, or its bending)
+                    const float np = b.fem.sections[e.section].Np;
+                    const bool bend = np > 0 && std::fabs(e.N) / np < 0.5f * e.util;
+                    col = ramp(e.util, bend ? kBending : e.N >= 0 ? kTension : kCompression);
                 } else {
                     col = e.damage > 1e-4f ? Renderer::rgba(1.0f, 0.55f, 0.15f) : Renderer::rgba(0.55f, 0.72f, 1.0f);
                 }
                 r.thick_line(a, c, col, std::max(2.5f, debug.beam_px * 2.0f));
+                { // (its axial force; a member loaded by its bending more than by that: named so)
+                    const float np = b.fem.sections[e.section].Np;
+                    const bool bend = np > 0 && std::fabs(e.N) / np < 0.5f * e.util;
+                    load_label(e.util, (a + c) * 0.5f, bend ? "bending, %+.1f kN  %.0f%%" : "%+.1f kN  %.0f%%", e.N * 1e-3f);
+                }
                 // the joints other than welded: a dot near the end, in the editor's colours
                 static const uint32_t jcol[] = {0, Renderer::rgba(1.0f, 0.6f, 0.2f), Renderer::rgba(0.45f, 1.0f, 0.5f), Renderer::rgba(0.3f, 0.9f, 1.0f),
                                                 Renderer::rgba(1.0f, 0.45f, 0.9f), Renderer::rgba(1.0f, 0.9f, 0.3f)};
@@ -415,8 +553,7 @@ void Game::draw_debug(Renderer& r) {
                 if (t.broken) continue;
                 uint32_t col;
                 if (debug.stress) {
-                    const float u = clampf(t.util, 0, 1);
-                    col = Renderer::rgba(0.2f + 0.8f * u, 0.9f - 0.7f * u, 0.2f);
+                    col = heat(t.util);
                 } else {
                     col = t.dmg > 0 ? Renderer::rgba(1.0f, 0.5f, 0.05f) : Renderer::rgba(0.15f, 0.45f, 1.0f);
                 }
@@ -426,6 +563,7 @@ void Game::draw_debug(Renderer& r) {
                 const vec3 up = n * ((dot(to_cam, n) >= 0 ? 1.0f : -1.0f) *
                                      (0.5f * b.fem.shell_sections[t.section].t + 0.002f + 0.0008f * length(to_cam)));
                 r.thick_line(p0 + up, p1 + up, col, tw), r.thick_line(p1 + up, p2 + up, col, tw), r.thick_line(p2 + up, p0 + up, col, tw);
+                if (const float y = b.fem.shell_sections[t.section].yield; y > 0) load_label(t.util, (p0 + p1 + p2) * (1.0f / 3) + up, "%.0f MPa  %.0f%%", t.util * y * 1e-6f);
             }
             // triangle elements: each edge once, on the face towards the camera. Pale blue (not the beams' grey: they are
             // no beams), the authored border brighter; plastically stretched or shortened (> 1%) orange; cracks and cuts
@@ -438,8 +576,7 @@ void Game::draw_debug(Renderer& r) {
                     vec3 a = b.nodes[ia].p + lift[ia], c = b.nodes[ic].p + lift[ic];
                     uint32_t col;
                     if (debug.stress) {
-                        float s = clampf(si < b.shk.aux.size() ? b.shk.aux[si].strain : 0.0f, 0, 1);
-                        col = Renderer::rgba(0.2f + 0.8f * s, 0.9f - 0.7f * s, 0.2f);
+                        col = heat(si < b.shk.aux.size() ? b.shk.aux[si].strain : 0.0f);
                     } else if (sh.nb[e] < 0 && !((sh.edges >> e) & 1u)) {
                         col = Renderer::rgba(1.0f, 0.25f, 0.2f, 0.95f);
                     } else {
@@ -449,6 +586,9 @@ void Game::draw_debug(Renderer& r) {
                     }
                     debug.beam_px > 1.0f ? r.thick_line(a, c, col, debug.beam_px) : r.line(a, c, col);
                 }
+                if (si < b.shk.aux.size() && b.shk.aux[si].strain >= 0.25f && b.shell_mat.brk < 10.0f) // (its stretch against its fracture strain)
+                    load_label(b.shk.aux[si].strain, (b.nodes[sh.n[0]].p + lift[sh.n[0]] + b.nodes[sh.n[1]].p + lift[sh.n[1]] + b.nodes[sh.n[2]].p + lift[sh.n[2]]) * (1.0f / 3),
+                               "sheet stretched %.0f%%  %.0f%%", 100.0f * b.shk.aux[si].strain * b.shell_mat.brk);
             }
             for (const auto& j : b.joints) {
                 if (j.broken) continue;
@@ -460,6 +600,25 @@ void Game::draw_debug(Renderer& r) {
                 }
             }
         }
+        if (debug.beams || debug.wheels)
+            for (const auto& wh : b.wheels)
+                if (wh.ring && !wh.detached && wh.axle0 < b.nodes.size() && wh.axle1 < b.nodes.size()) ring_tyre(b, wh);
+        if (debug.volumes && !b.volumes.empty()) volumes(b);
+        // the FEM plates' mid points (SoftBody::tri_mids): the collision view all of them (pale blue), the beam view the
+        // ones that touched something in the last frame - orange the static world, yellow another body, magenta a
+        // collision volume; on the plate's face towards the camera, as its edges
+        if ((debug.beams || debug.collision) && b.tri_mids && !b.fem.tris.empty())
+            for (size_t k = 0; k < b.fem.tris.size(); k++) {
+                const phys::FrameTri& t = b.fem.tris[k];
+                const uint8_t m = k < b.mid_touch.size() ? b.mid_touch[k] : 0;
+                if (t.broken || (!m && !debug.collision) || t.n[0] >= b.fem.node.size() || t.n[1] >= b.fem.node.size() || t.n[2] >= b.fem.node.size()) continue;
+                const vec3 p0 = b.nodes[b.fem.node[t.n[0]]].p, p1 = b.nodes[b.fem.node[t.n[1]]].p, p2 = b.nodes[b.fem.node[t.n[2]]].p, c = (p0 + p1 + p2) * (1.0f / 3);
+                const vec3 n = normalize_or(cross(p1 - p0, p2 - p0), vec3(0)), to_cam = m_last_cam.pos - c;
+                const vec3 up = n * ((dot(to_cam, n) >= 0 ? 1.0f : -1.0f) * (0.5f * b.fem.shell_sections[t.section].t + 0.003f + 0.0008f * length(to_cam)));
+                const uint32_t col = m & 4 ? Renderer::rgba(1.0f, 0.3f, 0.9f) : m & 2 ? Renderer::rgba(1.0f, 0.95f, 0.3f) : m & 1 ? Renderer::rgba(1.0f, 0.55f, 0.1f)
+                                                                                                       : Renderer::rgba(0.55f, 0.85f, 1.0f, 0.7f);
+                r.point(c + up, col);
+            }
         if (debug.nodes) {
             for (size_t i = 0; i < b.nodes.size(); i++) {
                 uint16_t f = b.info[i].flags;
@@ -516,19 +675,21 @@ void Game::draw_debug(Renderer& r) {
             }
         }
     }
+    // (the most loaded, nearest first among equals: the UI hides a label behind a nearer one)
+    std::sort(loaded.begin(), loaded.end(), [](const Loaded& a, const Loaded& b) { return a.util > b.util; });
+    for (size_t k = 0; k < loaded.size() && k < 30; k++) {
+        const float u = clampf(loaded[k].util, 0, 1);
+        debug_labels.push_back({loaded[k].at, loaded[k].text, vec4(0.4f + 0.6f * u, 1.0f - 0.6f * u, 0.35f, 1)});
+    }
     if (debug.collision) {
         for (const auto& bx : world.statics.boxes) {
             mat4 m = mat4::from_mat3(bx.rot, bx.center);
             r.box_wire(m, bx.half, Renderer::rgba(1, 0.6f, 0.1f, 0.7f));
         }
-        // the bodies' collision volumes (a car's engine, cabin, trunk): their hulls' faces
-        for (const auto& bp : world.bodies())
-            for (const phys::CollisionVolume& cv : bp->volumes) {
-                if (!cv.placed || cv.wverts.size() != cv.verts.size()) continue;
-                const uint32_t col = Renderer::rgba(1.0f, 0.25f, 0.85f, 0.95f);
-                for (const auto& f : cv.faces)
-                    for (size_t k = 0; k < f.size(); k++) r.thick_line(cv.wverts[f[k]], cv.wverts[f[(k + 1) % f.size()]], col, 2.5f);
-            }
+    }
+    for (auto it = m_vol_hits.begin(); it != m_vol_hits.end();) { // (the bodies gone)
+        const bool live = std::any_of(world.bodies().begin(), world.bodies().end(), [&](const auto& bp) { return bp.get() == it->first; });
+        it = live ? std::next(it) : m_vol_hits.erase(it);
     }
 }
 

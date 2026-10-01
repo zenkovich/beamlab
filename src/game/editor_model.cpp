@@ -268,6 +268,24 @@ int Model::twin(int n) const {
     return nearest_node(q, kTwinEps);
 }
 
+std::vector<int> Model::twins() const {
+    // the nodes sorted along x: each looks for its mirror among the ones within kTwinEps of its x
+    std::vector<int> id(nodes.size()), out(nodes.size(), -1);
+    for (int i = 0; i < (int)id.size(); i++) id[i] = i;
+    std::sort(id.begin(), id.end(), [&](int a, int b) { return nodes[a].p.x < nodes[b].p.x; });
+    for (int i = 0; i < (int)nodes.size(); i++) {
+        const vec3 p = nodes[i].p, q(p.x, p.y, -p.z);
+        if (std::fabs(p.z) < kTwinEps) continue;
+        float bd = kTwinEps * kTwinEps;
+        auto it = std::lower_bound(id.begin(), id.end(), p.x - kTwinEps, [&](int a, float x) { return nodes[a].p.x < x; });
+        for (; it != id.end() && nodes[*it].p.x <= p.x + kTwinEps; ++it) {
+            const float d = length2(nodes[*it].p - q);
+            if (d < bd) bd = d, out[i] = *it;
+        }
+    }
+    return out;
+}
+
 vec3 Model::centroid() const {
     vec3 c(0);
     for (const Node& n : nodes) c += n.p;
@@ -378,7 +396,7 @@ void Model::remove_wheel(int i) {
 int Model::wheel_node_count(int w) const {
     if (w < 0 || w >= (int)wheels.size()) return 0;
     const Wheel& x = wheels[w];
-    return (x.type == 1 || x.type == 4) ? 4 * x.rays : 2 * x.rays;
+    return x.type == 5 ? 0 : (x.type == 1 || x.type == 4) ? 4 * x.rays : 2 * x.rays; // (a ring tyre: no nodes of its own)
 }
 
 int Model::file_node(int ref) const {
@@ -1151,18 +1169,19 @@ std::string write_truck(const Model& m, bool preview) {
         }
     }
     if (!m.wheels.empty()) {
-        static const char* kWheelSections[] = {"wheels", "wheels2", "meshwheels", "meshwheels2", "flexbodywheels"};
+        static const char* kWheelSections[] = {"wheels", "wheels2", "meshwheels", "meshwheels2", "flexbodywheels", "ringwheels"};
         static const char* kWheelFields[] = {
             ";radius, width, rays, node1, node2, rigidity, braking, propulsion, arm, mass, spring, damping, face, band",
             ";rim radius, radius, width, rays, node1, node2, rigidity, braking, propulsion, arm, mass, rim spring, rim damping, spring, damping, face, band",
             ";radius, rim radius, width, rays, node1, node2, rigidity, braking, propulsion, arm, mass, spring, damping, side, rim mesh, tyre material",
             ";radius, rim radius, width, rays, node1, node2, rigidity, braking, propulsion, arm, mass, spring, damping, side, rim mesh, tyre material",
-            ";radius, rim radius, width, rays, node1, node2, rigidity, braking, propulsion, arm, mass, spring, damping, rim spring, rim damping, side, rim mesh, tyre mesh"};
+            ";radius, rim radius, width, rays, node1, node2, rigidity, braking, propulsion, arm, mass, spring, damping, rim spring, rim damping, side, rim mesh, tyre mesh",
+            ";(BeamLab) radius, rim radius, width, node1, node2, braking, propulsion, arm, mass, tyre stiffness (N/m, 2 cm in), damping (N s/m), grip"};
         int cur_type = -1;
         std::string cur_bd, cur_nd;
         section();
         for (const Wheel& w : m.wheels) {
-            const int t = std::clamp(w.type, 0, 4);
+            const int t = std::clamp(w.type, 0, 5);
             // the wheel's beam defaults and node friction, written when they change
             const std::string bd = defaults_line(w.bd);
             const std::string nd = w.friction != 1.0f || !cur_nd.empty() ? "set_node_defaults -1, " + num(w.friction) + ", 1, 1\n" : std::string();
@@ -1181,6 +1200,10 @@ std::string write_truck(const Model& m, bool preview) {
             const std::string side(1, w.side == 'r' ? 'r' : 'l');
             const std::string rim = w.rim_mesh.empty() ? "wheel.mesh" : w.rim_mesh;
             switch (t) {
+            case 5:
+                o += num(w.radius) + ", " + num(w.rim_radius) + ", " + num(w.width) + ", " + fmt("%d", w.n1) + ", " + fmt("%d", w.n2) + ", " + fmt("%d", w.braking) + ", " +
+                     fmt("%d", w.propulsion) + ", " + fmt("%d", w.arm) + ", " + num(w.mass) + ", " + num(w.spring) + ", " + num(w.damp) + ", " + num(w.grip) + "\n";
+                break;
             case 0: o += num(w.radius) + ", " + num(w.width) + ", " + common + ", " + num(w.spring) + ", " + num(w.damp) + ", " + w.face_material + " " + w.band_material + "\n"; break;
             case 1:
                 o += num(w.rim_radius) + ", " + num(w.radius) + ", " + num(w.width) + ", " + common + ", " + num(w.rim_spring) + ", " + num(w.rim_damp) + ", " + num(w.spring) + ", " +
@@ -1408,20 +1431,21 @@ std::string write_truck(const Model& m, bool preview) {
         section();
         for (const Mount& mt : m.mounts) {
             o += fmt("%d", mt.a) + ", " + fmt("%d", mt.b) + ", " + num(mt.brk) + ", " + num(mt.k) + ", " + num(mt.damp);
-            if (mt.kind == 'h') o += ", h, " + fmt("%d", mt.b2);
+            if (mt.kind == 'h' && mt.b2 >= 0) o += ", h, " + fmt("%d", mt.b2); // (a hinge without its second node: a point)
             else if (mt.kind == 'c' || mt.kind == 'r') o += fmt(", %c, ", mt.kind) + num(mt.param);
             else if (mt.kind == 's') o += ", s";
             o += "\n";
         }
     }
     if (!m.volumes.empty()) {
-        o += "collision_volumes\n;(BeamLab) volume name, break rms (m); its anchors (frame nodes); its hull's points (x, y, z)\n";
+        o += "collision_volumes\n;(BeamLab) volume name, break rms (m)[, crush force (N)]; its anchors (frame nodes); its hull's points (x, y, z)\n";
         section();
         for (const Volume& v : m.volumes) {
-            o += "volume " + (v.name.empty() ? std::string("volume") : v.name) + ", " + num(v.break_rms) + "\nanchors ";
+            o += "volume " + (v.name.empty() ? std::string("volume") : v.name) + ", " + num(v.break_rms) + (v.break_force > 0 ? ", " + num(v.break_force) : std::string()) + "\nanchors ";
             for (size_t i = 0; i < v.anchors.size(); i++) o += (i ? ", " : "") + fmt("%d", v.anchors[i]);
             o += "\n";
             for (const vec3& p : v.verts) o += "vertex " + num(p.x) + ", " + num(p.y) + ", " + num(p.z) + "\n";
+            if (v.color.x >= 0) o += "color " + num(v.color.x) + ", " + num(v.color.y) + ", " + num(v.color.z) + "\n";
         }
     }
     if (!m.slidenodes.empty()) {
@@ -1623,6 +1647,7 @@ bool import_document(const ror::Document& d, Model& m, std::vector<std::string>&
         x.arm = ok(w.arm) ? map[w.arm] : -1;
         x.mass = w.mass, x.spring = w.spring, x.damp = w.damp, x.rim_spring = w.rim_spring, x.rim_damp = w.rim_damp;
         x.side = w.side;
+        x.grip = w.grip;
         if (!w.face_material.empty()) x.face_material = w.face_material;
         if (!w.band_material.empty()) x.band_material = w.band_material;
         x.rim_mesh = w.rim_mesh, x.tyre_material = w.tyre_material;
@@ -1704,7 +1729,7 @@ bool import_document(const ror::Document& d, Model& m, std::vector<std::string>&
     }
     for (const auto& v : d.volumes) {
         Volume x;
-        x.name = v.name, x.break_rms = v.break_rms, x.verts = v.verts;
+        x.name = v.name, x.break_rms = v.break_rms, x.break_force = v.break_force, x.verts = v.verts, x.color = v.color;
         for (int a : v.anchors)
             if (ok(a)) x.anchors.push_back(map[a]);
         if (x.anchors.size() < 3) {
@@ -1837,7 +1862,9 @@ void read_markers(const std::string& text, Model& m) {
     if (text.find(";written by the BeamLab model editor") != std::string::npos) m.cinecam = text.find(";editor-cinecam") != std::string::npos;
     std::string section;
     int layer = 0, group = -1;
-    int counts[9] = {}; // nodes, beams, shocks, hydros, wheels, cab, joints, flexbodies, props (across repeated sections)
+    int counts[10] = {}; // nodes, beams, shocks, hydros, wheels, cab, joints, flexbodies, props, FEM triangles (across repeated sections)
+    int first_fem = 0;   // (the FEM triangles follow the cab's in Model::tris)
+    while (first_fem < (int)m.tris.size() && !m.tris[first_fem].fem) first_fem++;
     // the presets whole (write_truck), each beam's preset, the parser's shell materials and FEM shells in the order of
     // their directives -> the editor's preset
     std::vector<BeamGroup> beam_presets;
@@ -2026,12 +2053,15 @@ void read_markers(const std::string& text, Model& m) {
         } else if (section == "hydros") {
             const int i = counts[3]++;
             if (i < (int)m.hydros.size()) m.hydros[i].layer = layer;
-        } else if (section == "wheels" || section == "wheels2" || section == "meshwheels" || section == "meshwheels2" || section == "flexbodywheels") {
+        } else if (section == "wheels" || section == "wheels2" || section == "meshwheels" || section == "meshwheels2" || section == "flexbodywheels" || section == "ringwheels") {
             const int i = counts[4]++;
             if (i < (int)m.wheels.size()) m.wheels[i].layer = layer;
         } else if (section == "cab") {
             const int i = counts[5]++;
             if (i < (int)m.tris.size()) m.tris[i].layer = layer;
+        } else if (section == "fem_tris") {
+            const int i = first_fem + counts[9]++;
+            if (i < (int)m.tris.size() && m.tris[i].fem) m.tris[i].layer = layer;
         } else if (section == "joints") {
             const int i = counts[6]++;
             if (i < (int)m.joints.size()) m.joints[i].layer = layer;

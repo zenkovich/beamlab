@@ -119,6 +119,9 @@ void App::ui_main_menu() {
         if (ImGui::IsKeyPressed(ImGuiKey_F2)) m_show_perf = !m_show_perf;
         if (ImGui::IsKeyPressed(ImGuiKey_F3)) m_game.debug.beams = !m_game.debug.beams;
         if (ImGui::IsKeyPressed(ImGuiKey_F4)) m_game.debug.hide_meshes = !m_game.debug.hide_meshes;
+        if (ImGui::IsKeyPressed(ImGuiKey_F6)) m_game.debug.xray = !m_game.debug.xray;
+        if (ImGui::IsKeyPressed(ImGuiKey_F7)) m_game.debug.volumes = !m_game.debug.volumes;
+        if (ImGui::IsKeyPressed(ImGuiKey_F8)) m_game.debug.stress = !m_game.debug.stress;
     }
     if (!io.WantCaptureKeyboard && (!m_editor.active() || m_editor.driving())) { // (the editor has its own keys)
         if (ImGui::IsKeyPressed(ImGuiKey_P)) m_game.paused = !m_game.paused;
@@ -355,13 +358,17 @@ void App::ui_main_menu() {
         }
         ImGui::SliderFloat("FOV", &m_game.cam.fov, 35, 100, "%.0f");
         ImGui::SeparatorText("Debug views");
-        ImGui::MenuItem("Beams", "F3", &m_game.debug.beams);
-        ImGui::MenuItem("  color by stress", nullptr, &m_game.debug.stress, m_game.debug.beams);
+        ImGui::MenuItem("Beams, elements, wheels", "F3", &m_game.debug.beams);
+        ImGui::MenuItem("  colored by load (off: by deformation)", "F8", &m_game.debug.stress, m_game.debug.beams);
+        ImGui::MenuItem("  forces, stresses, names (labels)", nullptr, &m_game.debug.labels, m_game.debug.beams || m_game.debug.wheels || m_game.debug.volumes);
+        ImGui::MenuItem("Collision volumes", "F7", &m_game.debug.volumes);
         ImGui::MenuItem("Nodes & frames", nullptr, &m_game.debug.nodes);
         ImGui::MenuItem("Collision geometry", nullptr, &m_game.debug.collision);
         ImGui::MenuItem("Wheels", nullptr, &m_game.debug.wheels);
         ImGui::MenuItem("Bodies (awake/asleep)", nullptr, &m_game.debug.islands);
         ImGui::MenuItem("Hide meshes (skeleton only)", "F4", &m_game.debug.hide_meshes);
+        ImGui::MenuItem("X-ray: plates and sheets see-through", "F6", &m_game.debug.xray);
+        if (m_game.debug.xray) ImGui::SliderFloat("  opacity", &m_game.debug.xray_alpha, 0.02f, 0.8f, "%.2f");
         bool on_top = !m_renderer.debug_depth_test;
         if (ImGui::MenuItem("Debug lines on top", nullptr, &on_top)) m_renderer.debug_depth_test = !on_top;
         ImGui::SeparatorText("Rendering");
@@ -668,25 +675,34 @@ void App::ui_hud() {
         dl->AddText(p, col32(0.6f, 0.85f, 1.0f), t);
         ImGui::PopFont();
     }
-    // world labels (sample names): behind the windows, faded with distance
-    if (!m_game.labels.empty()) {
+    // world labels (sample names; the debug view's, close by only): behind the windows, faded with distance
+    if (!m_game.labels.empty() || !m_game.debug_labels.empty()) {
         const Camera& cam = m_game.last_camera();
         ImDrawList* bg = ImGui::GetBackgroundDrawList();
         const ImVec2 ds = ImGui::GetIO().DisplaySize;
         // nearest first; a label hidden behind a nearer one is skipped
-        std::vector<std::pair<float, const WorldLabel*>> vis;
+        struct Vis {
+            float key;
+            const WorldLabel* l;
+            float a;
+        };
+        std::vector<Vis> vis;
         for (const WorldLabel& l : m_game.labels) {
             float dist = length(l.pos - cam.pos);
-            if (dist <= 70.0f) vis.push_back({dist, &l});
+            if (dist <= 70.0f) vis.push_back({dist, &l, clampf((70.0f - dist) / 20.0f, 0, 1)});
         }
-        std::sort(vis.begin(), vis.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const WorldLabel& l : m_game.debug_labels) { // (after the scene's; faded out past 10 m to 15)
+            float dist = length(l.pos - cam.pos);
+            if (dist <= 15.0f) vis.push_back({dist + 100.0f, &l, clampf((15.0f - dist) / 5.0f, 0, 1)});
+        }
+        std::sort(vis.begin(), vis.end(), [](const Vis& a, const Vis& b) { return a.key < b.key; });
         std::vector<ImVec4> drawn;
-        for (auto [dist, lp] : vis) {
-            const WorldLabel& l = *lp;
+        for (const Vis& v : vis) {
+            const WorldLabel& l = *v.l;
+            const float a = v.a;
             vec4 c = cam.viewproj * vec4(l.pos, 1.0f);
             if (c.w <= 0.1f) continue;
             float sx = (c.x / c.w * 0.5f + 0.5f) * ds.x, sy = (0.5f - c.y / c.w * 0.5f) * ds.y;
-            float a = clampf((70.0f - dist) / 20.0f, 0, 1);
             ImVec2 ts = ImGui::CalcTextSize(l.text.c_str());
             ImVec2 p(sx - ts.x * 0.5f, sy - ts.y * 0.5f);
             ImVec4 r(p.x - 6, p.y - 3, p.x + ts.x + 6, p.y + ts.y + 3);
@@ -696,6 +712,34 @@ void App::ui_hud() {
             drawn.push_back(r);
             bg->AddRectFilled(ImVec2(r.x, r.y), ImVec2(r.z, r.w), col32(0, 0, 0, 0.55f * a), 4);
             bg->AddText(p, col32(l.color.x, l.color.y, l.color.z, l.color.w * a), l.text.c_str());
+        }
+    }
+    // the beam view's load colours: their legend (top right, under the performance button)
+    if (m_game.debug.beams && m_game.debug.stress) {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        struct Key {
+            ImU32 lo, hi;
+            const char* text;
+        };
+        const ImU32 idle = col32(0.52f, 0.55f, 0.60f);
+        const Key keys[] = {{idle, col32(0.15f, 0.45f, 1.0f), "tension"},
+                            {idle, col32(1.0f, 0.15f, 0.1f), "compression"},
+                            {idle, col32(1.0f, 0.68f, 0.1f), "bending"},
+                            {col32(1.0f, 0.85f, 0.15f), col32(1.0f, 0.12f, 0.08f), "plates, sheets: stress"}};
+        const float lh = ImGui::GetTextLineHeight() + 4, bw = 46, w = 240;
+        ImVec2 p(vp->WorkPos.x + vp->WorkSize.x - w - 12, vp->WorkPos.y + 64);
+        dl->AddRectFilled(ImVec2(p.x - 8, p.y - 6), ImVec2(p.x + w, p.y + lh * 5 + 4), col32(0, 0, 0, 0.45f), 6);
+        dl->AddText(p, col32(0.85f, 0.87f, 0.9f), "load: 0 ... its limit");
+        for (int k = 0; k < 4; k++) {
+            const ImVec2 q(p.x, p.y + lh * (k + 1));
+            if (k == 3) { // (grey, yellow, red)
+                dl->AddRectFilledMultiColor(q, ImVec2(q.x + bw * 0.5f, q.y + lh - 6), idle, keys[k].lo, keys[k].lo, idle);
+                dl->AddRectFilledMultiColor(ImVec2(q.x + bw * 0.5f, q.y), ImVec2(q.x + bw, q.y + lh - 6), keys[k].lo, keys[k].hi, keys[k].hi, keys[k].lo);
+            } else {
+                dl->AddRectFilledMultiColor(q, ImVec2(q.x + bw, q.y + lh - 6), keys[k].lo, keys[k].hi, keys[k].hi, keys[k].lo);
+            }
+            dl->AddText(ImVec2(q.x + bw + 8, q.y - 2), col32(0.85f, 0.87f, 0.9f), keys[k].text);
         }
     }
     // scene banner (stage timer), below the time scale indicator
@@ -1098,7 +1142,8 @@ void App::ui_help() {
             row("Z  , .  Del", "Projectile type, projectile speed -/+, remove projectiles");
             row("F5", "Reload scene / rerun the crash test");
             row("F1 / F2", "Help / performance widget");
-            row("F3 / F4", "Beam view / hide meshes");
+            row("F3 / F4 / F6", "Beam view (with the ring tyres, the loaded elements' forces and stresses) / hide meshes / x-ray: plates and sheets see-through");
+            row("F7 / F8", "Collision volumes / the beam view coloured by the elements' loads, or by their deformation");
             row("H", "Toggle HUD");
             row("Gamepad", "Left stick steer, triggers throttle/brake, A handbrake");
             ImGui::EndTable();

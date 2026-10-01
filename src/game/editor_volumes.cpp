@@ -292,6 +292,26 @@ void ModelEditor::ui_volumes() {
         V.break_rms = rms * 0.01f;
     }
     if (ImGui::IsItemDeactivated()) m_drag_pushed_ui = false;
+    prop("Crush force", "The force of its contacts (all of them) it is off past, held 3 ms: a bumper's reinforcement crushed, the beam under it takes over (0: never)");
+    float kn = V.break_force * 0.001f;
+    if (ImGui::SliderFloat("##vcrush", &kn, 0.0f, 1000.0f, kn > 0 ? "%.0f kN" : "never", ImGuiSliderFlags_Logarithmic)) {
+        if (!m_drag_pushed_ui) push_undo(), m_drag_pushed_ui = true;
+        V.break_force = kn * 1000.0f;
+    }
+    if (ImGui::IsItemDeactivated()) m_drag_pushed_ui = false;
+    prop("Drawn", "Drawn in the game as a solid of this colour (an engine block, a gearbox: the car's simplified machinery)");
+    bool drawn = V.color.x >= 0;
+    if (ImGui::Checkbox("##vdrawn", &drawn)) push_undo(), V.color = drawn ? vec3(0.32f, 0.33f, 0.35f) : vec3(-1);
+    if (drawn) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        vec3 c = V.color;
+        if (ImGui::ColorEdit3("##vcol", &c.x, ImGuiColorEditFlags_NoInputs)) {
+            if (!m_drag_pushed_ui) push_undo(), m_drag_pushed_ui = true;
+            V.color = c;
+        }
+        if (ImGui::IsItemDeactivated()) m_drag_pushed_ui = false;
+    }
     // what it is: faces, size, the nodes in it
     const std::vector<int> inside = volume_nodes_inside(v);
     int in_anchors = 0;

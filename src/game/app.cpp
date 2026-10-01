@@ -135,8 +135,11 @@ bool App::init(const AppOptions& opt) {
             m_shots.push_back(sh);
         }
     }
-    if (getenv("BL_COLLISION")) m_game.debug.collision = true;
+    if (getenv("BL_COLLISION")) m_game.debug.collision = m_game.debug.volumes = true;
+    if (getenv("BL_VOLUMES")) m_game.debug.volumes = true;   // (the volumes view alone, F7)
+    if (getenv("BL_DEFORM")) m_game.debug.stress = false;    // (the beam view coloured by deformation, F8)
     if (getenv("BL_HIDEMESHES")) m_game.debug.hide_meshes = true; // (screenshots: the collision view alone)
+    if (const char* x = getenv("BL_XRAY")) m_game.debug.xray = true, m_game.debug.xray_alpha = std::clamp((float)atof(x), 0.02f, 1.0f); // (the x-ray view, F6)
     if (getenv("BL_SKELETON")) {
         m_game.debug.beams = m_game.debug.nodes = m_game.debug.hide_meshes = true;
     }
@@ -544,8 +547,16 @@ void App::frame(float dt) {
                 // (camber against the body's up, not the world's: the body's roll is not the wheel's)
                 const float toe = std::atan2(dot(ax, f) * side, std::fabs(dot(ax, l))) * kRad2Deg,
                             camber = std::asin(clampf(dot(ax, v->up()) * side, -1, 1)) * kRad2Deg;
-                printf("    wheel r=%.3f (min %.3f max %.3f, def %.3f) axle %.3f speed %.1f torque %.0f brake %.0f hub y %.2f tyre ymin %.3f toe %.2f camber %.2f deg\n",
-                       rs / w.nodes.size(), rmin, rmax, w.radius, length(a1 - a0), w.speed, w.last_torque, w.brake, a0.y, ymin, toe, camber);
+                if (w.ring) { // (a ring tyre: its load, how far it is pressed in, its spin)
+                    float sq = 0;
+                    for (float q : w.squash) sq = std::max(sq, q);
+                    rs = w.radius - sq, rmin = rs, rmax = w.radius, ymin = 0.5f * (a0.y + a1.y) - rs;
+                    printf("    ring load %.0f N pressed in %.3f spin %.2f rad/s\n", w.load, sq, w.spin);
+                } else if (!w.nodes.empty()) {
+                    rs /= (float)w.nodes.size();
+                }
+                printf("    wheel r=%.3f (min %.3f max %.3f, def %.3f) axle %.3f speed %.1f torque %.0f brake %.0f hub y %.2f tyre ymin %.3f toe %.2f camber %.2f deg\n", rs, rmin, rmax,
+                       w.radius, length(a1 - a0), w.speed, w.last_torque, w.brake, a0.y, ymin, toe, camber);
             }
             {
                 // the lowest node that is not a tyre's (does anything drag?)
@@ -839,6 +850,56 @@ void App::frame(float dt) {
                     }
                 }
             }
+            if (const char* cf = getenv("BL_CELLDBG")) { // (diagnostics: each car's deformation at the points of a file, "x y z" lines in
+                // the definition's space - its safety cell's: their rms and largest distance off the best rigid fit, mm)
+                static std::vector<vec3> pts;
+                static std::map<const Vehicle*, std::vector<int>> ids;
+                if (pts.empty())
+                    if (FILE* f = fopen(cf, "r")) {
+                        float x, y, z;
+                        while (fscanf(f, "%f %f %f", &x, &y, &z) == 3) pts.push_back(vec3(x, y, z));
+                        fclose(f);
+                    }
+                for (size_t vi = 0; vi < m_game.vehicles.size(); vi++) {
+                    const Vehicle* w = m_game.vehicles[vi].get();
+                    const auto& sp = w->spawn_nodes();
+                    auto& id = ids[w];
+                    if (id.empty())
+                        for (const vec3& q : pts) {
+                            int best = -1;
+                            float bd = 2e-3f * 2e-3f;
+                            for (size_t i = 0; i < sp.size(); i++)
+                                if (const float d = length2(sp[i].p - q); d < bd) bd = d, best = (int)i;
+                            if (best >= 0) id.push_back(best);
+                        }
+                    const auto& nd = w->body->nodes;
+                    const size_t n = id.size();
+                    if (n < 3) continue;
+                    vec3 c0(0), c1(0);
+                    for (int i : id) c0 += sp[i].p, c1 += nd[i].p;
+                    c0 = c0 / (float)n, c1 = c1 / (float)n;
+                    mat3 A(vec3(0), vec3(0), vec3(0));
+                    for (int i : id) A = A + outer(nd[i].p - c1, sp[i].p - c0);
+                    // (from the car's heading: the definition's -x forward, y up, +z left; then Mueller's iteration)
+                    quat q = from_mat3(mat3(-w->forward(), w->up(), w->left()));
+                    for (int it = 0; it < 40; it++) {
+                        const mat3 R = to_mat3(q);
+                        const vec3 om = cross(R.c[0], A.c[0]) + cross(R.c[1], A.c[1]) + cross(R.c[2], A.c[2]);
+                        const float den = std::fabs(dot(R.c[0], A.c[0]) + dot(R.c[1], A.c[1]) + dot(R.c[2], A.c[2])) + 1e-9f;
+                        const vec3 wv = om / den;
+                        const float wl = length(wv);
+                        if (!(wl > 1e-8f)) break;
+                        q = normalize(quat::axis_angle(wv / wl, wl) * q);
+                    }
+                    const mat3 R = to_mat3(q);
+                    float r2 = 0, mx = 0;
+                    for (int i : id) {
+                        const float d = length(nd[i].p - c1 - R * (sp[i].p - c0));
+                        r2 += d * d, mx = std::max(mx, d);
+                    }
+                    printf(" | cell%zu n %zu rms %.1f max %.1f mm", vi, n, 1000.0f * std::sqrt(r2 / (float)n), 1000.0f * mx);
+                }
+            }
             if (getenv("BL_SUSPDBG")) { // (diagnostics: the wheels' beams bent for good, the frame's members bent for good)
                 const phys::SoftBody& b = *v->body;
                 std::vector<char> in(b.nodes.size(), 0);
@@ -910,6 +971,7 @@ void App::frame(float dt) {
                 for (const phys::FrameTri& t : f.tris) dented += !t.broken && t.dmg > 0;
                 printf(" | tris %zu, %d torn, %d dented", f.tris.size(), f.tris_torn, dented);
                 if (!f.mounts.empty()) printf(", mounts %d of %zu let go", f.mounts_broken, f.mounts.size());
+                printf(", %d loose", f.loose_count);
             }
             if (!v->body->volumes.empty()) { // (its collision volumes: their contacts so far, the largest force, off)
                 printf(" | volumes:");
@@ -1087,6 +1149,16 @@ int App::run(const AppOptions& opt) {
         prof::end_frame();
         m_perf.Update(dt);
         write_prof_csv(dt);
+        if (getenv("BL_HASHDBG")) { // (diagnostics: a hash of every node's position and velocity, each frame - two builds compared)
+            uint64_t hsh = 1469598103934665603ull;
+            for (const auto& bp : m_game.world.bodies())
+                for (const phys::Node& x : bp->nodes) {
+                    const float v[6] = {x.p.x, x.p.y, x.p.z, x.v.x, x.v.y, x.v.z};
+                    const unsigned char* c = (const unsigned char*)v;
+                    for (size_t i = 0; i < sizeof(v); i++) hsh = (hsh ^ c[i]) * 1099511628211ull;
+                }
+            printf("hash %d %016llx\n", m_frame_index, (unsigned long long)hsh);
+        }
         record_elements();
         if (opt.realtime) // like vsync at 60 Hz: a frame takes at least 1/60 s
             while (glfwGetTime() - now < 1.0 / 60.0) std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -1163,7 +1235,8 @@ void App::write_prof_csv(float dt) {
                                        "Sheet refine", "Sheet cracks", "Sheet detach", "Sheet reorder", "Visual update", "Sheet mesh", "Sheet mesh rebuild", "Sheet upload",
                                        "Sheet pattern", "Sheet pattern codes", "Sheet settle", "Sheet split point", "Sheet coarsen", "Sheet fx", "Sheet budget", "Sheet sync",
                                        "Render", "Shadows", "Main pass", "UI", "ImGui render", "Draw submit", "Swap", "Input", "Events",
-                                       "Frame elements", "Frame solve", "Frame assemble", "Frame factor", "Sheet membrane", "Sheet spheres"};
+                                       "Frame elements", "Frame solve", "Frame assemble", "Frame factor", "Sheet membrane", "Sheet spheres",
+                                       "Volumes", "Near pairs", "Frame held", "Frame sync", "Sheet events", "FEM assemble", "FEM factor", "FEM finish", "FEM repass", "Volume mids", "Volume find", "Volume push", "Frame events", "Short step first", "Short steps later"};
     if (!path) return;
     if (!m_prof_csv) {
         m_prof_csv = fopen(path, "w");

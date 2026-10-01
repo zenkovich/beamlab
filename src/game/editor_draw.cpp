@@ -194,7 +194,7 @@ void ModelEditor::draw(Renderer& r, int view) {
     auto P = [&](int n) { return to_world(M.nodes[n].p); };
     // the skeleton's opacity (the Graphics tab: the beams and nodes give way to the meshes; 0: only the selected and the
     // hovered are drawn); the lines give way a little to the graphics anyway
-    const float skel = m_skel_alpha * (m_show_gfx && m_preview ? 0.75f : 1.0f) * (m_tool == Tool::Volume ? 0.45f : 1.0f); // (the Volume tool: the hulls stand out)
+    const float skel = m_skel_alpha * (m_show_gfx && m_preview ? 0.75f : 1.0f) * (m_tool == Tool::Volume || m_tool == Tool::Ties ? 0.45f : 1.0f); // (the Volume and Ties tools: theirs stand out)
     const bool skel_off = skel < 0.02f;
     auto hi_of = [&](Elem k, int i) { return elem_selected(k, i) ? 1 : (m_hover_kind == k && m_hover_elem == i ? 2 : 0); };
     // widths (points): the display setting; the selected and the hovered wider, held ends and shocks a little wider
@@ -273,29 +273,48 @@ void ModelEditor::draw(Renderer& r, int view) {
         seg(Elem::Joint, i, j.parent, j.child, c, j.layer, 1.4f);
         square(r, vf, P(j.parent), c, 5);
     }
-    // the sheet's welds (a short tick from the frame node), the parts' mounts (a line with a square at the part's node)
-    // and the slide nodes (a line to the middle of their rail): not editable here, shown so the parts' ties are seen
-    if (!skel_off) {
-        const uint32_t cw = dim(Renderer::rgba(1.0f, 0.85f, 0.25f, 0.9f), skel), cm = dim(Renderer::rgba(1.0f, 0.45f, 0.15f, 1), skel),
-                       cs = dim(Renderer::rgba(0.3f, 1.0f, 0.6f, 1), skel);
+    // the ties (View: Welds and mounts, always with the Ties tool): the mounts (a line from the body's node to the part's,
+    // a square there; a hinge a line on to its second node) and the welds in their kind's colour (editor_ties.cpp), the
+    // Ties tool's active one bright and wide, the hovered lit; the slide nodes (a line to the middle of their rail)
+    if (m_tool == Tool::Ties || (m_show_ties && !skel_off)) {
+        const bool tool = m_tool == Tool::Ties;
+        const float a = tool ? 1.0f : skel;
+        static const uint32_t kinds[] = {Renderer::rgba(1.0f, 0.45f, 0.15f, 1), Renderer::rgba(1.0f, 0.22f, 0.25f, 1), Renderer::rgba(0.35f, 0.7f, 1.0f, 1),
+                                         Renderer::rgba(0.62f, 0.64f, 0.7f, 1), Renderer::rgba(0.45f, 1.0f, 0.45f, 1), Renderer::rgba(1.0f, 0.85f, 0.25f, 1)};
         auto shown = [&](int n) { return n >= 0 && n < (int)M.nodes.size() && node_shown(n); };
-        for (const edit::Weld& w : M.welds)
-            if (shown(w.anchor) && shown(w.node)) r.thick_line(P(w.anchor), P(w.node), cw, bw * 0.8f);
-        for (const edit::Mount& mt : M.mounts)
-            if (shown(mt.a) && shown(mt.b)) r.thick_line(P(mt.a), P(mt.b), cm, bw * 1.2f), square(r, vf, P(mt.b), cm, 5);
+        const int nm = (int)M.mounts.size();
+        for (int t = 0; t < tie_count(); t++) {
+            int n[3];
+            const int c = tie_nodes(t, n);
+            bool ok = true;
+            for (int k = 0; k < c; k++) ok &= shown(n[k]);
+            if (!ok) continue;
+            const char mk = t < nm ? M.mounts[t].kind : 'w';
+            const int ki = mk == 'w' ? 5 : mk == 'c' ? 1 : mk == 'h' ? 2 : mk == 's' ? 3 : mk == 'r' ? 4 : 0;
+            if (tool && m_tie_filter >= 0 && m_tie_filter != ki) continue;
+            const bool act = tool && t == m_tie, hov = tool && t == m_tie_hover;
+            const uint32_t col = act ? Renderer::rgba(1, 1, 0.35f, 1) : hov ? kHoverCol : dim(kinds[ki], a);
+            const float w = act ? sel_w : hov ? hov_w : bw * (t < nm ? 1.2f : 0.8f);
+            if (ki == 3) dashed(r, P(n[0]), P(n[1]), col, std::max(0.005f, length(P(n[1]) - P(n[0])) / 6.0f), w); // (a buffer: pushes only)
+            else r.thick_line(P(n[0]), P(n[1]), col, w);
+            if (c == 3) dashed(r, P(n[1]), P(n[2]), col, std::max(0.01f, length(P(n[2]) - P(n[1])) / 10.0f), w);
+            if (t < nm) square(r, vf, P(n[1]), col, act ? 7 : 5);
+            if (act) ring(r, vf, P(n[0]), col, 8, 14, 2.0f);
+        }
+        const uint32_t cs = dim(Renderer::rgba(0.3f, 1.0f, 0.6f, 1), skel);
         for (const edit::SlideNode& sn : M.slidenodes) {
-            if (!shown(sn.node)) continue;
+            if (!shown(sn.node) || skel_off) continue;
             vec3 mid(0);
             for (int n : sn.rail) mid += P(n) * (1.0f / (float)sn.rail.size());
             r.thick_line(P(sn.node), mid, cs, bw), square(r, vf, P(sn.node), cs, 5);
         }
     }
-    // the collision volumes: their hulls' edges (magenta, as the game's collision view); with the Volume tool the active
-    // one bright, its points (the selected and the hovered lit), its anchors ringed, the nodes inside it marked
+    // the collision volumes (View: Collision volumes, always with the Volume tool): their hulls' edges (magenta, as the
+    // game's collision view); with the Volume tool the active one bright, its points (the selected and the hovered lit), its anchors ringed, the nodes inside it marked
     {
         const bool tool = m_tool == Tool::Volume;
         const int av = active_volume();
-        for (int v = 0; v < (int)M.volumes.size(); v++) {
+        for (int v = 0; v < (int)M.volumes.size() && (tool || m_show_volumes); v++) {
             const VolumeHull& h = volume_hull(v);
             const std::vector<vec3>& pts = M.volumes[v].verts;
             const bool act = tool && v == av;
@@ -452,6 +471,15 @@ void ModelEditor::draw_tool_preview(Renderer& r, int view) {
     switch (m_tool) {
     case Tool::Line:
         if (m_chain >= 0 && pk.valid()) axis_line(M.nodes[m_chain].p, pk.p);
+        break;
+    case Tool::Ties:
+        // the nodes picked so far, a band to the hovered one
+        for (size_t k = 0; k < m_picks.size(); k++)
+            if (m_picks[k] < (int)M.nodes.size()) {
+                ring(r, vf, W(M.nodes[m_picks[k]].p), Renderer::rgba(1, 0.75f, 0.3f, 1), 9, 14, 2.0f);
+                if (k) thick_line(r, vf, W(M.nodes[m_picks[k - 1]].p), W(M.nodes[m_picks[k]].p), white, 2);
+            }
+        if (!m_picks.empty() && m_picks.back() < (int)M.nodes.size() && pk.kind == PK_Node) dashed(r, W(M.nodes[m_picks.back()].p), W(pk.p), white, std::max(0.01f, vf.px_at(W(pk.p)) * 6), 2.0f);
         break;
     case Tool::Tri: case Tool::Shell: case Tool::FemTri: case Tool::Shock: case Tool::Rod: case Tool::Wheel:
         if (!m_picks.empty() && pk.valid()) {

@@ -623,6 +623,7 @@ void ModelEditor::tool_input() {
                 } else {
                     if (!(is_selected(m_hover_node) && !shift && !ctrl)) select_node(m_hover_node, shift, ctrl);
                     if (is_selected(m_hover_node) && !shift && !ctrl) {
+                        if (std::fabs(M.nodes[m_hover_node].p.z) > 1e-3f) m_sym_side = M.nodes[m_hover_node].p.z > 0 ? 1 : -1; // (the side dragged leads)
                         op_begin_nodes();
                         m_drag_anchor = M.nodes[m_hover_node].p;
                         m_drag = Drag::MoveFree;
@@ -639,10 +640,15 @@ void ModelEditor::tool_input() {
                         sorted_insert(m_sel_tris, t);
                         for (int k : {M.tris[t].a, M.tris[t].b, M.tris[t].c}) sorted_insert(m_sel, k);
                     }
+                    select_twins();
                 } else {
                     const bool was = elem_selected(m_hover_kind, m_hover_elem);
                     if (!(was && !shift && !ctrl)) select_elem(m_hover_kind, m_hover_elem, shift, ctrl);
                     if (elem_selected(m_hover_kind, m_hover_elem) && !shift && !ctrl) {
+                        int en[3];
+                        float ez = 0;
+                        for (int k = 0, c = elem_nodes(m_hover_kind, m_hover_elem, en); k < c; k++) ez += M.nodes[en[k]].p.z;
+                        if (std::fabs(ez) > 1e-3f) m_sym_side = ez > 0 ? 1 : -1; // (the side dragged leads)
                         op_begin_nodes();
                         vec3 ro, rd;
                         mouse_ray(m_active_view, ro, rd);
@@ -966,6 +972,41 @@ void ModelEditor::tool_input() {
         }
         break;
     }
+    // ---- ties: node after node for a new one (two, a hinge three), a click on a line makes that one active; Shift+click
+    // a node: the active hinge's second node
+    case Tool::Ties: {
+        m_tie_hover = in_view && m_drag == Drag::None && m_pick.kind != PK_Node ? tie_at(m_mouse) : -1;
+        if (!click) break;
+        const int t = active_tie();
+        if (m_pick.kind == PK_Node && shift) {
+            if (t >= 0 && t < (int)M.mounts.size() && M.mounts[t].kind == 'h' && m_pick.node != M.mounts[t].a) {
+                push_undo();
+                const int w = m_symmetry ? tie_twin(t) : -1;
+                M.mounts[t].b2 = m_pick.node;
+                const int n2 = twin_or_self(m_pick.node);
+                if (w >= 0 && w < (int)M.mounts.size() && n2 >= 0) M.mounts[w].b2 = n2;
+                m_status = "The hinge's second node: " + std::to_string(m_pick.node);
+            } else {
+                m_status = "Shift+click: the active hinge's second node (make a hinge active first)";
+            }
+        } else if (m_pick.kind == PK_Node) {
+            if (std::find(m_picks.begin(), m_picks.end(), m_pick.node) == m_picks.end()) m_picks.push_back(m_pick.node);
+            const size_t need = m_tie_kind == 2 ? 3 : 2;
+            if (m_picks.size() >= need) {
+                add_tie(m_tie_kind, m_picks);
+                m_picks.clear();
+            } else {
+                static const char* next[] = {"the part's node", "the part's second node on the hinge's line"};
+                m_status = "Node " + std::to_string(m_pick.node) + ": now " + (m_tie_kind == 5 ? "the sheet's node" : next[m_picks.size() - 1]);
+            }
+        } else if (m_tie_hover >= 0) {
+            m_tie = m_tie_hover;
+            m_picks.clear();
+        } else {
+            m_picks.clear();
+        }
+        break;
+    }
     // ---- merge: click a node, then the node it goes into
     case Tool::Merge: {
         if (click && m_pick.kind == PK_Node) {
@@ -1078,6 +1119,13 @@ void ModelEditor::box_select(bool add, bool remove) {
     for (int i = 0; i < (int)M.nodes.size(); i++) {
         vec2 s;
         if (node_shown(i) && project(vi, to_world(M.nodes[i].p), s)) in[i] = s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1;
+    }
+    if (m_symmetry) {
+        // the twins of what the box holds: the mirrored nodes, and the elements on them
+        const std::vector<int> tw = M.twins();
+        const std::vector<char> box = in;
+        for (int i = 0; i < (int)M.nodes.size(); i++)
+            if (box[i] && tw[i] >= 0) in[tw[i]] = 1;
     }
     if (!add && !remove) clear_selection();
     auto put = [&](std::vector<int>& v, int i) {
@@ -1284,6 +1332,7 @@ void ModelEditor::hotkeys() {
     }
     if ((pressed(ImGuiKey_Delete) || pressed(ImGuiKey_Backspace)) && !vcb_active() && m_vcb.empty()) {
         if (m_tool == Tool::Volume && active_volume() >= 0 && m_vol_point >= 0) volume_remove_point(active_volume(), m_vol_point);
+        else if (m_tool == Tool::Ties && active_tie() >= 0 && selection_empty()) delete_tie(active_tie());
         else delete_selection();
     }
     if (io.KeyAlt) {
@@ -1317,7 +1366,7 @@ void ModelEditor::hotkeys() {
     for (const K& k : keys)
         if (pressed(k.key)) set_tool(k.tool);
     if (pressed(ImGuiKey_G)) m_snap = !m_snap;
-    if (pressed(ImGuiKey_X)) m_symmetry = !m_symmetry;
+    if (pressed(ImGuiKey_X)) m_symmetry = !m_symmetry, select_twins();
     if (pressed(ImGuiKey_I)) m_show_ids = !m_show_ids;
     if (pressed(ImGuiKey_V)) {
         m_quad = !m_quad;

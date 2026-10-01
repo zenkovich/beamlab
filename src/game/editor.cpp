@@ -20,6 +20,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <unordered_map>
 
 namespace bl {
 
@@ -151,6 +152,14 @@ void ModelEditor::open() {
         for (int i = 0; i < (int)m_model.tris.size(); i++)
             if (is_selected(m_model.tris[i].a) && is_selected(m_model.tris[i].b) && is_selected(m_model.tris[i].c)) m_sel_tris.push_back(i);
     }
+    if (const char* sn = getenv("BL_EDITOR_PICK")) { // (screenshots: "tri,<i>" or "node,<i>" clicked, ",c" then everything connected)
+        const std::string v = sn;
+        const int i = atoi(v.c_str() + v.find(',') + 1);
+        if (v.rfind("tri", 0) == 0) select_elem(Elem::Tri, i, false, false);
+        else select_node(i, false, false);
+        if (v.size() > 2 && v.compare(v.size() - 2, 2, ",c") == 0) select_connected();
+    }
+    if (const char* t = getenv("BL_EDITOR_TIE")) m_tie = atoi(t); // (the Ties tool's active one)
     if (const char* dm = getenv("BL_EDITOR_DEFORM")) { // (the deformation demo; a number: a preset)
         enter_deform();
         if (atoi(dm) >= 0 && *dm != 'x') m_demo_amount = 0.7f, deform_preset(atoi(dm));
@@ -533,21 +542,114 @@ int ModelEditor::selected_elements() const {
 
 void ModelEditor::select_node(int n, bool add, bool toggle) {
     if (n < 0 || !node_pickable(n)) return;
+    if (std::fabs(m_model.nodes[n].p.z) > 1e-3f) m_sym_side = m_model.nodes[n].p.z > 0 ? 1 : -1;
     if (toggle) sorted_toggle(m_sel, n);
     else if (add) sorted_insert(m_sel, n);
     else {
         clear_selection();
         m_sel = {n};
     }
+    // with symmetry the twin goes the same way
+    const int t = m_symmetry ? m_model.twin(n) : -1;
+    if (t < 0 || !node_pickable(t)) return;
+    if (is_selected(n)) sorted_insert(m_sel, t);
+    else if (is_selected(t)) sorted_toggle(m_sel, t);
+}
+
+int ModelEditor::elem_nodes(Elem k, int i, int n[3]) const {
+    const edit::Model& M = m_model;
+    switch (k) {
+    case Elem::Beam: n[0] = M.beams[i].a, n[1] = M.beams[i].b; return 2;
+    case Elem::Shock: n[0] = M.shocks[i].a, n[1] = M.shocks[i].b; return 2;
+    case Elem::Hydro: n[0] = M.hydros[i].a, n[1] = M.hydros[i].b; return 2;
+    case Elem::Tri: n[0] = M.tris[i].a, n[1] = M.tris[i].b, n[2] = M.tris[i].c; return 3;
+    case Elem::Wheel: n[0] = M.wheels[i].n1, n[1] = M.wheels[i].n2; return 2;
+    case Elem::Joint: n[0] = M.joints[i].parent, n[1] = M.joints[i].child; return 2;
+    default: return 0;
+    }
+}
+
+int ModelEditor::elem_count(Elem k) const {
+    const edit::Model& M = m_model;
+    switch (k) {
+    case Elem::Beam: return (int)M.beams.size();
+    case Elem::Shock: return (int)M.shocks.size();
+    case Elem::Hydro: return (int)M.hydros.size();
+    case Elem::Tri: return (int)M.tris.size();
+    case Elem::Wheel: return (int)M.wheels.size();
+    case Elem::Joint: return (int)M.joints.size();
+    default: return 0;
+    }
+}
+
+namespace {
+// an element's nodes as a key regardless of their order (a triangle's three in 21 bits each)
+uint64_t elem_key(const int* n, int c) {
+    int s[3] = {n[0], n[1], c > 2 ? n[2] : -1};
+    std::sort(s, s + c);
+    uint64_t k = 0;
+    for (int j = 0; j < c; j++) k = k << 21 | (uint64_t)(s[j] & 0x1fffff);
+    return k;
+}
+} // namespace
+
+int ModelEditor::elem_twin(Elem k, int i) const {
+    int n[3], t[3];
+    const int c = elem_nodes(k, i, n);
+    for (int j = 0; j < c; j++)
+        if ((t[j] = twin_or_self(n[j])) < 0) return -1;
+    const uint64_t key = elem_key(t, c);
+    for (int e = 0, m = elem_count(k); e < m; e++) {
+        int q[3];
+        if (e != i && elem_nodes(k, e, q) == c && elem_key(q, c) == key) return e;
+    }
+    return -1;
 }
 
 void ModelEditor::select_elem(Elem k, int i, bool add, bool toggle) {
     if (k == Elem::None || i < 0 || !elem_pickable(k, i)) return;
+    {
+        int n[3];
+        float z = 0;
+        const int c = elem_nodes(k, i, n);
+        for (int j = 0; j < c; j++) z += m_model.nodes[n[j]].p.z;
+        if (std::fabs(z) > 1e-3f) m_sym_side = z > 0 ? 1 : -1;
+    }
     if (toggle) sorted_toggle(sel_of(k), i);
     else if (add) sorted_insert(sel_of(k), i);
     else {
         clear_selection();
         sel_of(k) = {i};
+    }
+    const int t = m_symmetry ? elem_twin(k, i) : -1;
+    if (t < 0 || !elem_pickable(k, t)) return;
+    if (elem_selected(k, i)) sorted_insert(sel_of(k), t);
+    else if (elem_selected(k, t)) sorted_toggle(sel_of(k), t);
+}
+
+void ModelEditor::select_twins() {
+    if (!m_symmetry) return;
+    const std::vector<int> tw = m_model.twins();
+    auto tos = [&](int n) { return tw[n] >= 0 ? tw[n] : std::fabs(m_model.nodes[n].p.z) < 1e-3f ? n : -1; };
+    for (int n : std::vector<int>(m_sel))
+        if (tw[n] >= 0 && node_pickable(tw[n])) sorted_insert(m_sel, tw[n]);
+    for (Elem k : {Elem::Beam, Elem::Shock, Elem::Hydro, Elem::Tri, Elem::Wheel, Elem::Joint}) {
+        std::vector<int>& sel = sel_of(k);
+        if (sel.empty()) continue;
+        std::unordered_map<uint64_t, int> at;
+        int n[3];
+        for (int e = 0, m = elem_count(k); e < m; e++) {
+            const int c = elem_nodes(k, e, n);
+            at.emplace(elem_key(n, c), e);
+        }
+        for (int i : std::vector<int>(sel)) {
+            const int c = elem_nodes(k, i, n);
+            bool ok = true;
+            for (int j = 0; j < c; j++) ok &= (n[j] = tos(n[j])) >= 0;
+            if (!ok) continue;
+            auto it = at.find(elem_key(n, c));
+            if (it != at.end() && elem_pickable(k, it->second)) sorted_insert(sel, it->second);
+        }
     }
 }
 
@@ -716,18 +818,49 @@ void ModelEditor::frame_selection() {
 }
 
 void ModelEditor::select_connected() {
-    std::vector<char> in(m_model.nodes.size(), 0);
-    for (int n : selection_nodes_all()) in[n] = 1;
-    bool grown = true;
-    while (grown) {
-        grown = false;
-        for (const edit::Beam& b : m_model.beams)
-            if (in[b.a] != in[b.b]) in[b.a] = in[b.b] = 1, grown = true;
+    // the nodes reached through beams, triangles (cab, shells, FEM), shocks, rods and wheels; the kinds of elements
+    // that were selected get all of theirs on these nodes too
+    const edit::Model& M = m_model;
+    const int N = (int)M.nodes.size();
+    std::vector<int> head(N, -1), next, to;
+    auto link = [&](int a, int b) {
+        if (a < 0 || b < 0 || a >= N || b >= N || a == b) return;
+        to.push_back(b), next.push_back(head[a]), head[a] = (int)to.size() - 1;
+        to.push_back(a), next.push_back(head[b]), head[b] = (int)to.size() - 1;
+    };
+    for (const edit::Beam& b : M.beams) link(b.a, b.b);
+    for (const edit::Tri& t : M.tris) link(t.a, t.b), link(t.b, t.c), link(t.c, t.a);
+    for (const edit::Shock& s : M.shocks) link(s.a, s.b);
+    for (const edit::Hydro& h : M.hydros) link(h.a, h.b);
+    for (const edit::Wheel& w : M.wheels) link(w.n1, w.n2);
+    std::vector<char> in(N, 0);
+    std::vector<int> open = selection_nodes_all();
+    for (int n : open) in[n] = 1;
+    while (!open.empty()) {
+        const int n = open.back();
+        open.pop_back();
+        for (int e = head[n]; e >= 0; e = next[e])
+            if (!in[to[e]]) in[to[e]] = 1, open.push_back(to[e]);
     }
     m_sel.clear();
-    for (int i = 0; i < (int)in.size(); i++)
+    for (int i = 0; i < N; i++)
         if (in[i] && node_pickable(i)) m_sel.push_back(i);
-    m_status = std::to_string(m_sel.size()) + " connected nodes selected";
+    int elems = 0;
+    for (Elem k : {Elem::Beam, Elem::Shock, Elem::Hydro, Elem::Tri, Elem::Wheel, Elem::Joint}) {
+        std::vector<int>& sel = sel_of(k);
+        if (sel.empty()) continue;
+        sel.clear();
+        int n[3];
+        for (int e = 0, m = elem_count(k); e < m; e++) {
+            const int c = elem_nodes(k, e, n);
+            bool all = true;
+            for (int j = 0; j < c; j++) all &= n[j] >= 0 && in[n[j]];
+            if (all && elem_pickable(k, e)) sel.push_back(e);
+        }
+        elems += (int)sel.size();
+    }
+    select_twins();
+    m_status = std::to_string(m_sel.size()) + " connected nodes selected" + (elems ? ", " + std::to_string(selected_elements()) + " elements" : std::string());
 }
 
 void ModelEditor::select_invert() {
@@ -740,11 +873,14 @@ void ModelEditor::select_invert() {
 
 void ModelEditor::select_grow() {
     std::vector<int> out = m_sel;
-    for (const edit::Beam& b : m_model.beams) {
-        if (is_selected(b.a) && node_pickable(b.b)) sorted_insert(out, b.b);
-        if (is_selected(b.b) && node_pickable(b.a)) sorted_insert(out, b.a);
-    }
+    auto grow = [&](int a, int b) {
+        if (is_selected(a) && node_pickable(b)) sorted_insert(out, b);
+        if (is_selected(b) && node_pickable(a)) sorted_insert(out, a);
+    };
+    for (const edit::Beam& b : m_model.beams) grow(b.a, b.b);
+    for (const edit::Tri& t : m_model.tris) grow(t.a, t.b), grow(t.b, t.c), grow(t.c, t.a);
     m_sel = out;
+    select_twins();
 }
 
 void ModelEditor::select_by_preset(int group) {
@@ -1165,9 +1301,13 @@ void ModelEditor::hull_selection() {
 }
 
 void ModelEditor::move_selection(vec3 delta) {
-    for (int n : m_sel) m_model.nodes[n].p += delta;
+    const vec3 md = mirror_z(delta);
+    for (int n : m_sel) {
+        const int t = m_symmetry ? m_model.twin(n) : -1;
+        // (a pair of selected twins moves mirrored: the side clicked last leads)
+        m_model.nodes[n].p += t >= 0 && is_selected(t) && m_model.nodes[n].p.z * m_sym_side < 0 ? md : delta;
+    }
     if (m_symmetry) {
-        const vec3 md = mirror_z(delta);
         for (int n : m_sel) {
             const int t = m_model.twin(n);
             if (t >= 0 && !is_selected(t) && !m_model.node_locked(t)) m_model.nodes[t].p += md;
@@ -1177,7 +1317,17 @@ void ModelEditor::move_selection(vec3 delta) {
 
 void ModelEditor::op_begin_nodes() {
     m_op_nodes.clear(), m_op_twins.clear(), m_op_pos0.clear();
-    for (int n : selection_nodes_all()) {
+    std::vector<int> nodes = selection_nodes_all();
+    if (m_symmetry) {
+        // a pair of selected twins moves mirrored: the side clicked last leads, the other follows as the twins
+        std::vector<int> keep;
+        for (int n : nodes) {
+            const int t = m_model.twin(n);
+            if (!(t >= 0 && std::binary_search(nodes.begin(), nodes.end(), t) && m_model.nodes[n].p.z * m_sym_side < 0)) keep.push_back(n);
+        }
+        nodes.swap(keep);
+    }
+    for (int n : nodes) {
         if (m_model.node_locked(n)) continue;
         m_op_nodes.push_back(n);
         m_op_pos0.push_back(m_model.nodes[n].p);

@@ -54,8 +54,9 @@ const ToolInfo kTools[] = {
     {"Joint", "", I::Joint, "Frame elements (FEM beams): click near an end of one to join it to its node with the joint chosen below (welded, ball, hinges, swivel, elastic); Shift+click: its preset's joint again; with symmetry the twin's end too"},
     {"FEM triangle", "Q", I::FemTri, "Three nodes: a FEM triangle, a shell element of the frame (membrane and bending, plastic past the yield, torn past the elongation) of the FEM shell chosen below; it makes its own collision surface. The Rectangle, Circle and Push / Pull tools make them too (Faces: FEM triangles)"},
     {"Collision volume", "Z", I::Volume, "What fills a car (the engine, the cabin, the load): a convex hull riding on frame nodes. New (below) makes one of the selected nodes; drag its points (with symmetry their mirrors too), Ctrl+click adds a point, Delete takes the selected one off; Shift+click a node to make it an anchor or take it off; a point of another volume makes that one active"},
+    {"Ties", "", I::Ties, "What holds the parts on the body: the mounts (latches, clamped bolts, hinges, buffers, stays) and the sheet's welds. Click the body's node, then the part's for a new one of the kind chosen below (a hinge: then the part's second node; a weld: the frame's node, then the sheet's); click a line to edit that one, Delete takes it off; Shift+click a node: the active hinge's second node; with symmetry the twins too"},
 };
-static_assert(sizeof(kTools) / sizeof(kTools[0]) == 20, "one entry per tool");
+static_assert(sizeof(kTools) / sizeof(kTools[0]) == 21, "one entry per tool");
 // one line each: what the tool does (the tooltips have more)
 const char* kToolShort[] = {
     "Click or drag a box to select (Shift adds); drag to move",
@@ -78,6 +79,7 @@ const char* kToolShort[] = {
     "Click near a frame element's end: its joint",
     "Three nodes: a FEM triangle (a shell element of the frame)",
     "Drag its points; Shift+click nodes: its anchors; Ctrl+click: a point",
+    "The body's node, then the part's: a latch, a bolt, a hinge...",
 };
 
 const char* kViewNames[] = {"3D", "Front", "Side", "Top"};
@@ -92,7 +94,8 @@ const char* kJointTips[] = {
     "Hinge swinging in the member's horizontal plane (free about its y axis, up)",
     "Swivel: turns freely about the member's own axis, bending held (a bearing, a steering column)",
     "Elastic: every rotation held by a spring of the preset's joint stiffness (a rubber bushing, a bolted joint)"};
-const char* kWheelTypes[] = {"wheels (rim + tyre drawn)", "wheels2 (rim and tyre springs)", "meshwheels (a rim mesh)", "meshwheels2", "flexbodywheels (tyre mesh)"};
+const char* kWheelTypes[] = {"wheels (rim + tyre drawn)", "wheels2 (rim and tyre springs)", "meshwheels (a rim mesh)", "meshwheels2", "flexbodywheels (tyre mesh)",
+                             "ringwheels (rigid rim, flexible tyre)"};
 
 ImVec2 V(float x, float y) { return ImVec2(x, y); }
 void section(const char* s) { section_title(s); }
@@ -384,6 +387,12 @@ void ModelEditor::draw_icon(ImDrawList* dl, Icon icon, float x, float y, float s
         dot(0.64f, 0.36f, 0.06f), dot(0.36f, 0.64f, 0.06f);
         break;
     }
+    case Icon::Ties: // (two plates, a bolt through them)
+        L(0.1f, 0.3f, 0.52f, 0.3f, th * 1.6f), L(0.48f, 0.7f, 0.9f, 0.7f, th * 1.6f);
+        L(0.5f, 0.3f, 0.5f, 0.7f, th);
+        dot(0.5f, 0.3f, 0.08f), dot(0.5f, 0.7f, 0.08f);
+        dl->AddRect(P(0.42f, 0.42f), P(0.58f, 0.58f), c, 0, 0, th);
+        break;
     case Icon::Joint: // (a beam, a ring round its end at a node)
         L(0.12f, 0.82f, 0.62f, 0.32f, th * 1.6f);
         dl->AddCircle(P(0.72f, 0.24f), 0.17f * s, c, 0, th);
@@ -554,7 +563,7 @@ void ModelEditor::ui_bar(ImFont* small) {
     }
     gap();
     // how points are placed
-    if (icon_button("##sym", Icon::Symmetry, m_symmetry, "Symmetry (X): edits are mirrored across z = 0 onto the twin nodes", bs)) m_symmetry = !m_symmetry;
+    if (icon_button("##sym", Icon::Symmetry, m_symmetry, "Symmetry (X): edits are mirrored across z = 0 onto the twin nodes", bs)) m_symmetry = !m_symmetry, select_twins();
     ImGui::SameLine();
     if (icon_button("##snap", Icon::Snap, m_snap, "Snap (G): points to the grid step, angles to 15 degrees (the step: View)", bs)) m_snap = !m_snap;
     gap();
@@ -631,6 +640,12 @@ void ModelEditor::ui_view_popup() {
         ImGui::Checkbox("Filled faces", &m_fill);
         ImGui::TableNextColumn();
         ImGui::Checkbox("Node numbers (I)", &m_show_ids);
+        ImGui::TableNextColumn();
+        ImGui::Checkbox("Collision volumes", &m_show_volumes);
+        ImGui::SetItemTooltip("The volumes' hulls (always shown with the Volume tool)");
+        ImGui::TableNextColumn();
+        ImGui::Checkbox("Welds and mounts", &m_show_ties);
+        ImGui::SetItemTooltip("The sheet's welds and the parts' mounts (always shown with the Ties tool)");
         ImGui::EndTable();
     }
     section_title("Beams and nodes");
@@ -789,9 +804,16 @@ void ModelEditor::ui_left(ImFont* small) {
     } else {
         ui_tools();
         ui_tool_options();
-        if (ImGui::CollapsingHeader("Beam presets", ImGuiTreeNodeFlags_DefaultOpen)) ui_presets();
-        if (ImGui::CollapsingHeader("Shell materials", ImGuiTreeNodeFlags_DefaultOpen)) ui_shell_presets();
-        if (ImGui::CollapsingHeader("FEM shells", m_model.fem_count() ? ImGuiTreeNodeFlags_DefaultOpen : 0)) ui_fem_presets();
+        // the presets and materials with the tools that use them (the drawing tools by the kind of faces they make),
+        // with Select for the kinds selected
+        const bool draws = m_tool == Tool::Rect || m_tool == Tool::Circle || m_tool == Tool::PushPull;
+        const bool sel = m_tool == Tool::Select;
+        const bool beams = m_tool == Tool::Line || m_tool == Tool::Joint || (draws && (m_face_mode < 2 || m_shell_beams)) || (sel && !m_sel_beams.empty());
+        const bool shells = m_tool == Tool::Shell || (draws && m_face_mode == 2) || (sel && sel_count(SelKind::Shells) > 0);
+        const bool fem = m_tool == Tool::FemTri || (draws && m_face_mode == 3) || (sel && sel_count(SelKind::Fem) > 0);
+        if (beams && ImGui::CollapsingHeader("Beam presets", ImGuiTreeNodeFlags_DefaultOpen)) ui_presets();
+        if (shells && ImGui::CollapsingHeader("Shell materials", ImGuiTreeNodeFlags_DefaultOpen)) ui_shell_presets();
+        if (fem && ImGui::CollapsingHeader("FEM shells", ImGuiTreeNodeFlags_DefaultOpen)) ui_fem_presets();
         if (ImGui::CollapsingHeader("Utilities", ImGuiTreeNodeFlags_DefaultOpen)) ui_utilities();
     }
     ImGui::PopFont();
@@ -807,7 +829,7 @@ void ModelEditor::ui_tools() {
     static const Group groups[] = {
         {"Select and change", {Tool::Select, Tool::Move, Tool::Rotate, Tool::Scale, Tool::Merge, Tool::Erase, Tool::Tape}},
         {"Draw", {Tool::Line, Tool::Node, Tool::Rect, Tool::Circle, Tool::PushPull}},
-        {"Add", {Tool::Tri, Tool::Shell, Tool::FemTri, Tool::Shock, Tool::Rod, Tool::Wheel, Tool::Joint, Tool::Volume}},
+        {"Add", {Tool::Tri, Tool::Shell, Tool::FemTri, Tool::Shock, Tool::Rod, Tool::Wheel, Tool::Joint, Tool::Volume, Tool::Ties}},
     };
     const float bs = 32.0f;
     for (const Group& g : groups) {
@@ -837,7 +859,7 @@ void ModelEditor::ui_tool_options() {
     // only the tools that have options show them
     const bool any = m_tool == Tool::Line || m_tool == Tool::Node || m_tool == Tool::Rect || m_tool == Tool::Circle || m_tool == Tool::Move || m_tool == Tool::Rotate ||
                      m_tool == Tool::Scale || m_tool == Tool::Shell || m_tool == Tool::PushPull || m_tool == Tool::Merge || m_tool == Tool::Joint ||
-                     m_tool == Tool::FemTri || m_tool == Tool::Volume;
+                     m_tool == Tool::FemTri || m_tool == Tool::Volume || m_tool == Tool::Ties;
     auto shell_mat = [&]() {
         std::vector<std::string> names;
         for (int i = 0; i < m_model.shell_preset_count(); i++) names.push_back(m_model.shell_preset(i).name + " (" + m_model.shell_preset(i).material + ")");
@@ -881,6 +903,10 @@ void ModelEditor::ui_tool_options() {
     };
     if (m_tool == Tool::Volume) {
         ui_volumes();
+        return;
+    }
+    if (m_tool == Tool::Ties) {
+        ui_ties();
         return;
     }
     if (!props_begin("##toolopts")) return;
@@ -1779,20 +1805,20 @@ void ModelEditor::ui_properties() {
             prop("Axle nodes");
             ImGui::Text("%d - %d", w.n1, w.n2);
             prop("Kind");
-            m_dirty |= ImGui::Combo("##wt", &w.type, kWheelTypes, 5);
+            m_dirty |= ImGui::Combo("##wt", &w.type, kWheelTypes, 6);
             prop("Radius");
             m_dirty |= ImGui::SliderFloat("##wr", &w.radius, 0.05f, 1.5f, "%.3f m");
             if (w.type != 0) prop("Rim radius"), m_dirty |= ImGui::SliderFloat("##wrr", &w.rim_radius, 0.02f, 1.2f, "%.3f m");
             prop("Width");
             m_dirty |= ImGui::SliderFloat("##ww", &w.width, 0.02f, 1.0f, "%.3f m");
-            prop("Rays");
-            m_dirty |= ImGui::SliderInt("##wrays", &w.rays, 3, 32);
+            if (w.type != 5) prop("Rays"), m_dirty |= ImGui::SliderInt("##wrays", &w.rays, 3, 32);
             prop("Mass");
             m_dirty |= ImGui::SliderFloat("##wm", &w.mass, 1.0f, 500.0f, "%.1f kg", ImGuiSliderFlags_Logarithmic);
-            prop("Tyre spring");
+            prop(w.type == 5 ? "Tyre stiffness" : "Tyre spring", w.type == 5 ? "N/m: the tyre pressed 2 cm into the flat (its stiffness per area follows)" : nullptr);
             m_dirty |= ImGui::SliderFloat("##wk", &w.spring, 1.0e3f, 3.0e6f, "%.3g", ImGuiSliderFlags_Logarithmic);
             prop("Tyre damping");
             m_dirty |= ImGui::SliderFloat("##wd", &w.damp, 10.0f, 1.0e5f, "%.3g", ImGuiSliderFlags_Logarithmic);
+            if (w.type == 5) prop("Grip", "Times the ground's friction"), m_dirty |= ImGui::SliderFloat("##wg", &w.grip, 0.2f, 2.0f, "%.2f");
             if (w.type == 1 || w.type == 4) {
                 prop("Rim spring");
                 m_dirty |= ImGui::SliderFloat("##wrk", &w.rim_spring, 1.0e3f, 1.0e7f, "%.3g", ImGuiSliderFlags_Logarithmic);

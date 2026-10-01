@@ -54,12 +54,12 @@ public:
         Select, Line, Node, Rect, Circle, PushPull, Move, Rotate, Scale, Tape, Erase, Tri, Shell, Shock, Rod, Wheel,
         Undo, Redo, Save, Drive, Physics, Close, Eye, EyeOff, Lock, Unlock, Plus, Trash, Edit, Copy, Quad, Grid, Floor,
         Symmetry, Snap, Frame, Chain, Pairs, Fill, Mirror, Connected, Grow, Invert, Hide, Show, Triangulate, Mesh, Link, Ids,
-        Width, Blast, Shoot, Laser, Merge, Joint, Divide, FemTri, Volume, Count
+        Width, Blast, Shoot, Laser, Merge, Joint, Divide, FemTri, Volume, Ties, Count
     };
 
 private:
     enum class Mode { Edit, Deform, Physics, Drive };
-    enum class Tool { Select, Line, Node, Rect, Circle, PushPull, Move, Rotate, Scale, Tape, Erase, Tri, Shell, Shock, Rod, Wheel, Merge, Joint, FemTri, Volume, Count };
+    enum class Tool { Select, Line, Node, Rect, Circle, PushPull, Move, Rotate, Scale, Tape, Erase, Tri, Shell, Shock, Rod, Wheel, Merge, Joint, FemTri, Volume, Ties, Count };
     enum class Elem { None, Beam, Shock, Hydro, Tri, Wheel, Joint };
     enum class Drag { None, Box, MoveFree, MoveAxis, Orbit, Pan, SplitX, SplitY, SplitXY, Grab, Erase, VolumePoint };
     struct View {                    // a view of the model: the perspective one orbits, the others are orthographic
@@ -106,6 +106,12 @@ private:
     bool elem_selected(Elem k, int i) const { const auto& v = sel_of(k); return std::binary_search(v.begin(), v.end(), i); }
     void select_node(int n, bool add, bool toggle);
     void select_elem(Elem k, int i, bool add, bool toggle);
+    // with symmetry a click takes the twin too (a node's, an element's on the twin nodes), select_twins the whole
+    // selection's; the side clicked last leads a move of both
+    int elem_nodes(Elem k, int i, int n[3]) const; // (2, or 3 for a triangle)
+    int elem_count(Elem k) const;
+    int elem_twin(Elem k, int i) const;
+    void select_twins();
     void clear_selection();
     bool selection_empty() const;
     int selected_elements() const;
@@ -165,6 +171,19 @@ private:
     void volume_prune(int v);                    // the points inside the hull dropped
     void delete_volume(int v);
     void ui_volumes();
+    // the parts' ties (editor_ties.cpp, the Ties tool): the mounts (Model::mounts: latches, bolts, hinges, buffers,
+    // stays) and the sheet's welds (Model::welds) in one list - a tie t < mounts.size() the mount t, past them the weld
+    // t - mounts.size(); the one under the mouse, the twin (the same kind on the twin nodes, -1: none), a new one of
+    // the kind (kTieKinds: the mounts' p c h s r, then a weld) on the picked nodes (with symmetry the twin too), one
+    // deleted (with its twin), the panel
+    int tie_count() const { return (int)(m_model.mounts.size() + m_model.welds.size()); }
+    int active_tie() const { return m_tie >= 0 && m_tie < tie_count() ? m_tie : -1; }
+    int tie_nodes(int t, int n[3]) const;
+    int tie_at(vec2 mouse) const;
+    int tie_twin(int t) const;
+    void add_tie(int kind, const std::vector<int>& nodes);
+    void delete_tie(int t);
+    void ui_ties();
     void finish_merge(const std::vector<std::vector<int>>& groups, const std::vector<vec3>& at, const char* what);
     void set_view(int preset);       // 0 3D, 1 front, 2 side, 3 top
     bool node_shown(int n) const;    // visible and not hidden
@@ -396,6 +415,8 @@ private:
     double m_last_click = 0;
     GLFWwindow* m_win = nullptr;
     // options
+    bool m_show_volumes = false, m_show_ties = true; // (the View popup; the Volume and Ties tools show theirs anyway)
+    int m_sym_side = 1;              // the side (+1 / -1 in z) clicked last: it leads a move of a pair of selected twins
     bool m_symmetry = true, m_snap = true, m_show_ids = false, m_fill = true, m_grid = true, m_floor = true;
     float m_snap_size = 0.05f, m_work_y = 0.0f;
     int m_face_mode = 1;             // new faces (rectangle, circle, push / pull): 0 none, 1 cab triangles, 2 shells, 3 FEM
@@ -405,6 +426,7 @@ private:
     int m_divide_n = 2;              // divide the selected beams into this many
     // the Volume tool: the active volume, its selected point, the point under the mouse (its volume), the drag's twin
     // and start positions; the new volumes' inset from their nodes' box; the nodes inside the active one lit
+    int m_tie = -1, m_tie_hover = -1, m_tie_kind = 0, m_tie_filter = -1; // (the Ties tool: the active tie, the kind of a new one, the list's kind)
     int m_vol = -1, m_vol_point = -1, m_vol_hover = -1, m_vol_hover_point = -1, m_vol_drag_twin = -1;
     vec3 m_vol_p0{0, 0, 0}, m_vol_twin_p0{0, 0, 0};
     float m_vol_inset = 0.08f;
