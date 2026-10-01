@@ -46,6 +46,12 @@ bool JobSystem::in_job() { return t_inside_job; }
 void JobSystem::init(int num_workers) {
     shutdown();
     m_quit = false;
+#if defined(__APPLE__)
+    // (the calling thread - the main one - runs the islands' serial parts, the critical path of every phase: kept on the
+    // performance cores like the workers; left at its default class it ran on an efficiency core now and then)
+    if (getenv("BL_QOSDBG")) printf("main thread QoS before: %d\n", (int)qos_class_self());
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     for (int i = 0; i < num_workers; i++) m_workers.emplace_back([this, i] { worker_main(i + 1); });
 }
 
@@ -203,6 +209,7 @@ bool JobSystem::help_boards() {
         t_inside_job = true;
         (*fn)(chunk);
         t_inside_job = was;
+        m_helped_chunks.fetch_add(1, std::memory_order_relaxed);
         b.done.fetch_add(1, std::memory_order_acq_rel);
         return true;
     }
@@ -229,7 +236,39 @@ void JobSystem::run_board(Board* b, int count, const ChunkFn& fn) {
         done++;
     }
     t_inside_job = was;
-    if (done) b->done.fetch_add(done, std::memory_order_acq_rel);
+    if (done) b->done.fetch_add(done, std::memory_order_acq_rel), m_own_chunks.fetch_add(done, std::memory_order_relaxed);
+    if (b->done.load(std::memory_order_acquire) < count) {
+        const uint64_t w0 = prof::now();
+        while (b->done.load(std::memory_order_acquire) < count) BL_CPU_RELAX();
+        const double ms = prof::ticks_to_ms(prof::now() - w0);
+        m_wait_ms.fetch_add((uint64_t)(ms * 1000.0), std::memory_order_relaxed);
+        if (ms > 0.2) m_stalls.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void JobSystem::post_board(Board* b, int count, const ChunkFn& fn) {
+    const uint32_t g = ++b->gen;
+    Board::Desc& d = b->desc[g & 1];
+    d.gen.store(0xffffffffu, std::memory_order_seq_cst);
+    d.fn.store(&fn, std::memory_order_seq_cst);
+    d.count.store(count, std::memory_order_seq_cst);
+    d.gen.store(g, std::memory_order_seq_cst);
+    b->done.store(0, std::memory_order_seq_cst);
+    b->state.store((uint64_t)g << 32, std::memory_order_seq_cst);
+    wake_parked();
+}
+
+void JobSystem::wait_board(Board* b, int count) {
+    const bool was = t_inside_job;
+    t_inside_job = true;
+    int chunk, done = 0;
+    const ChunkFn* f;
+    while (claim(*b, chunk, f)) {
+        (*f)(chunk);
+        done++;
+    }
+    t_inside_job = was;
+    if (done) b->done.fetch_add(done, std::memory_order_acq_rel), m_own_chunks.fetch_add(done, std::memory_order_relaxed);
     if (b->done.load(std::memory_order_acquire) < count) {
         const uint64_t w0 = prof::now();
         while (b->done.load(std::memory_order_acquire) < count) BL_CPU_RELAX();

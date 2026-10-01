@@ -169,6 +169,7 @@ struct FrameElement {
     uint8_t level = 0;              // times split since authored
     uint8_t torn = 0;               // bit 0: end a torn off its joint, bit 1: end b (its node is the member's own copy)
     bool broken = false;            // degenerate (no length): out of the frame
+    bool hidden = false;            // not drawn (a brace standing for a window's glass, a door's inner beam: beam option i)
     int32_t tag = -1;               // the definition's beam (vehicles), or the caller's own
     float L0 = 0;                   // rest length
     float mass = 0;                 // mass the member put on its nodes, half at each (moved along when split or torn)
@@ -222,6 +223,7 @@ struct FrameMount {
     float brk = 0;                  // break force (N; 0: never)
     float damp = 0;                 // the turning's damping (N m s/rad)
     float overload = 0;             // (the force over the break force, less one, over time)
+    float twist = 0;                // (a clamp's moment over its break moment, less one, over time: kTwistTime)
     float f = 0;                    // its force at the last step (N), for display
     bool made = false, broken = false;
     MountKind kind = MountKind::Point;
@@ -246,6 +248,10 @@ public:
     static constexpr float kOverloadTime = 0.005f;
     // a clamp mount's give: it turns the part this far (rad) at its break moment before it lets go
     static constexpr float kClampGive = 0.2f;
+    // ... and how long it takes being twisted past it (s, at twice it; at 1.2 times half a second): a part left hanging
+    // on it twists it off, the jolts of a rough road through a part on all its mounts do not (a bumper's brackets on
+    // whoops at 80 km/h: 19 N m for tens of milliseconds, the bumper hung on one of them 16 for good)
+    static constexpr float kTwistTime = 0.1f;
     // frame nodes
     std::vector<uint32_t> node;     // the body's node of each frame node
     std::vector<quat> q;            // orientation (node -> world); identity at rest in the definition's space
@@ -318,8 +324,13 @@ public:
     int begin_forces(SoftBody& b);
     void eval_forces(SoftBody& b, int chunk);
     void end_forces(SoftBody& b);
-    static constexpr int kElemChunk = 64;
-    static constexpr int kTriChunk = 32;
+    // (end_forces in parts: the forces onto frame nodes [f0, f1) - a team's chunks - then the rest, the mounts and the
+    // events, once)
+    void gather_forces(SoftBody& b, size_t f0, size_t f1);
+    void end_forces_rest(SoftBody& b);
+    void end_forces_scatter(SoftBody& b);
+    static constexpr int kElemChunk = 16;
+    static constexpr int kTriChunk = 16;
     // The implicit step of length h (after every other force on the nodes is in b.force), plus the impulses held since
     // the last one: the frame nodes' force is replaced by m dv / step, `step` being the body integrator's (theta,
     // dissipation: see above). A body stepping its sheets in short steps solves its frame once per substep (h the
@@ -335,6 +346,40 @@ public:
     int solve_begin(SoftBody& b, float h, float step, float theta, float dissipation);
     void solve_component(SoftBody& b, int c);
     void solve_end(SoftBody& b);
+    // A large component's step in the team's stages (par_component): solve_assemble for every component (a small one
+    // solved whole, a large one assembled), then par_groups(c) chunks of solve_factor and par_defers(c) of solve_defer
+    // (any order, in parallel, the factor's blocks of their own), then solve_finish (the columns above the subtrees, the
+    // substitutions, the passes again if a hinge unloads). The same result as solve_component, up to the order in
+    // which a block above the subtrees sums its updates.
+    static constexpr int kParNodes = 120, kParGroups = 12, kParDefers = 12;
+    bool par_component(int c) const { return c < (int)comp_plan_.size() && comp_plan_[c] >= 0; }
+    int par_groups(int c) const { return par_component(c) ? (int)plans_[comp_plan_[c]].gptr.size() - 1 : 0; }
+    int par_defers(int c) const { return par_component(c) ? (int)plans_[comp_plan_[c]].dptr.size() - 1 : 0; }
+    void solve_assemble(SoftBody& b, int c);
+    // (the assembly's blocks in chunks of columns, before solve_assemble: a large component's in the team's chunks)
+    static constexpr int kAsmCols = 16;
+    int asm_chunks(int c) const { return (component_nodes(c) + kAsmCols - 1) / kAsmCols; }
+    void solve_gather(SoftBody& b, int c, int chunk);
+    // (the blocks of solve_gather - the elements' tangents in, the contacts not needed - for a whole component, any
+    // thread, after solve_begin and before the step: then mark_blocks(c), and solve_gather the rest of it)
+    void gather_blocks(SoftBody& b, int c);
+    void gather_blocks(SoftBody& b, int c, int chunk) { gather_part(b, c, chunk, 0); }
+    void mark_blocks(int c) {
+        if (c < (int)comp_blocks_.size()) comp_blocks_[c] = 1;
+    }
+    void solve_factor(int c, int g);
+    void solve_defer(int c, int g);
+    void solve_finish(SoftBody& b, int c);
+    // (a hinge unloaded: the pass again in the stages - solve_repass the change into the system, the factor's stages,
+    // solve_finish; at most twice)
+    bool wants_repass(int c) const { return c < (int)comp_repass_.size() && comp_repass_[c]; }
+    void solve_repass(SoftBody& b, int c);
+    // (the substitutions too: the subtrees' forward one in solve_factor, solve_finish the columns above both ways, then
+    // par_groups(c) chunks of solve_back - the subtrees' backward one - and solve_finish_end, the rest of the pass; the
+    // same sums in the same order as one after another)
+    bool wants_back(int c) const { return c < (int)comp_back_.size() && comp_back_[c]; }
+    void solve_back(int c, int g);
+    void solve_finish_end(SoftBody& b, int c);
     void hold(SoftBody& b, float step);
     // A step between the frame's steps (WorldSettings::frame_every): the frame's response to this step's forces beyond
     // what the last step took them to be (its prediction), through that step's factorization again - the elements not
@@ -344,11 +389,25 @@ public:
     int held_begin(SoftBody& b, float step);
     void held_component(SoftBody& b, int c);
     void held_end(SoftBody& b);
+    // (a large component's in the team's stages, held_par: par_groups(c) chunks of held_front - the subtrees' right side
+    // and forward substitution -, held_top - the columns above -, par_groups(c) chunks of held_back - the subtrees'
+    // backward substitution and velocities; the same sums as held_component's)
+    bool held_par(int c) const { return subst_staged(c) && c < (int)comp_factored_.size() && comp_factored_[c]; }
+    // (the substitutions in the team's stages only for a component of kParSubstBlocks factor blocks or more: a car body of
+    // shells; on a frame's 600 blocks the stages' barriers took more than they gave - the Buggy's step 4% slower)
+    static constexpr int kParSubstBlocks = 1200;
+    bool subst_staged(int c) const {
+        return par_component(c) && col_ptr_[comp_range_[c].second] - col_ptr_[comp_range_[c].first] >= kParSubstBlocks;
+    }
+    void held_front(SoftBody& b, int c, int g);
+    void held_top(SoftBody& b, int c);
+    void held_back(SoftBody& b, int c, int g);
     std::vector<vec3> impulse;      // per frame node: the forces held over the short steps less what solve took them
                                     // to be (N s)
     // After the body's integration (a step of length h): the frame nodes' double positions and orientations advanced,
     // the float positions set from them (see xd).
     void sync_positions(SoftBody& b, float h);
+    void sync_positions(SoftBody& b, float h, size_t i0, size_t i1); // (frame nodes [i0, i1): a team's chunk)
     // rigid motions of the whole body
     void rotate(const quat& r);
     void set_orientation(const quat& r);  // every node (a respawn: rest orientations are the identity)
@@ -381,6 +440,15 @@ public:
     // compacted. The large parts (a car torn in two) stay frames. Returns the new bodies.
     bool debris_check = false;      // set by a tear
     int detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>& out, float max_mass);
+    // A fragment of at most kLooseTris triangle elements torn off the shell, held by nothing else (detach_debris): out
+    // of the frame, the body's springs hold its shape; its triangles still drawn (body nodes, their shell section)
+    static constexpr int kLooseTris = 4;
+    struct LooseTri {
+        uint32_t n[3];
+        uint16_t section;
+    };
+    std::vector<LooseTri> loose_tris;
+    int loose_count = 0;            // (fragments let loose so far)
     // drops the broken members and the frame nodes left without members (renumbering the frame nodes)
     void compact(SoftBody& b);
     // A member split at t (0..1 from a): the new frame node, on the member's bent shape (-1: too short). A member's end
@@ -469,9 +537,11 @@ private:
     };
     Tangent effective(const Tangent& t) const;
     std::vector<Tangent> tan_;
-    // the triangles: their local stiffness (18 x 18, packed upper triangle; rebuilt when the rest shape flowed) and the
-    // tangent of the last evaluation (the element's axes, its membrane tension for the geometric stiffness)
-    static constexpr int kTriK = 171, kTriB = 54;
+    // the triangles: their local stiffness (rebuilt when the rest shape flowed: of the 18 x 18 the membrane's 9 x 9 - each
+    // corner's u, v, theta_z - and the plate's - w, theta_x, theta_y -, the rest of it nothing; each in full, its upper
+    // triangle's values) and the tangent of the last evaluation (the element's axes, its membrane tension for the
+    // geometric stiffness)
+    static constexpr int kTriK = 162, kTriB = 54;
     std::vector<float> tri_k_;
     std::vector<float> tri_b_;                    // per triangle: the bending's curvatures from the corners' rotations at the
                                                   // three points (3 x 3 x 6), with the stiffness
@@ -483,6 +553,26 @@ private:
     };
     std::vector<TriTan> tri_tan_;
     void tri_build_k(uint32_t ti);
+    // per triangle: K v of its corners' velocities at the last evaluation (eval_tris, in the team's chunks; 3 x 6, the
+    // world's axes): the material damping's part of the right side (the velocities are the solve's: nothing changes them
+    // between the forces and the step)
+    std::vector<double> tri_kv_;
+    // the same of the members (eval_forces): the blocks aa, bb, ba, ab of the element's matrix (its tangent then), K v
+    static constexpr int kMemW = 144;
+    std::vector<double> mem_kw_, mem_kv_;
+    void member_world_k(const SoftBody& b, uint32_t ei);
+    // The assembly gathers (solve_gather, a range of columns at a time: a team's chunks for a large component): each
+    // block of the system sums its members' and triangles' blocks, in the order the elements were assembled in (members,
+    // then triangles); per column the diagonal block and the right side, per off-diagonal block its own (analyse)
+    struct Gather {
+        uint32_t id;      // the member or the triangle
+        uint8_t kind;     // 0 a member's block (blk: 0 aa, 1 bb, 2 ba, 3 ab), 1 a triangle's (corners blk, tr)
+        uint8_t blk, tr;
+        uint8_t corner;   // (a diagonal block's: the member's end, the triangle's corner)
+    };
+    std::vector<int> gdiag_ptr_, goff_ptr_;
+    std::vector<Gather> gdiag_, goff_;
+    void gather_lists();
     std::vector<std::array<int, 3>> tri_block_;   // per triangle: the off-diagonal blocks of its corner pairs (01, 12, 20)
     std::vector<std::array<uint8_t, 3>> tri_swap_;
     std::vector<std::vector<uint32_t>> comp_tris_;
@@ -535,14 +625,46 @@ private:
     std::vector<std::vector<std::pair<uint32_t, vec3>>> comp_react_;   // (the other ends' impulses of the step, per component)
     std::vector<uint16_t> onesided_n_;                                  // (per body node: its one-sided springs)
     void one_sided_rhs(const SoftBody& b, int comp, float h);
+    void one_sided_entry(const SoftBody& b, const OneSided& o, float h);   // (one of them)
+    void held_rhs_col(const SoftBody& b, int kk);                          // (held_component's right side of column kk)
+    void held_vel_col(SoftBody& b, int kk, int& clamps);                   // (... and its node's velocity after)
     void one_sided_react(const SoftBody& b, int comp, float h);
     void apply_reacts(SoftBody& b, float step);
     std::vector<std::vector<Changed>> comp_changed_;
     struct CompStats {
         int failures = 0, clamps = 0;
         long long passes = 0;
+        double t[6] = {};   // (BL_FEMPROF: ms in assembly, factor, substitution, unloading check, the rest, held steps)
+        long long held = 0; // (BL_FEMPROF: held steps)
     };
+    void prof_flush();
     std::vector<CompStats> comp_stats_;
+    // The large components' factorization shared by a team (par_plan, made by analyse): the elimination tree cut into
+    // subtrees, packed into groups factored side by side (each column's updates of its own subtree's blocks); the
+    // updates of the blocks above the subtrees, grouped by their column (each group its columns' blocks alone, in the
+    // order of their source columns); then the columns above the subtrees in order, as before
+    struct ParPlan {
+        int comp = -1;
+        std::vector<int> gptr, gcols;             // the groups' columns (ascending in each)
+        std::vector<int> dptr, dupd;              // the deferred updates' groups (indices into upd_)
+        std::vector<int> top;                     // the columns above the subtrees (ascending)
+        std::vector<int> tptr, tblk, tcol;        // per column above: the blocks in its row, ascending by their column
+    };
+    std::vector<ParPlan> plans_;
+    std::vector<int> comp_plan_;                  // per component: its plan (-1: factored alone, in order)
+    std::vector<int> upd_split_;                  // per column of a subtree: the end of its updates in the subtree stage
+    std::vector<int> row_split_;                  // (and the end of its blocks in rows of its subtree)
+    std::vector<int> col_group_;                  // (per column: its group, -1 above the subtrees or none)
+    std::vector<int> par_clamps_;                 // (per plan and group: held_back's clamps)
+    std::vector<uint8_t> comp_back_, comp_held_par_; // (a component's backward stage due; its held step in the stages)
+    std::vector<char> par_fail_;                  // per plan and group: a diagonal block that would not factor
+    std::vector<int> par_fail_ptr_;               // (the plans' first entries in par_fail_)
+    void par_plan();
+    std::vector<uint8_t> comp_pass_, comp_repass_;   // (a large component's pass in the team's stages; one asked again)
+    std::vector<uint8_t> comp_blocks_;               // (its blocks gathered before the step: gather_blocks)
+    std::vector<double> rdamp_;                      // (per column: the elements' damping's part of the right side)
+    void gather_part(SoftBody& b, int comp, int chunk, int part);
+    void solve_impl(SoftBody& b, int comp, int stage);
     struct SolveArgs {
         float h = 0, step = 0, theta = 0, dissipation = 0;
         const vec3* ext = nullptr;

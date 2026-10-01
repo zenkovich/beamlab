@@ -14,7 +14,13 @@
 
 namespace bl::prof {
 
-uint64_t now();                 // raw ticks
+// raw ticks (Apple's arm64: the system counter read in place - mach_absolute_time's barrier in every zone of the
+// hot loops' small tasks was a twentieth of a crash's physics)
+#if defined(__APPLE__) && defined(__aarch64__)
+inline uint64_t now() { return __builtin_arm_rsr64("CNTVCT_EL0"); }
+#else
+uint64_t now();
+#endif
 double ticks_to_ms(uint64_t t); // conversion
 
 // Accumulators of one thread (PROFILE_ACCUM in parallel phases: no shared cache line, no atomic read-modify-write).
@@ -73,13 +79,22 @@ private:
     bool m_nano = false;
 };
 
+// (diagnostics: every PROFILE_ACCUM scope's interval on its thread while armed - World arms it for the substeps
+// BL_TRACE names; trace_dump writes them as JSON)
+extern std::atomic<bool> g_trace;
+void trace_event(const Zone* z, uint64_t t0, uint64_t t1);
+void trace_mark(const char* what, int value); // (a marker in the trace: a substep's start, its short step)
+void trace_dump(const char* path);
+
 class AccumScope {
 public:
     explicit AccumScope(Zone* z) : m_zone(z), m_t0(now()) {}
     ~AccumScope() {
+        const uint64_t t1 = now();
         ZoneSlot& s = m_zone->slot[t_zone_slot];
-        s.ticks.store(s.ticks.load(std::memory_order_relaxed) + (now() - m_t0), std::memory_order_relaxed);
+        s.ticks.store(s.ticks.load(std::memory_order_relaxed) + (t1 - m_t0), std::memory_order_relaxed);
         s.calls.store(s.calls.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        if (g_trace.load(std::memory_order_relaxed)) trace_event(m_zone, m_t0, t1);
     }
 
 private:

@@ -63,7 +63,7 @@ int SoftBody::add_volume(const std::string& name, const std::vector<uint32_t>& a
     std::vector<uint32_t> an;
     for (uint32_t a : anchors)
         if (a < nodes.size() && std::find(an.begin(), an.end(), a) == an.end()) an.push_back(a);
-    if (an.size() < 3 || points.size() < 4 || points.size() > 64) return -1;
+    if (an.size() < 2 || points.size() < 4 || points.size() > 64) return -1; // (two: a tyre's, on its axle)
     CollisionVolume cv;
     cv.name = name;
     cv.anchors = an;
@@ -79,10 +79,15 @@ int SoftBody::add_volume(const std::string& name, const std::vector<uint32_t>& a
 }
 
 void SoftBody::place_volumes() {
-    for (CollisionVolume& cv : volumes) {
+    for (size_t k = 0; k < volumes.size(); k++) place_volume(k);
+}
+
+void SoftBody::place_volume(size_t vk) {
+    CollisionVolume& cv = volumes[vk];
+    {
         if (cv.broken) {
             cv.placed = false;
-            continue;
+            return;
         }
         const size_t na = cv.anchors.size();
         vec3 c(0), v(0);
@@ -98,17 +103,35 @@ void SoftBody::place_volumes() {
             J = J + mat3::diag(vec3(dot(d, d))) + outer(d, d) * -1.0f;
         }
         // the rotation of the best fit: Mueller et al. 2016, from the last step's (a few iterations: it moves little)
-        quat q = cv.q;
-        for (int it = 0; it < 20; it++) {
+        auto fit = [&](quat q) {
+            for (int it = 0; it < 20; it++) {
+                const mat3 R = to_mat3(q);
+                const vec3 om = cross(R.c[0], A.c[0]) + cross(R.c[1], A.c[1]) + cross(R.c[2], A.c[2]);
+                const float den = std::fabs(dot(R.c[0], A.c[0]) + dot(R.c[1], A.c[1]) + dot(R.c[2], A.c[2])) + 1e-9f;
+                const vec3 wv = om / den;
+                const float wl = length(wv);
+                if (!(wl > 1e-7f)) break;
+                q = normalize(quat::axis_angle(wv / wl, wl) * q);
+            }
+            return std::isfinite(q.x + q.y + q.z + q.w) ? q : quat();
+        };
+        auto misfit = [&](quat q) {
             const mat3 R = to_mat3(q);
-            const vec3 om = cross(R.c[0], A.c[0]) + cross(R.c[1], A.c[1]) + cross(R.c[2], A.c[2]);
-            const float den = std::fabs(dot(R.c[0], A.c[0]) + dot(R.c[1], A.c[1]) + dot(R.c[2], A.c[2])) + 1e-9f;
-            const vec3 wv = om / den;
-            const float wl = length(wv);
-            if (!(wl > 1e-7f)) break;
-            q = normalize(quat::axis_angle(wv / wl, wl) * q);
-        }
-        if (!std::isfinite(q.x + q.y + q.z + q.w)) q = quat();
+            float r2 = 0;
+            for (size_t i = 0; i < na; i++) r2 += length2(cv.cur[i] - R * cv.rest[i]);
+            return std::sqrt(r2 / (float)na);
+        };
+        quat q = fit(cv.q);
+        // (turned far since the last fit, by a spawn's heading or a reset: from half a turn away it stalls, as the turn
+        // there is a saddle of the fit; a Frame Car spawned facing the other way had its seat volume 10 cm into a door.
+        // From each half turn too, the best of them - unless it is as far off as at the last fit: a crushed volume, its
+        // anchors out of shape, not turned; tried every substep, a crash's volumes took a millisecond a frame)
+        static const bool retry_all = getenv("BL_VOLRETRY") != nullptr; // (diagnostics: the half turns tried every substep)
+        if (float e = misfit(q); !(e <= 0.25f * cv.break_rms) && (retry_all || !(cv.placed && e <= 1.5f * cv.rms + 0.005f)))
+            for (vec3 ax : {vec3(1, 0, 0), vec3(0, 1, 0), vec3(0, 0, 1)}) {
+                const quat t = fit(normalize(quat::axis_angle(ax, kPi) * cv.q));
+                if (const float et = misfit(t); et < e) e = et, q = t;
+            }
         cv.q = q;
         const mat3 R = to_mat3(q);
         float r2 = 0;
@@ -120,7 +143,7 @@ void SoftBody::place_volumes() {
         cv.rms = std::sqrt(r2 / (float)na);
         if (!(cv.rms <= cv.break_rms)) { // crushed or torn apart: off for good
             cv.broken = true, cv.placed = false;
-            continue;
+            return;
         }
         // (a flat or thin set of anchors: its spread nearly singular across it; a little of its size keeps it invertible)
         float sz = 0;
@@ -191,6 +214,7 @@ int SoftBody::find_volume_parts() {
     int inside = 0;
     for (CollisionVolume& cv : volumes) {
         cv.parts.clear();
+        if (cv.tyre) continue; // (a ring tyre's: the body's own parts are no business of it)
         std::vector<char> own(part.size(), 0);
         for (uint32_t a : cv.anchors)
             if (comp[a] >= 0) own[comp[a]] = 1;

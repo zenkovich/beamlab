@@ -562,7 +562,21 @@ void SoftBody::compute_wheel_forces(float dt, bool first) {
     float speed_sum = 0, spin_sum = 0;
     int nprop = 0;
     for (Wheel& w : wheels) {
-        if (w.detached || w.nodes.empty()) continue;
+        if (w.detached) continue;
+        if (w.ring) { // (a ring tyre: its spin its own - World::ring_tyres takes the torque and the brake)
+            if (first) w.drive_torque = w.torque;
+            else w.torque = w.drive_torque;
+            w.speed = (w.propulsed == 2 ? -w.spin : w.spin) * w.radius;
+            w.avg_speed = 0.99f * w.avg_speed + 0.1f * w.speed;
+            if (w.propulsed == 1) {
+                speed_sum += w.speed;
+                spin_sum += w.speed / std::max(0.05f, w.radius);
+                nprop++;
+            }
+            w.last_torque = w.torque;
+            continue;
+        }
+        if (w.nodes.empty()) continue;
         if (first) w.drive_torque = w.torque;
         else w.torque = w.drive_torque;
         if (w.brake > 0) {

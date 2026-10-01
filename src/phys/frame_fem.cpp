@@ -8,14 +8,26 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace bl::phys {
+
+namespace {
+// a triangle's local dofs (per corner u, v, w, theta_x, theta_y, theta_z) in its stiffness's two parts, the membrane's
+// (u, v, theta_z) and the plate's (w, theta_x, theta_y)
+constexpr int kMemDof[3] = {0, 1, 5}, kPlateDof[3] = {2, 3, 4};
+} // namespace
 
 // ------------------------------------------------------------------------------------------------ materials, sections
 static const FrameMaterial kMaterials[] = {
     // name, E, G, density, yield, elongation at fracture
     {"Steel", 2.10e11f, 8.1e10f, 7850.0f, 3.5e8f, 0.20f},      // mild structural steel (S355)
+    {"MildSteel", 2.10e11f, 8.1e10f, 7850.0f, 1.8e8f, 0.40f},  // deep-drawing sheet steel (DC04): a car body's, yields early, stretches far
     {"Chromoly", 2.05e11f, 8.0e10f, 7850.0f, 4.6e8f, 0.15f},   // 4130, normalized: roll cages, race frames
+    {"ChromolyHT", 2.05e11f, 8.0e10f, 7850.0f, 9.0e8f, 0.12f}, // 4130, quenched and tempered: an off-road racer's cage
     {"Aluminium", 6.9e10f, 2.6e10f, 2700.0f, 2.75e8f, 0.10f},  // 6061-T6
     {"Titanium", 1.14e11f, 4.4e10f, 4430.0f, 8.8e8f, 0.10f},   // Ti-6Al-4V
     {"Carbon", 1.2e11f, 2.5e10f, 1600.0f, 6.0e8f, 0.015f},     // CFRP tube: strong, light and brittle
@@ -283,10 +295,10 @@ void FemFrame::finalize(const SoftBody& b) {
                     for (int i = 0; i < 3; i++) nbr[t.n[i]].push_back(t.n[(i + 1) % 3]), nbr[t.n[(i + 1) % 3]].push_back(t.n[i]);
         }
         // (of candidates round node c within reach: the farthest from it, then off their line, then off their plane)
-        auto spread = [&](int c, float reach, int out[3]) {
+        auto spread = [&](int c, float reach, int out[3], int rings = 6) {
             const vec3 x0 = b.nodes[node[c]].p;
             std::vector<uint32_t> cand{(uint32_t)c};
-            for (size_t r0 = 0, ring = 0; ring < 6 && r0 < cand.size(); ring++) {
+            for (size_t r0 = 0, ring = 0; ring < (size_t)rings && r0 < cand.size(); ring++) {
                 const size_t r1 = cand.size();
                 for (size_t i = r0; i < r1; i++)
                     for (uint32_t u : nbr[cand[i]])
@@ -334,8 +346,11 @@ void FemFrame::finalize(const SoftBody& b) {
         m.nb = 1, m.bn[0] = m.b;
         if (m.kind == MountKind::Hinge && slot(m.b2) >= 0 && m.b2 != m.b) m.bn[m.nb++] = m.b2;
         if (m.kind == MountKind::Clamp) {
+            // (its flange: the ring of the part's nodes next to b - farther out a flexible part's own bending read as the
+            // bolt turned, a bumper's plastic clip twisted off by a drive round a circle; more rings for a sparse one)
             int bi[3];
-            spread(sb, 0.5f, bi);
+            spread(sb, 0.5f, bi, 1);
+            if (bi[1] < 0) spread(sb, 0.5f, bi);
             for (int j = 0; j < 3; j++)
                 if (bi[j] >= 0) m.bn[m.nb++] = node[bi[j]];
         }
@@ -395,8 +410,8 @@ void FemFrame::finalize(const SoftBody& b) {
 }
 
 // The mounts' springs: b (and a clamp's, a hinge's other nodes) held at a's points (explicit; acting for the frame's
-// step, as the members); past the break force (a clamp's break moment) for kOverloadTime a mount lets go. A stop pushes
-// b off a, a strap pulls it back, past their distances
+// step, as the members); past the break force for kOverloadTime a mount lets go, a clamp past its break moment (about
+// its bolt) for kTwistTime. A stop pushes b off a, a strap pulls it back, past their distances
 void FemFrame::mount_forces(SoftBody& b) {
     vec3* F = b.force.data();
     static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
@@ -468,12 +483,25 @@ void FemFrame::mount_forces(SoftBody& b) {
             fj[j] = fs + (Pv - Bj.v) * c; // (on the part's node; the anchor's nodes take it back)
             fsum += fs, xm += Bj.p / (float)m.nb;
         }
+        // (a clamp's moment about its bolt, b: about the held nodes' middle b's own spring carrying the part's weight and
+        // its jolts made one - a bumper's brackets were twisted off by a drive round a circle, 69 N m of it, more than
+        // the bumper hung on one of them made)
         vec3 msum(0);
-        for (int j = 0; j < m.nb; j++) msum += cross(b.nodes[m.bn[j]].p - xm, fj[j]);
+        const vec3 about = m.kind == MountKind::Clamp ? b.nodes[m.b].p : xm;
+        for (int j = 0; j < m.nb; j++) msum += cross(b.nodes[m.bn[j]].p - about, fj[j]);
         m.f = length(fsum), m.m = length(msum);
-        float over = m.brk > 0 ? m.f / m.brk : 0.0f;
-        if (m.kind == MountKind::Clamp && m.brk_m > 0) over = std::max(over, m.m / m.brk_m);
-        if ((m.brk > 0 || m.brk_m > 0) && lets_go(over)) continue;
+        if (m.kind == MountKind::Clamp && m.brk_m > 0) { // (twisted past its break moment for kTwistTime: it lets go)
+            m.twist = std::max(0.0f, m.twist + (m.m / m.brk_m - 1.0f) * h);
+            if (m.twist > kTwistTime && b.allow_break) {
+                if (dbg) printf("frame: mount %zu (%u-%u) twisted off at %.0f N m (breaks at %.0f N m)\n", i, m.a, m.b, m.m, m.brk_m);
+                m.broken = true;
+                mounts_broken++;
+                b.stats.broken_beams++;
+                debris_check = true;
+                continue;
+            }
+        }
+        if (m.brk > 0 && lets_go(m.f / m.brk)) continue;
         for (int j = 0; j < m.nb; j++) {
             const vec3 f = fj[j];
             F[m.bn[j]] += f;
@@ -495,6 +523,7 @@ void FemFrame::mount_forces(SoftBody& b) {
 
 // ------------------------------------------------------------------------------------------------ the sparse pattern
 void FemFrame::analyse() {
+    PROFILE_ACCUM("Frame analyse");
     const int n = (int)node.size();
     // the components: frame nodes joined by members (a part on mounts is one of its own)
     std::vector<int> up(n);
@@ -506,11 +535,11 @@ void FemFrame::analyse() {
     for (const FrameElement& e : elems) up[find((int)e.a)] = find((int)e.b);
     for (const FrameTri& t : tris)
         if (!t.broken) up[find((int)t.n[0])] = find((int)t.n[1]), up[find((int)t.n[1])] = find((int)t.n[2]);
-    std::vector<std::vector<int>> adj(n);
+    // (the graph's edges collected, then a node's neighbours each once: adj_ptr / adj_idx)
+    std::vector<std::pair<int, int>> edge;
+    edge.reserve(elems.size() + 3 * tris.size() + 64);
     auto link = [&](int a, int b) {
-        if (a == b) return;
-        if (std::find(adj[a].begin(), adj[a].end(), b) == adj[a].end()) adj[a].push_back(b);
-        if (std::find(adj[b].begin(), adj[b].end(), a) == adj[b].end()) adj[b].push_back(a);
+        if (a != b) edge.push_back({a, b});
     };
     for (const FrameElement& e : elems) link((int)e.a, (int)e.b);
     for (const FrameTri& t : tris)
@@ -541,57 +570,130 @@ void FemFrame::analyse() {
         comp_of[i] = comp_of[r];
     }
     const int nc = (int)roots.size();
+    std::vector<int> adj_ptr(n + 1, 0), adj_idx;
+    {
+        for (const auto& [a, b] : edge) adj_ptr[a + 1]++, adj_ptr[b + 1]++;
+        for (int i = 0; i < n; i++) adj_ptr[i + 1] += adj_ptr[i];
+        std::vector<int> raw(adj_ptr[n]), fill(adj_ptr.begin(), adj_ptr.end() - 1);
+        for (const auto& [a, b] : edge) raw[fill[a]++] = b, raw[fill[b]++] = a;
+        std::vector<int> stamp(n, -1);
+        adj_idx.reserve(raw.size());
+        std::vector<int> ptr2(n + 1, 0);
+        for (int i = 0; i < n; i++) {
+            for (int q = adj_ptr[i]; q < adj_ptr[i + 1]; q++)
+                if (stamp[raw[q]] != i) stamp[raw[q]] = i, adj_idx.push_back(raw[q]);
+            ptr2[i + 1] = (int)adj_idx.size();
+        }
+        adj_ptr.swap(ptr2);
+    }
+    if (prof::g_trace) prof::trace_mark("analyse", 1);
     std::vector<std::vector<int>> comp_nodes(nc);
     for (int i = 0; i < n; i++) comp_nodes[comp_of[i]].push_back(i);
     perm_.assign(n, 0);
     iperm_.assign(n, 0);
     comp_range_.assign(nc, {0, 0});
-    std::vector<char> done(n, 0);
-    std::vector<std::vector<int>> cols(n);
+    // (the elimination graph of a component as bit rows: a node's neighbours after the ones before it were eliminated,
+    // each elimination joining its neighbours to each other; the pick is the first node of least degree in the
+    // component's order. With lists and searches it was a third of a millisecond a pattern, 30 of them in a crash's frame)
+    std::vector<int> cols_ptr(n + 1, 0), cols_buf, loc(n, -1), deg;
+    std::vector<uint64_t> bits, bucket; // (bucket d: the nodes of degree d, a bit each - the least degree's first in order)
+    cols_buf.reserve((size_t)n * 8);
     int k = 0;
     for (int c = 0; c < nc; c++) {
         comp_range_[c].first = k;
-        for (size_t step = 0; step < comp_nodes[c].size(); step++, k++) {
+        const std::vector<int>& cn = comp_nodes[c];
+        const int m = (int)cn.size(), W = (m + 63) / 64;
+        for (int x = 0; x < m; x++) loc[cn[x]] = x;
+        bits.assign((size_t)m * W, 0ull);
+        bucket.assign((size_t)m * W, 0ull);
+        deg.assign(m, 0);
+        int mind = m;
+        for (int x = 0; x < m; x++) {
+            uint64_t* rx = &bits[(size_t)x * W];
+            for (int q = adj_ptr[cn[x]]; q < adj_ptr[cn[x] + 1]; q++) {
+                const int y = loc[adj_idx[q]];
+                rx[y >> 6] |= 1ull << (y & 63);
+            }
+            deg[x] = adj_ptr[cn[x] + 1] - adj_ptr[cn[x]];
+            bucket[(size_t)deg[x] * W + (x >> 6)] |= 1ull << (x & 63);
+            mind = std::min(mind, deg[x]);
+        }
+        for (int step = 0; step < m; step++, k++) {
             int v = -1;
-            for (int i : comp_nodes[c])
-                if (!done[i] && (v < 0 || adj[i].size() < adj[v].size())) v = i;
-            perm_[k] = v;
-            iperm_[v] = k;
-            done[v] = 1;
-            cols[k] = adj[v];
-            for (size_t x = 0; x < adj[v].size(); x++)
-                for (size_t y = x + 1; y < adj[v].size(); y++) link(adj[v][x], adj[v][y]);
-            for (int u : adj[v]) adj[u].erase(std::find(adj[u].begin(), adj[u].end(), v));
-            adj[v].clear();
+            while (v < 0) {
+                const uint64_t* bd = &bucket[(size_t)mind * W];
+                for (int w = 0; w < W; w++)
+                    if (bd[w]) {
+                        v = (w << 6) + __builtin_ctzll(bd[w]);
+                        break;
+                    }
+                if (v < 0) mind++;
+            }
+            bucket[(size_t)deg[v] * W + (v >> 6)] &= ~(1ull << (v & 63));
+            perm_[k] = cn[v];
+            iperm_[cn[v]] = k;
+            uint64_t* rv = &bits[(size_t)v * W];
+            for (int w = 0; w < W; w++)
+                for (uint64_t b = rv[w]; b; b &= b - 1) {
+                    const int y = (w << 6) + __builtin_ctzll(b);
+                    cols_buf.push_back(cn[y]);
+                    uint64_t* ry = &bits[(size_t)y * W];
+                    int d = 0;
+                    for (int q = 0; q < W; q++) ry[q] |= rv[q];
+                    ry[y >> 6] &= ~(1ull << (y & 63));
+                    ry[v >> 6] &= ~(1ull << (v & 63));
+                    for (int q = 0; q < W; q++) d += __builtin_popcountll(ry[q]);
+                    bucket[(size_t)deg[y] * W + (y >> 6)] &= ~(1ull << (y & 63));
+                    bucket[(size_t)d * W + (y >> 6)] |= 1ull << (y & 63);
+                    deg[y] = d;
+                    mind = std::min(mind, d);
+                }
+            for (int w = 0; w < W; w++) rv[w] = 0;
+            cols_ptr[k + 1] = (int)cols_buf.size();
         }
         comp_range_[c].second = k;
     }
+    if (prof::g_trace) prof::trace_mark("analyse", 2);
     col_ptr_.assign(n + 1, 0);
-    row_.clear();
+    row_.resize(cols_buf.size());
+    size_t nupd = 0;
     for (int kk = 0; kk < n; kk++) {
-        std::vector<int> r;
-        for (int u : cols[kk]) r.push_back(iperm_[u]);
-        std::sort(r.begin(), r.end());
-        row_.insert(row_.end(), r.begin(), r.end());
-        col_ptr_[kk + 1] = (int)row_.size();
+        const int a0 = cols_ptr[kk], a1 = cols_ptr[kk + 1];
+        for (int q = a0; q < a1; q++) row_[q] = iperm_[cols_buf[q]];
+        std::sort(row_.begin() + a0, row_.begin() + a1);
+        col_ptr_[kk + 1] = a1;
+        nupd += (size_t)(a1 - a0) * (a1 - a0 + 1) / 2;
     }
-    auto find_block = [&](int col, int row) {
-        for (int p = col_ptr_[col]; p < col_ptr_[col + 1]; p++)
-            if (row_[p] == row) return p;
-        return -1;
+    auto find_block = [&](int col, int row) { // (a column's rows are sorted)
+        const int* a = row_.data() + col_ptr_[col];
+        const int* e = row_.data() + col_ptr_[col + 1];
+        const int* it = std::lower_bound(a, e, row);
+        return it != e && *it == row ? (int)(it - row_.data()) : -1;
     };
     upd_ptr_.assign(n + 1, 0);
     upd_.clear();
+    upd_.reserve(nupd);
     for (int kk = 0; kk < n; kk++) {
-        for (int pi = col_ptr_[kk]; pi < col_ptr_[kk + 1]; pi++)
+        for (int pi = col_ptr_[kk]; pi < col_ptr_[kk + 1]; pi++) {
+            // (the targets in column row_[pi], rows ascending as pj's: a walk down its rows, not a search each)
+            const int c = row_[pi], qe = col_ptr_[c + 1];
+            int q = col_ptr_[c];
             for (int pj = pi; pj < col_ptr_[kk + 1]; pj++) {
                 Update u;
                 u.pi = pi, u.pj = pj;
-                u.target = pi == pj ? -(row_[pi] + 1) : find_block(row_[pi], row_[pj]);
+                if (pi == pj) {
+                    u.target = -(c + 1);
+                } else {
+                    const int rr = row_[pj];
+                    while (q < qe && row_[q] < rr) q++;
+                    u.target = q < qe && row_[q] == rr ? q : -1;
+                }
                 upd_.push_back(u);
             }
+        }
         upd_ptr_[kk + 1] = (int)upd_.size();
     }
+    if (prof::g_trace) prof::trace_mark("analyse", 3);
     elem_block_.assign(elems.size(), -1);
     elem_swap_.assign(elems.size(), 0);
     comp_elems_.assign(nc, {});
@@ -643,14 +745,588 @@ void FemFrame::analyse() {
     }
     comp_changed_.assign(nc, {});
     comp_stats_.assign(nc, CompStats());
-    if (getenv("BL_FACTORDBG")) // (diagnostics: the factor's size)
+    if (getenv("BL_FACTORDBG")) { // (diagnostics: the factor's size, the largest components')
         printf("frame pattern: %d nodes, %zu members, %zu triangles, %d components, %zu off-diagonal blocks, %zu block updates\n", n, elems.size(), tris.size(), nc, row_.size(),
                upd_.size());
+        for (int c = 0; c < nc; c++) {
+            const int a = comp_range_[c].first, b = comp_range_[c].second;
+            if (b - a >= 60) printf("  component %d: %d nodes, %d off-diagonal blocks, %d block updates\n", c, b - a, col_ptr_[b] - col_ptr_[a], upd_ptr_[b] - upd_ptr_[a]);
+        }
+    }
+    if (prof::g_trace) prof::trace_mark("analyse", 4);
+    gather_lists();
+    if (prof::g_trace) prof::trace_mark("analyse", 5);
+    par_plan();
+    if (prof::g_trace) prof::trace_mark("analyse", 6);
+    // (diagnostics, BL_FACTORDUMP=<file>: the largest component's pattern as JSON, once: the nodes in the elimination
+    // order, the members, triangles and springs between them, and the factor's blocks per column)
+    static bool dumped = false;
+    if (const char* path = getenv("BL_FACTORDUMP"); path && !dumped && body_) {
+        int big = -1;
+        for (int c = 0; c < nc; c++)
+            if (big < 0 || comp_range_[c].second - comp_range_[c].first > comp_range_[big].second - comp_range_[big].first) big = c;
+        const int a = big >= 0 ? comp_range_[big].first : 0, e = big >= 0 ? comp_range_[big].second : 0;
+        if (e - a >= 100) {
+            dumped = true;
+            if (FILE* f = fopen(path, "w")) {
+                fprintf(f, "{\"nodes\": %d, \"blocks\": %d, \"updates\": %d,\n\"pos\": [", e - a, col_ptr_[e] - col_ptr_[a], upd_ptr_[e] - upd_ptr_[a]);
+                for (int kk = a; kk < e; kk++) {
+                    const vec3 q = body_->nodes[node[perm_[kk]]].p;
+                    fprintf(f, "%s[%.3f,%.3f,%.3f]", kk > a ? "," : "", q.x, q.y, q.z);
+                }
+                fprintf(f, "],\n\"members\": [");
+                bool first = true;
+                for (const FrameElement& m : elems)
+                    if (comp_of[m.a] == big && m.a != m.b)
+                        fprintf(f, "%s[%d,%d,%d]", first ? "" : ",", iperm_[m.a] - a, iperm_[m.b] - a, m.hidden ? 1 : 0), first = false;
+                fprintf(f, "],\n\"tris\": [");
+                first = true;
+                for (const FrameTri& t : tris)
+                    if (!t.broken && comp_of[t.n[0]] == big)
+                        fprintf(f, "%s[%d,%d,%d]", first ? "" : ",", iperm_[t.n[0]] - a, iperm_[t.n[1]] - a, iperm_[t.n[2]] - a), first = false;
+                fprintf(f, "],\n\"links\": [");
+                first = true;
+                for (const Link& l : links_)
+                    if (l.fa >= 0 && l.fb >= 0 && l.fa != l.fb && comp_of[l.fa] == big)
+                        fprintf(f, "%s[%d,%d]", first ? "" : ",", iperm_[l.fa] - a, iperm_[l.fb] - a), first = false;
+                fprintf(f, "],\n\"cols\": [");
+                for (int kk = a; kk < e; kk++) {
+                    fprintf(f, "%s[", kk > a ? "," : "");
+                    for (int p = col_ptr_[kk]; p < col_ptr_[kk + 1]; p++) fprintf(f, "%s%d", p > col_ptr_[kk] ? "," : "", row_[p] - a);
+                    fprintf(f, "]");
+                }
+                // (its plan of the team's stages, if any: the subtree groups' columns, the columns above)
+                fprintf(f, "],\n\"groups\": [");
+                const int pl = big < (int)comp_plan_.size() ? comp_plan_[big] : -1;
+                if (pl >= 0) {
+                    const ParPlan& P = plans_[pl];
+                    for (size_t g = 0; g + 1 < P.gptr.size(); g++) {
+                        fprintf(f, "%s[", g ? "," : "");
+                        for (int x = P.gptr[g]; x < P.gptr[g + 1]; x++) fprintf(f, "%s%d", x > P.gptr[g] ? "," : "", P.gcols[x] - a);
+                        fprintf(f, "]");
+                    }
+                    fprintf(f, "],\n\"top\": [");
+                    for (size_t x = 0; x < P.top.size(); x++) fprintf(f, "%s%d", x ? "," : "", P.top[x] - a);
+                    fprintf(f, "],\n\"deferred\": %zu", P.dupd.size());
+                } else {
+                    fprintf(f, "],\n\"top\": [], \"deferred\": 0");
+                }
+                fprintf(f, "}\n");
+                fclose(f);
+            }
+        }
+    }
     diag_.assign((size_t)n * 36, 0.0);
     off_.assign(row_.size() * 36, 0.0);
     rhs_.assign((size_t)n * 6, 0.0);
     dinv_.assign((size_t)n * 6, 0.0);
-    diagA_.assign(diag_.size(), 0.0), offA_.assign(off_.size(), 0.0), rhsA_.assign(rhs_.size(), 0.0);
+    diagA_.resize(diag_.size()), offA_.resize(off_.size()), rhsA_.resize(rhs_.size()); // (copies of the assembly: no zeroing)
+}
+
+// The assembly's lists (see Gather): the members' blocks, then the triangles', each in its order
+void FemFrame::gather_lists() {
+    const int n = (int)node.size();
+    gdiag_ptr_.assign(n + 2, 0);
+    goff_ptr_.assign(row_.size() + 2, 0);
+    // (counted, then filled in the elements' order: the members, then the triangles)
+    for (size_t i = 0; i < elems.size(); i++) {
+        gdiag_ptr_[iperm_[elems[i].a] + 2]++, gdiag_ptr_[iperm_[elems[i].b] + 2]++;
+        if (elem_block_[i] >= 0) goff_ptr_[elem_block_[i] + 2]++;
+    }
+    for (size_t ti = 0; ti < tris.size(); ti++) {
+        if (tris[ti].broken) continue;
+        for (int c = 0; c < 3; c++) gdiag_ptr_[iperm_[tris[ti].n[c]] + 2]++;
+        for (int e = 0; e < 3; e++)
+            if (tri_block_[ti][e] >= 0) goff_ptr_[tri_block_[ti][e] + 2]++;
+    }
+    for (size_t k = 2; k < gdiag_ptr_.size(); k++) gdiag_ptr_[k] += gdiag_ptr_[k - 1];
+    for (size_t k = 2; k < goff_ptr_.size(); k++) goff_ptr_[k] += goff_ptr_[k - 1];
+    gdiag_.resize(gdiag_ptr_.back());
+    goff_.resize(goff_ptr_.back());
+    // (the fill cursors: ptr[k + 1] runs from the start of k's entries to their end)
+    for (size_t i = 0; i < elems.size(); i++) {
+        const FrameElement& e = elems[i];
+        gdiag_[gdiag_ptr_[iperm_[e.a] + 1]++] = {(uint32_t)i, 0, 0, 0, 0};
+        gdiag_[gdiag_ptr_[iperm_[e.b] + 1]++] = {(uint32_t)i, 0, 1, 0, 1};
+        if (elem_block_[i] >= 0) goff_[goff_ptr_[elem_block_[i] + 1]++] = {(uint32_t)i, 0, (uint8_t)(elem_swap_[i] ? 3 : 2), 0, 0}; // (the row node's: b, or a)
+    }
+    for (size_t ti = 0; ti < tris.size(); ti++) {
+        const FrameTri& t = tris[ti];
+        if (t.broken) continue;
+        for (int c = 0; c < 3; c++) gdiag_[gdiag_ptr_[iperm_[t.n[c]] + 1]++] = {(uint32_t)ti, 1, (uint8_t)c, (uint8_t)c, (uint8_t)c};
+        for (int e = 0; e < 3; e++)
+            if (tri_block_[ti][e] >= 0) { // (the block's row is the later corner in the order)
+                const uint8_t i = (uint8_t)e, j = (uint8_t)((e + 1) % 3);
+                goff_[goff_ptr_[tri_block_[ti][e] + 1]++] = {(uint32_t)ti, 1, tri_swap_[ti][e] ? i : j, tri_swap_[ti][e] ? j : i, (uint8_t)e};
+            }
+    }
+    gdiag_ptr_.pop_back();
+    goff_ptr_.pop_back();
+}
+
+// The assembly of columns [chunk * kAsmCols, ...) of a component: their diagonal blocks and right sides (the node's
+// mass, inertia, forces, ground contact; its members' and triangles' blocks) and their off-diagonal blocks
+void FemFrame::solve_gather(SoftBody& b, int comp, int chunk) {
+    if (comp < (int)comp_blocks_.size() && !comp_blocks_[comp]) gather_part(b, comp, chunk, 0);
+    gather_part(b, comp, chunk, 1);
+}
+
+void FemFrame::gather_blocks(SoftBody& b, int comp) {
+    for (int ch = 0, n = asm_chunks(comp); ch < n; ch++) gather_part(b, comp, ch, 0);
+}
+
+// part 0: the blocks - the masses, the members' and the triangles' (and their damping's part of the right side, apart:
+// rdamp_); part 1: the rest of the right side, the ground contacts' terms, rdamp_ in
+void FemFrame::gather_part(SoftBody& b, int comp, int chunk, int part) {
+    PROFILE_ACCUM("Frame assemble");
+    const float h = sv_.h, step = sv_.step, theta = sv_.theta, dissipation = sv_.dissipation;
+    const double h2 = (double)theta * h * h, hd = (double)dissipation * h * h;
+    const vec3* F = b.force.data();
+    const vec3* E = sv_.ext;
+    const int k0 = comp_range_[comp].first, k1 = comp_range_[comp].second;
+    const int ka = k0 + chunk * kAsmCols, kb = std::min(k1, ka + kAsmCols);
+    auto is_fixed = [&](int k) { return b.nodes[node[perm_[k]]].inv_mass <= 0; };
+    // a member's block blk (0 aa, 1 bb, 2 ba) times c, with the geometric stiffness of its tension (sign gs)
+    auto member_block = [&](const Gather& g, double* D, double gs) {
+        const FrameElement& e = elems[g.id];
+        const Tangent& t = tan_[g.id];
+        const double c = h2 + (double)sections[e.section].damping * h;
+        const double* B = &mem_kw_[(size_t)g.id * kMemW + (size_t)g.blk * 36];
+        for (int x = 0; x < 36; x++) D[x] += c * B[x];
+        // (as add_member: the product first, then signed - the same sums to the bit)
+        const double gg = h2 * t.ngeo;
+        if (gg != 0) {
+            double P[9];
+            const double ee[3] = {t.e1.x, t.e1.y, t.e1.z};
+            for (int r = 0; r < 3; r++)
+                for (int q = 0; q < 3; q++) P[r * 3 + q] = gg * ((r == q ? 1.0 : 0.0) - ee[r] * ee[q]);
+            for (int r = 0; r < 3; r++)
+                for (int q = 0; q < 3; q++) D[r * 6 + q] += gs * P[r * 3 + q];
+        }
+    };
+    // a triangle's block of corners (i, j) in the world's axes (R K_ij R^T, R the element's axes for the translations and
+    // the rotations alike) times c, with the geometric stiffness of its tension
+    auto tri_block = [&](const Gather& g, double* D) {
+        const FrameTri& t = tris[g.id];
+        const TriTan& tg = tri_tan_[g.id];
+        const int i = g.blk, j = g.tr;
+        const double c = h2 + (double)shell_sections[t.section].damping * h;
+        const double E[3][3] = {{tg.e1.x, tg.e2.x, tg.e3.x}, {tg.e1.y, tg.e2.y, tg.e3.y}, {tg.e1.z, tg.e2.z, tg.e3.z}}; // (E[p][a]: axis a)
+        // (the local block's nothing between the membrane's dofs and the plate's left out of E K_ij: of its 9 products
+        // per row 4 or 5 - the same sums, the products by nothing dropped)
+        const float* Km = &tri_k_[(size_t)g.id * kTriK];
+        const float* Kp = Km + 81;
+        auto m = [&](int s2, int t2) { return (double)Km[(3 * i + s2) * 9 + 3 * j + t2]; };
+        auto pl = [&](int s2, int t2) { return (double)Kp[(3 * i + s2) * 9 + 3 * j + t2]; };
+        for (int ra = 0; ra < 2; ra++)
+            for (int cb = 0; cb < 2; cb++) {
+                double T[3][3];
+                for (int p = 0; p < 3; p++) {
+                    const double E0 = E[p][0], E1 = E[p][1], E2 = E[p][2];
+                    if (ra == 0 && cb == 0) { // (u v w against u v w)
+                        T[p][0] = E0 * m(0, 0) + E1 * m(1, 0);
+                        T[p][1] = E0 * m(0, 1) + E1 * m(1, 1);
+                        T[p][2] = E2 * pl(0, 0);
+                    } else if (ra == 0) { // (u v w against theta_x theta_y theta_z)
+                        T[p][0] = E2 * pl(0, 1);
+                        T[p][1] = E2 * pl(0, 2);
+                        T[p][2] = E0 * m(0, 2) + E1 * m(1, 2);
+                    } else if (cb == 0) { // (theta against u v w)
+                        T[p][0] = E2 * m(2, 0);
+                        T[p][1] = E2 * m(2, 1);
+                        T[p][2] = E0 * pl(1, 0) + E1 * pl(2, 0);
+                    } else { // (theta against theta)
+                        T[p][0] = E0 * pl(1, 1) + E1 * pl(2, 1);
+                        T[p][1] = E0 * pl(1, 2) + E1 * pl(2, 2);
+                        T[p][2] = E2 * m(2, 2);
+                    }
+                }
+                for (int p = 0; p < 3; p++)
+                    for (int q = 0; q < 3; q++) D[(3 * ra + p) * 6 + 3 * cb + q] += c * (T[p][0] * E[q][0] + T[p][1] * E[q][1] + T[p][2] * E[q][2]);
+            }
+        const double gg = h2 * tg.g[i][j];
+        if (gg != 0)
+            for (int p = 0; p < 3; p++) D[p * 7] += gg;
+    };
+    auto member_on = [&](uint32_t ei) { return tan_[ei].on && !elems[ei].broken; };
+    auto tri_on = [&](uint32_t ti) { return tri_tan_[ti].on && !tris[ti].broken && tri_k_ok_[ti] && tri_kv_.size() >= ((size_t)ti + 1) * 18; };
+    for (int k = ka; k < kb; k++) {
+        const int i = perm_[k];
+        const Node& x = b.nodes[node[i]];
+        double* D = &diag_[(size_t)k * 36];
+        double* r = &rhs_[(size_t)k * 6];
+        double* rd = &rdamp_[(size_t)k * 6];
+        if (part == 0) {
+            std::fill(D, D + 36, 0.0);
+            if (x.inv_mass <= 0) {
+                fixed_[i] = 1;
+                for (int j = 0; j < 6; j++) D[j * 7] = 1.0, r[j] = 0.0;
+            } else {
+                D[0] = D[7] = D[14] = x.mass;
+                D[21] = D[28] = D[35] = inertia[i];
+                for (int j = 0; j < 6; j++) rd[j] = 0;
+                // its members' and triangles' blocks, and their damping's part of the right side: -(theta_d h^2 + beta h) K v
+                for (int q = gdiag_ptr_[k]; q < gdiag_ptr_[k + 1]; q++) {
+                    const Gather& g = gdiag_[q];
+                    if (g.kind == 0) {
+                        if (!member_on(g.id)) continue;
+                        member_block(g, D, 1.0);
+                        const double cr = hd + (double)sections[elems[g.id].section].damping * h;
+                        if (cr != 0) {
+                            const double* kv = &mem_kv_[(size_t)g.id * 12 + 6 * g.corner];
+                            for (int j = 0; j < 6; j++) rd[j] -= cr * kv[j];
+                        }
+                    } else {
+                        if (!tri_on(g.id)) continue;
+                        tri_block(g, D);
+                        const double cr = hd + (double)shell_sections[tris[g.id].section].damping * h;
+                        if (cr != 0) {
+                            const double* kv = &tri_kv_[(size_t)g.id * 18 + 6 * g.corner];
+                            for (int j = 0; j < 6; j++) rd[j] -= cr * kv[j];
+                        }
+                    }
+                }
+            }
+        } else if (x.inv_mass > 0) {
+            const vec3 f = F[node[i]], m = torque[i], J = impulse[i];
+            // (all of it for h but the contacts; the smooth forces' guess for the later short steps comes off the held
+            // impulse, which then tells the next step how far off it was)
+            vec3 fc = i < (int)contact_f.size() ? contact_f[i] : vec3(0);
+            if (h > step && E) fc += E[node[i]];
+            const double hs = (double)h - (double)step;
+            const vec3 fm = i < (int)member_f.size() ? member_f[i] : vec3(0);
+            const vec3 tm = i < (int)member_t_.size() ? member_t_[i] : vec3(0);
+            // (the smooth forces taken for the whole of h, corrected by what they turn out to be in the steps between:
+            // held_component at once, hold at the next step; taken for this step alone they loaded the structure every
+            // other step, and a cantilever's static twist came out 14% short)
+            r[0] = h * (double)f.x - hs * fc.x + J.x, r[1] = h * (double)f.y - hs * fc.y + J.y, r[2] = h * (double)f.z - hs * fc.z + J.z;
+            impulse[i] = (f - fm - fc) * -(float)hs;
+            pred_[i] = f - fm - fc;
+            r[3] = h * (double)m.x, r[4] = h * (double)m.y, r[5] = h * (double)m.z;
+            tpred_[i] = m - tm;
+            if (i < (int)contact_n.size() && length2(contact_n[i]) > 0) {
+                // a ground contact: kappa n n^T towards the normal velocity change the contact asked for (step f.n / m, its
+                // force being in f: for its short step, the later ones hold theirs); kappa 200 m makes it 99.5% of it
+                // whatever the members do
+                const bool stick = length2(contact_n[i]) > 2.0f;
+                const vec3 cn = stick ? contact_n[i] * 0.5f : contact_n[i];
+                const double kap = 200.0 * x.mass, want = step * (double)dot(f, cn) / x.mass;
+                const double nn[3] = {cn.x, cn.y, cn.z};
+                for (int p = 0; p < 3; p++) {
+                    for (int q2 = 0; q2 < 3; q2++) D[p * 6 + q2] += kap * nn[p] * nn[q2];
+                    r[p] += kap * want * nn[p];
+                }
+                // sticking (see World::collide_static): along the ground too, towards what its friction asked (a ring's node
+                // on the ground slid a little every step under its members' forces, and a lying drum with frame rings
+                // crept along at a centimetre a second)
+                if (stick) { // (its sliding stopped)
+                    const vec3 vt = x.v - cn * dot(x.v, cn);
+                    const double wt[3] = {-vt.x, -vt.y, -vt.z};
+                    for (int p = 0; p < 3; p++) {
+                        for (int q2 = 0; q2 < 3; q2++) D[p * 6 + q2] += kap * ((p == q2 ? 1.0 : 0.0) - nn[p] * nn[q2]);
+                        r[p] += kap * wt[p];
+                    }
+                }
+            }
+            for (int j = 0; j < 6; j++) r[j] += rd[j];
+        }
+        if (part != 0) continue;
+        // the column's off-diagonal blocks (none to or from a pinned node)
+        const bool fk = x.inv_mass <= 0;
+        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) {
+            double* O = &off_[(size_t)p * 36];
+            std::fill(O, O + 36, 0.0);
+            if (fk || goff_ptr_[p] == goff_ptr_[p + 1] || is_fixed(row_[p])) continue;
+            for (int q = goff_ptr_[p]; q < goff_ptr_[p + 1]; q++) {
+                const Gather& g = goff_[q];
+                if (g.kind == 0) {
+                    if (member_on(g.id)) member_block(g, O, -1.0);
+                } else if (tri_on(g.id)) {
+                    tri_block(g, O);
+                }
+            }
+        }
+    }
+}
+
+// The large components' factorization in the team's stages (see ParPlan): the elimination tree (a column's parent the
+// first row below its diagonal) cut into subtrees and the columns above them. The cut: from the roots down, the
+// costliest subtree replaced by its children while the estimate of the stages' time (the slowest group of subtrees,
+// the slowest group of the updates above them, the columns above in order) goes down. Costs in block updates.
+void FemFrame::par_plan() {
+    plans_.clear();
+    comp_plan_.assign(comp_range_.size(), -1);
+    const int n = (int)col_ptr_.size() - 1;
+    upd_split_.assign(std::max(0, n), 0);
+    row_split_.assign(std::max(0, n), 0);
+    col_group_.assign(std::max(0, n), -1);
+    for (int k = 0; k < n; k++) upd_split_[k] = upd_ptr_[k + 1], row_split_[k] = col_ptr_[k + 1];
+    par_fail_ptr_.clear();
+    par_fail_.clear();
+    par_clamps_.clear();
+    static const bool off = getenv("BL_NOPARFACTOR") != nullptr; // (diagnostics: every component factored in order)
+    if (off) return;
+    for (int c = 0; c < (int)comp_range_.size(); c++) {
+        const int k0 = comp_range_[c].first, k1 = comp_range_[c].second, m = k1 - k0;
+        if (m < kParNodes) continue;
+        std::vector<int> par(m, -1), cptr(m + 1, 0), clist(m);
+        // (costs in tenths of a block update - integers: the sums exact in any order)
+        std::vector<int64_t> cost(m), sub;
+        int64_t total = 0;
+        for (int k = k0; k < k1; k++) {
+            const int64_t r = col_ptr_[k + 1] - col_ptr_[k];
+            if (r > 0) par[k - k0] = row_[col_ptr_[k]] - k0;
+            cost[k - k0] = 15 + 6 * r + 5 * r * (r + 1);
+            total += cost[k - k0];
+        }
+        sub = cost;
+        for (int k = 0; k < m; k++)
+            if (par[k] >= 0) sub[par[k]] += sub[k], cptr[par[k] + 1]++;
+        for (int k = 0; k < m; k++) cptr[k + 1] += cptr[k];
+        {
+            std::vector<int> fill(cptr.begin(), cptr.end() - 1);
+            for (int k = 0; k < m; k++)
+                if (par[k] >= 0) clist[fill[par[k]]++] = k;
+        }
+        std::vector<int> front, owner(m, -1), stack;
+        for (int k = 0; k < m; k++)
+            if (par[k] < 0) front.push_back(k);
+        std::vector<int64_t> local(m, 0), dcount(m, 0);
+        auto rows_in = [&](int k, int r) { // (column k's rows in its subtree r: the first ones, its ancestors up to r)
+            const int* a = &row_[col_ptr_[k + k0]];
+            const int* e = &row_[col_ptr_[k + k0 + 1]];
+            return (int)(std::upper_bound(a, e, r + k0) - a);
+        };
+        // (the costliest first, each to the lightest bin: the slowest bin's load)
+        std::vector<int64_t> loc, dc;
+        loc.reserve(m), dc.reserve(m);
+        auto lpt = [](std::vector<int64_t>& items, int bins) {
+            std::sort(items.begin(), items.end(), std::greater<int64_t>());
+            int64_t load[64] = {};
+            bins = std::clamp(bins, 1, 64);
+            for (int64_t x : items) {
+                int j = 0;
+                for (int q = 1; q < bins; q++)
+                    if (load[q] < load[j]) j = q;
+                load[j] += x;
+            }
+            int64_t mx = 0;
+            for (int q = 0; q < bins; q++) mx = std::max(mx, load[q]);
+            return mx;
+        };
+        // the estimate of a cut from scratch (owner, local, dcount of it)
+        auto estimate = [&](const std::vector<int>& fr) {
+            std::fill(owner.begin(), owner.end(), -1);
+            std::fill(dcount.begin(), dcount.end(), 0);
+            loc.clear();
+            int64_t topc = 0;
+            for (int r : fr) {
+                int64_t l = 0;
+                stack.assign(1, r);
+                while (!stack.empty()) {
+                    const int x = stack.back();
+                    stack.pop_back();
+                    owner[x] = r;
+                    const int rr = col_ptr_[x + k0 + 1] - col_ptr_[x + k0], s2 = rows_in(x, r);
+                    const int64_t q = rr - s2;
+                    l += cost[x] - 5 * q * (q + 1);
+                    for (int i = s2; i < rr; i++) dcount[row_[col_ptr_[x + k0] + i] - k0] += rr - i;
+                    for (int y = cptr[x]; y < cptr[x + 1]; y++) stack.push_back(clist[y]);
+                }
+                local[r] = l;
+                loc.push_back(l);
+            }
+            dc.clear();
+            for (int k = 0; k < m; k++) {
+                if (owner[k] < 0) topc += cost[k];
+                if (dcount[k] > 0) dc.push_back(dcount[k]);
+            }
+            return lpt(loc, kParGroups) + 10 * lpt(dc, kParDefers) + topc;
+        };
+        // the cut moved down one subtree root r at a time, incrementally: r's column goes above the cut (its updates of
+        // the blocks above leave the deferred ones), and of the columns below it only those with a block in row r change -
+        // that row is above the cut now (one more deferred update set, the local cost less); their subtrees' sums along
+        // the path up to r (a whole subtree walked again for each move was a third of a millisecond a pattern)
+        std::vector<int> tptr(m + 1, 0), tcol, tpos;          // (per row r: the columns with a block in it, the block's place)
+        for (int k = 0; k < m; k++)
+            for (int p = col_ptr_[k + k0]; p < col_ptr_[k + k0 + 1]; p++) tptr[row_[p] - k0 + 1]++;
+        for (int k = 0; k < m; k++) tptr[k + 1] += tptr[k];
+        tcol.resize(tptr[m]), tpos.resize(tptr[m]);
+        {
+            std::vector<int> fill(tptr.begin(), tptr.end() - 1);
+            for (int k = 0; k < m; k++)
+                for (int p = col_ptr_[k + k0]; p < col_ptr_[k + k0 + 1]; p++) {
+                    const int r = row_[p] - k0;
+                    tcol[fill[r]] = k, tpos[fill[r]] = p - col_ptr_[k + k0], fill[r]++;
+                }
+        }
+        std::vector<int64_t> qa(m, 0);                        // (per column: its rows above the cut)
+        // (the subtrees' local sums: a Fenwick tree over the tree's preorder, a subtree an interval of it)
+        std::vector<int> tin(m, 0), tout(m, 0);
+        {
+            int t = 0;
+            for (int r : front) {
+                stack.assign(1, r);
+                while (!stack.empty()) {
+                    const int x = stack.back();
+                    stack.pop_back();
+                    if (x < 0) { tout[-x - 1] = t; continue; }
+                    tin[x] = t++;
+                    stack.push_back(-x - 1);
+                    for (int y = cptr[x]; y < cptr[x + 1]; y++) stack.push_back(clist[y]);
+                }
+            }
+        }
+        std::vector<int64_t> fen(m + 1, 0);
+        auto fen_add = [&](int i, int64_t v) { for (++i; i <= m; i += i & -i) fen[i] += v; };
+        auto fen_sum = [&](int i) { int64_t r = 0; for (; i > 0; i -= i & -i) r += fen[i]; return r; }; // ([0, i))
+        for (int x = 0; x < m; x++) fen_add(tin[x], cost[x]);
+        auto subtree_local = [&](int x) { return fen_sum(tout[x]) - fen_sum(tin[x]); };
+        std::vector<int> topl;
+        std::fill(dcount.begin(), dcount.end(), 0);
+        for (int r : front) local[r] = subtree_local(r);
+        // (the deferred groups' slowest taken as the bound LPT keeps near: the largest one or an even share - the
+        // search's every step sorted and binned them, a third of an analysis)
+        auto value = [&]() {
+            loc.clear();
+            for (int r : front) loc.push_back(local[r]);
+            int64_t topc = 0, dsum = 0, dmax = 0;
+            for (int k : topl) {
+                topc += cost[k];
+                if (dcount[k] > 0) dsum += dcount[k], dmax = std::max(dmax, dcount[k]);
+            }
+            return lpt(loc, kParGroups) + 10 * std::max(dmax, (dsum + kParDefers - 1) / kParDefers) + topc;
+        };
+        int64_t best = INT64_MAX;
+        std::vector<int> best_front;
+        static const bool sdbg = getenv("BL_SEARCHDBG") != nullptr;
+        int best_it = 0, its = 0;
+        for (int it = 0; it < 64; it++) {
+            const int64_t e = value();
+            its = it + 1;
+            if (e < best) best = e, best_front = front, best_it = it;
+            int big = -1;
+            for (size_t i = 0; i < front.size(); i++)
+                if (big < 0 || local[front[i]] > local[front[big]]) big = (int)i;
+            const int r = front[big];
+            if (cptr[r] == cptr[r + 1]) break;
+            // r above the cut: its own updates of the blocks above it are the top's now
+            {
+                const int rr = col_ptr_[r + k0 + 1] - col_ptr_[r + k0];
+                for (int i = (int)(rr - qa[r]); i < rr; i++) dcount[row_[col_ptr_[r + k0] + i] - k0] -= rr - i;
+            }
+            topl.insert(std::upper_bound(topl.begin(), topl.end(), r), r);
+            for (int t = tptr[r]; t < tptr[r + 1]; t++) {
+                const int x = tcol[t];
+                const int rr = col_ptr_[x + k0 + 1] - col_ptr_[x + k0];
+                qa[x]++;
+                dcount[r] += rr - tpos[t];
+                fen_add(tin[x], -10 * qa[x]);
+            }
+            fen_add(tin[r], -cost[r]); // (r's own column: above the cut)
+            front.erase(front.begin() + big);
+            for (int y = cptr[r]; y < cptr[r + 1]; y++) front.push_back(clist[y]), local[clist[y]] = subtree_local(clist[y]);
+        }
+        if (sdbg) printf("search: comp %d of %d nodes: best at %d of %d iterations, %lld\n", c, m, best_it, its, (long long)best / 10);
+        if (best_front.size() < 2 || best > 0.8 * total) continue; // (not worth the stages)
+        estimate(best_front); // (owner, local of the cut chosen)
+        if (prof::g_trace) prof::trace_mark("plan", 3);
+        ParPlan pl;
+        pl.comp = c;
+        // the subtrees into groups (the costliest first, each to the lightest group)
+        std::vector<int> order = best_front;
+        std::sort(order.begin(), order.end(), [&](int a, int b2) { return local[a] > local[b2] || (local[a] == local[b2] && a < b2); });
+        const int ng = std::min<int>(kParGroups, (int)order.size());
+        std::vector<double> load(ng, 0.0);
+        std::vector<int> group_of(m, -1);
+        for (int r : order) {
+            const int g = (int)(std::min_element(load.begin(), load.end()) - load.begin());
+            load[g] += local[r];
+            group_of[r] = g;
+        }
+        std::vector<std::vector<int>> gc(ng);
+        for (int k = 0; k < m; k++) {
+            if (owner[k] < 0) {
+                pl.top.push_back(k + k0);
+                continue;
+            }
+            gc[group_of[owner[k]]].push_back(k + k0);
+            // (its updates of the blocks above its subtree: those of its rows from there on, the last of its list)
+            const int rr = col_ptr_[k + k0 + 1] - col_ptr_[k + k0], s2 = rows_in(k, owner[k]);
+            row_split_[k + k0] = col_ptr_[k + k0] + s2, col_group_[k + k0] = group_of[owner[k]];
+            int u = upd_ptr_[k + k0];
+            for (int a = 0; a < s2; a++) u += rr - a;
+            upd_split_[k + k0] = u;
+        }
+        pl.gptr.push_back(0);
+        for (const auto& v : gc) {
+            pl.gcols.insert(pl.gcols.end(), v.begin(), v.end());
+            pl.gptr.push_back((int)pl.gcols.size());
+        }
+        // (the rows of the columns above: their blocks, by column - the forward substitution's for them, left-looking)
+        {
+            std::vector<int> tpos(m, -1);
+            for (size_t t = 0; t < pl.top.size(); t++) tpos[pl.top[t] - k0] = (int)t;
+            pl.tptr.assign(pl.top.size() + 1, 0);
+            for (int k = k0; k < k1; k++)
+                for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++)
+                    if (tpos[row_[p] - k0] >= 0) pl.tptr[tpos[row_[p] - k0] + 1]++;
+            for (size_t t = 0; t < pl.top.size(); t++) pl.tptr[t + 1] += pl.tptr[t];
+            pl.tblk.resize(pl.tptr.back()), pl.tcol.resize(pl.tptr.back());
+            std::vector<int> fill(pl.tptr.begin(), pl.tptr.end() - 1);
+            for (int k = k0; k < k1; k++)
+                for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++)
+                    if (const int t = tpos[row_[p] - k0]; t >= 0) pl.tblk[fill[t]] = p, pl.tcol[fill[t]] = k, fill[t]++;
+        }
+        if (prof::g_trace) prof::trace_mark("plan", 4);
+        // the deferred updates by their block's column, the columns into groups by their count
+        std::vector<std::vector<int>> by_col(m);
+        for (int k = 0; k < m; k++) {
+            if (owner[k] < 0) continue;
+            for (int u = upd_split_[k + k0]; u < upd_ptr_[k + k0 + 1]; u++) by_col[row_[upd_[u].pi] - k0].push_back(u);
+        }
+        std::vector<int> cols;
+        for (int k = 0; k < m; k++)
+            if (!by_col[k].empty()) cols.push_back(k);
+        std::sort(cols.begin(), cols.end(), [&](int a, int b2) { return by_col[a].size() > by_col[b2].size() || (by_col[a].size() == by_col[b2].size() && a < b2); });
+        const int nd = std::max(1, std::min<int>(kParDefers, (int)cols.size()));
+        std::vector<size_t> dload(nd, 0);
+        std::vector<std::vector<int>> dg(nd);
+        for (int k : cols) {
+            const int g = (int)(std::min_element(dload.begin(), dload.end()) - dload.begin());
+            dload[g] += by_col[k].size();
+            dg[g].push_back(k);
+        }
+        pl.dptr.push_back(0);
+        for (auto& v : dg) {
+            std::sort(v.begin(), v.end());
+            for (int k : v) pl.dupd.insert(pl.dupd.end(), by_col[k].begin(), by_col[k].end());
+            pl.dptr.push_back((int)pl.dupd.size());
+        }
+        if (prof::g_trace) prof::trace_mark("plan", 5);
+        par_fail_ptr_.push_back((int)par_fail_.size());
+        par_fail_.resize(par_fail_.size() + ng, 0);
+        par_clamps_.resize(par_fail_.size(), 0);
+        comp_plan_[c] = (int)plans_.size();
+        plans_.push_back(std::move(pl));
+        if (getenv("BL_FACTORDBG")) {
+            printf("  component %d in the team's stages: %d groups (%zu subtrees), %d deferred groups (%zu updates), %zu columns above, estimate %lld of %lld\n", c, ng,
+                   best_front.size(), nd, plans_.back().dupd.size(), plans_.back().top.size(), (long long)best / 10, (long long)total / 10);
+            if (getenv("BL_TOPDBG")) {
+                int64_t tc = 0;
+                for (int k : plans_.back().top) tc += cost[k - k0];
+                printf("    top cost %lld, groups:", (long long)tc / 10);
+                for (double x : load) printf(" %.0f", x / 10);
+                printf("\n    top (col rows parent children):");
+                for (int k : plans_.back().top) {
+                    int nch = 0;
+                    for (int y = cptr[k - k0]; y < cptr[k - k0 + 1]; y++) nch += owner[clist[y]] < 0;
+                    printf(" %d:%d>%d/%d", k - k0, col_ptr_[k + 1] - col_ptr_[k], par[k - k0], nch);
+                }
+                printf("\n");
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ element mechanics
@@ -908,22 +1584,6 @@ bool tri_kinematics(const FemFrame& f, const FrameTri& t, TriKin& k) {
     return true;
 }
 
-// packed upper triangle of a symmetric 18 x 18 (and a table of it: the lookups sit in the inner loops)
-constexpr int kidx(int i, int j) { return i > j ? kidx(j, i) : i * 18 - i * (i - 1) / 2 + (j - i); }
-struct KMap {
-    uint8_t m[18][18];
-    constexpr KMap() : m() {
-        for (int i = 0; i < 18; i++)
-            for (int j = 0; j < 18; j++) m[i][j] = (uint8_t)kidx(i, j);
-    }
-};
-constexpr KMap kKMap;
-// the packed stiffness unpacked (double: the world's blocks are summed from it)
-inline void unpack_k(const float* P, double K[18][18]) {
-    for (int i = 0; i < 18; i++)
-        for (int j = 0; j < 18; j++) K[i][j] = P[kKMap.m[i][j]];
-}
-
 } // namespace
 
 void FemFrame::tri_build_k(uint32_t ti) {
@@ -931,8 +1591,13 @@ void FemFrame::tri_build_k(uint32_t ti) {
     const FrameTri& t = tris[ti];
     tri_local_k(t.X, shell_sections[t.section], K);
     float* P = &tri_k_[(size_t)ti * kTriK];
-    for (int i = 0; i < 18; i++)
-        for (int j = i; j < 18; j++) P[kidx(i, j)] = (float)K[i][j];
+    for (int a = 0; a < 9; a++)
+        for (int c = 0; c < 9; c++) {
+            const int im = 6 * (a / 3) + kMemDof[a % 3], jm = 6 * (c / 3) + kMemDof[c % 3];
+            const int ip = 6 * (a / 3) + kPlateDof[a % 3], jp = 6 * (c / 3) + kPlateDof[c % 3];
+            P[a * 9 + c] = (float)K[std::min(im, jm)][std::max(im, jm)];
+            P[81 + a * 9 + c] = (float)K[std::min(ip, jp)][std::max(ip, jp)];
+        }
     // (the bending's curvatures at the three points from the corners' rotations alone: the plastic check's)
     const double x[3] = {t.X[0][0], t.X[1][0], t.X[2][0]}, y[3] = {t.X[0][1], t.X[1][1], t.X[2][1]};
     float* Bc = &tri_b_[(size_t)ti * kTriB];
@@ -1042,13 +1707,42 @@ void FemFrame::eval_tris(SoftBody& b, int chunk, std::vector<Event>& evs) {
         }
         t.util = util;
         if (!tri_k_ok_[ti]) tri_build_k((uint32_t)ti);
-        // the corners' forces and moments: -K d in the element's axes
-        const float* P = &tri_k_[ti * kTriK];
-        double f[18];
-        for (int i = 0; i < 18; i++) {
-            double v = 0;
-            for (int j = 0; j < 18; j++) v += (double)P[kKMap.m[i][j]] * k.d[j];
-            f[i] = v;
+        // the corners' forces and moments: -K d in the element's axes; in the same pass K v at the corners'
+        // velocities in those axes (the material damping's part of the step's right side: tri_kv_)
+        const float* Km = &tri_k_[ti * kTriK];
+        const float* Kp = Km + 81;
+        double vl[18];
+        {
+            const double E[3][3] = {{k.e1.x, k.e2.x, k.e3.x}, {k.e1.y, k.e2.y, k.e3.y}, {k.e1.z, k.e2.z, k.e3.z}}; // (E[p][a]: axis a)
+            for (int i = 0; i < 3; i++) {
+                const vec3 v = b.nodes[node[t.n[i]]].v, om = w[t.n[i]];
+                for (int a2 = 0; a2 < 3; a2++) {
+                    vl[6 * i + a2] = E[0][a2] * v.x + E[1][a2] * v.y + E[2][a2] * v.z;
+                    vl[6 * i + 3 + a2] = E[0][a2] * om.x + E[1][a2] * om.y + E[2][a2] * om.z;
+                }
+            }
+        }
+        // (each part on its own dofs: the sums of the whole of K's rows, its nothing left out - in the same order)
+        double f[18], fl[18];
+        {
+            double dm[9], dp[9], vm[9], vp[9];
+            for (int a = 0; a < 9; a++) {
+                const int ci = 6 * (a / 3);
+                dm[a] = k.d[ci + kMemDof[a % 3]], dp[a] = k.d[ci + kPlateDof[a % 3]];
+                vm[a] = vl[ci + kMemDof[a % 3]], vp[a] = vl[ci + kPlateDof[a % 3]];
+            }
+            double fm[9] = {}, fp[9] = {}, um[9] = {}, up[9] = {};
+            for (int c = 0; c < 9; c++)
+                for (int a = 0; a < 9; a++) { // (symmetric: row a's c-th the c-th row's a-th)
+                    const double km = (double)Km[c * 9 + a], kp = (double)Kp[c * 9 + a];
+                    fm[a] += km * dm[c], um[a] += km * vm[c];
+                    fp[a] += kp * dp[c], up[a] += kp * vp[c];
+                }
+            for (int a = 0; a < 9; a++) {
+                const int ci = 6 * (a / 3);
+                f[ci + kMemDof[a % 3]] = fm[a], fl[ci + kMemDof[a % 3]] = um[a];
+                f[ci + kPlateDof[a % 3]] = fp[a], fl[ci + kPlateDof[a % 3]] = up[a];
+            }
         }
         o.on = true;
         for (int i = 0; i < 3; i++) {
@@ -1076,8 +1770,38 @@ void FemFrame::eval_tris(SoftBody& b, int chunk, std::vector<Event>& evs) {
                     tg.g[i][j] = (float)(A * (gi[0] * (S[0][0] * gj[0] + S[0][1] * gj[1]) + gi[1] * (S[1][0] * gj[0] + S[1][1] * gj[1])));
                 }
         }
+        // K v (above) turned back into the world's axes
+        {
+            const double E[3][3] = {{tg.e1.x, tg.e2.x, tg.e3.x}, {tg.e1.y, tg.e2.y, tg.e3.y}, {tg.e1.z, tg.e2.z, tg.e3.z}}; // (E[p][a]: axis a)
+            double* kv = &tri_kv_[(size_t)ti * 18];
+            for (int i = 0; i < 3; i++)
+                for (int p = 0; p < 3; p++) {
+                    kv[6 * i + p] = E[p][0] * fl[6 * i] + E[p][1] * fl[6 * i + 1] + E[p][2] * fl[6 * i + 2];
+                    kv[6 * i + 3 + p] = E[p][0] * fl[6 * i + 3] + E[p][1] * fl[6 * i + 4] + E[p][2] * fl[6 * i + 5];
+                }
+        }
     }
 }
+
+// a member's matrix at its tangent now (the plastic one where it yields: effective) for the assembly, and K v
+void FemFrame::member_world_k(const SoftBody& b, uint32_t ei) {
+    const FrameElement& e = elems[ei];
+    double K[12][12];
+    element_matrix(effective(tan_[ei]), K);
+    double* W = &mem_kw_[(size_t)ei * kMemW];
+    for (int r = 0; r < 6; r++)
+        for (int q = 0; q < 6; q++) W[r * 6 + q] = K[r][q], W[36 + r * 6 + q] = K[6 + r][6 + q], W[72 + r * 6 + q] = K[6 + r][q], W[108 + r * 6 + q] = K[r][6 + q];
+    const Node& na = b.nodes[node[e.a]];
+    const Node& nb = b.nodes[node[e.b]];
+    const double u[12] = {na.v.x, na.v.y, na.v.z, w[e.a].x, w[e.a].y, w[e.a].z, nb.v.x, nb.v.y, nb.v.z, w[e.b].x, w[e.b].y, w[e.b].z};
+    double* kv = &mem_kv_[(size_t)ei * 12];
+    for (int r = 0; r < 12; r++) {
+        double s2 = 0;
+        for (int q = 0; q < 12; q++) s2 += K[r][q] * u[q];
+        kv[r] = s2;
+    }
+}
+
 
 void FemFrame::compute_forces(SoftBody& b) {
     const int chunks = begin_forces(b);
@@ -1110,6 +1834,8 @@ int FemFrame::begin_forces(SoftBody& b) {
     tri_out_.resize(tris.size());
     if (tri_tan_.size() != tris.size()) tri_tan_.assign(tris.size(), TriTan());
     if (tri_k_ok_.size() != tris.size()) tri_k_.assign(tris.size() * kTriK, 0.0f), tri_b_.assign(tris.size() * kTriB, 0.0f), tri_k_ok_.assign(tris.size(), 0);
+    if (tri_kv_.size() != tris.size() * 18) tri_kv_.assign(tris.size() * 18, 0.0);
+    if (mem_kw_.size() != elems.size() * kMemW) mem_kw_.assign(elems.size() * kMemW, 0.0), mem_kv_.assign(elems.size() * 12, 0.0);
     const int chunks = (int)((elems.size() + kElemChunk - 1) / kElemChunk) + (int)((tris.size() + kTriChunk - 1) / kTriChunk);
     chunk_events_.resize(std::max<size_t>(chunk_events_.size(), (size_t)chunks));
     for (int c = 0; c < chunks; c++) chunk_events_[c].clear();
@@ -1287,10 +2013,47 @@ void FemFrame::eval_forces(SoftBody& b, int chunk) {
         t.unload = 0;
         if (t.elastic_hold > 0) t.elastic_hold--, t.unload = t.yield;
         t.ma = Ma, t.mb = Mb, t.N = N, t.T = T;
+        member_world_k(b, (uint32_t)ei);
     }
 }
 
 void FemFrame::end_forces(SoftBody& b) {
+    if (!gdiag_ptr_.empty() && gdiag_ptr_.size() == node.size() + 1) gather_forces(b, 0, node.size());
+    else end_forces_scatter(b);
+    end_forces_rest(b);
+}
+
+// The members' and triangles' forces onto frame nodes [f0, f1): each node's in their order, as the members' loop and
+// then the triangles' added them (the assembly's lists: Gather) - a team's chunks
+void FemFrame::gather_forces(SoftBody& b, size_t f0, size_t f1) {
+    if (gdiag_ptr_.size() != node.size() + 1 || iperm_.size() != node.size()) { // (no lists yet: the first chunk, in order)
+        if (f0 == 0) end_forces_scatter(b);
+        return;
+    }
+    vec3* F = b.force.data();
+    for (size_t fn = f0; fn < f1 && fn < node.size(); fn++) {
+        const int k = iperm_[fn];
+        vec3& Fn = F[node[fn]];
+        for (int q = gdiag_ptr_[k]; q < gdiag_ptr_[k + 1]; q++) {
+            const Gather& g = gdiag_[q];
+            if (g.kind == 0) {
+                if (g.id >= out_.size()) continue;
+                const ElemOut& o = out_[g.id];
+                if (!o.on) continue;
+                if (g.corner == 0) Fn += o.fa, member_f[fn] += o.fa, torque[fn] += o.ta, member_t_[fn] += o.ta;
+                else Fn -= o.fa, member_f[fn] -= o.fa, torque[fn] += o.tb, member_t_[fn] += o.tb;
+            } else {
+                if (g.id >= tri_out_.size()) continue;
+                const TriOut& o = tri_out_[g.id];
+                if (!o.on) continue;
+                Fn += o.f[g.corner], member_f[fn] += o.f[g.corner], torque[fn] += o.t[g.corner], member_t_[fn] += o.t[g.corner];
+            }
+        }
+    }
+}
+
+// (the same in the elements' order, the lists not made yet)
+void FemFrame::end_forces_scatter(SoftBody& b) {
     vec3* F = b.force.data();
     for (size_t ei = 0; ei < elems.size() && ei < out_.size(); ei++) {
         const ElemOut& o = out_[ei];
@@ -1316,6 +2079,9 @@ void FemFrame::end_forces(SoftBody& b) {
             member_t_[t.n[i]] += o.t[i];
         }
     }
+}
+
+void FemFrame::end_forces_rest(SoftBody& b) {
     if (!mounts.empty()) mount_forces(b);
     const size_t chunks = (elems.size() + kElemChunk - 1) / kElemChunk + (tris.size() + kTriChunk - 1) / kTriChunk;
     for (size_t c = 0; c < chunks && c < chunk_events_.size(); c++)
@@ -1402,6 +2168,59 @@ void right_solve_lt(const double* L, const double* dinv, double* X) {
 }
 // T -= P Q^T (Q transposed first: the inner loop runs along T's rows, which vectorizes; kept transposed for the whole
 // factorization instead, the blocks crowd the cache)
+#if defined(__aarch64__)
+// (NEON: Q's columns in registers, two of T's columns a lane pair; the same sums in the same order as below)
+void sub_abt(double* __restrict T, const double* __restrict P, const double* __restrict Q) {
+    float64x2_t q[6][3]; // q[m][j] = (Q[2j][m], Q[2j + 1][m])
+    for (int j = 0; j < 3; j++) {
+        const double* a = Q + 12 * j;
+        const double* b = a + 6;
+        for (int m = 0; m < 6; m += 2) {
+            const float64x2_t va = vld1q_f64(a + m), vb = vld1q_f64(b + m);
+            q[m][j] = vtrn1q_f64(va, vb);
+            q[m + 1][j] = vtrn2q_f64(va, vb);
+        }
+    }
+    for (int r = 0; r < 6; r++) {
+        const float64x2_t p0 = vld1q_f64(P + r * 6), p1 = vld1q_f64(P + r * 6 + 2), p2 = vld1q_f64(P + r * 6 + 4);
+        float64x2_t a0 = vdupq_n_f64(0.0), a1 = a0, a2 = a0;
+#define BL_SUB_M(m, pv, lane)                          \
+    a0 = vfmaq_laneq_f64(a0, q[m][0], pv, lane);       \
+    a1 = vfmaq_laneq_f64(a1, q[m][1], pv, lane);       \
+    a2 = vfmaq_laneq_f64(a2, q[m][2], pv, lane);
+        BL_SUB_M(0, p0, 0) BL_SUB_M(1, p0, 1) BL_SUB_M(2, p1, 0) BL_SUB_M(3, p1, 1) BL_SUB_M(4, p2, 0) BL_SUB_M(5, p2, 1)
+#undef BL_SUB_M
+        double* t = T + r * 6;
+        vst1q_f64(t, vsubq_f64(vld1q_f64(t), a0));
+        vst1q_f64(t + 2, vsubq_f64(vld1q_f64(t + 2), a1));
+        vst1q_f64(t + 4, vsubq_f64(vld1q_f64(t + 4), a2));
+    }
+}
+// r -= L y (each row's sum in order: two rows a lane pair)
+void sub_mv(const double* __restrict L, const double* __restrict y, double* __restrict r) {
+    for (int i = 0; i < 6; i += 2) {
+        float64x2_t acc = vdupq_n_f64(0.0);
+        for (int j = 0; j < 6; j += 2) {
+            const float64x2_t va = vld1q_f64(L + i * 6 + j), vb = vld1q_f64(L + i * 6 + 6 + j);
+            acc = vfmaq_n_f64(acc, vtrn1q_f64(va, vb), y[j]);
+            acc = vfmaq_n_f64(acc, vtrn2q_f64(va, vb), y[j + 1]);
+        }
+        vst1q_f64(r + i, vsubq_f64(vld1q_f64(r + i), acc));
+    }
+}
+// x -= L^T xr (each column's sum in order: two columns a lane pair)
+void sub_mtv(const double* __restrict L, const double* __restrict xr, double* __restrict x) {
+    float64x2_t a0 = vdupq_n_f64(0.0), a1 = a0, a2 = a0;
+    for (int i = 0; i < 6; i++) {
+        a0 = vfmaq_n_f64(a0, vld1q_f64(L + i * 6), xr[i]);
+        a1 = vfmaq_n_f64(a1, vld1q_f64(L + i * 6 + 2), xr[i]);
+        a2 = vfmaq_n_f64(a2, vld1q_f64(L + i * 6 + 4), xr[i]);
+    }
+    vst1q_f64(x, vsubq_f64(vld1q_f64(x), a0));
+    vst1q_f64(x + 2, vsubq_f64(vld1q_f64(x + 2), a1));
+    vst1q_f64(x + 4, vsubq_f64(vld1q_f64(x + 4), a2));
+}
+#else
 void sub_abt(double* __restrict T, const double* __restrict P, const double* __restrict Q) {
     double Qt[36];
     for (int c = 0; c < 6; c++)
@@ -1415,6 +2234,21 @@ void sub_abt(double* __restrict T, const double* __restrict P, const double* __r
         for (int c = 0; c < 6; c++) T[r * 6 + c] -= acc[c];
     }
 }
+void sub_mv(const double* __restrict L, const double* __restrict y, double* __restrict r) {
+    for (int i = 0; i < 6; i++) {
+        double s = 0;
+        for (int j = 0; j < 6; j++) s += L[i * 6 + j] * y[j];
+        r[i] -= s;
+    }
+}
+void sub_mtv(const double* __restrict L, const double* __restrict xr, double* __restrict x) {
+    for (int j = 0; j < 6; j++) {
+        double s = 0;
+        for (int i = 0; i < 6; i++) s += L[i * 6 + j] * xr[i];
+        x[j] -= s;
+    }
+}
+#endif
 void forward6(const double* L, const double* dinv, double* y) { // L y = b in place
     for (int j = 0; j < 6; j++) {
         double s = y[j];
@@ -1462,11 +2296,120 @@ int FemFrame::held_begin(SoftBody& b, float step) {
     held_step_ = step;
     impulse.resize(node.size(), vec3(0));
     for (CompStats& cs : comp_stats_) cs.clamps = 0; // (the step's were counted by solve_end)
+    std::fill(par_clamps_.begin(), par_clamps_.end(), 0);
+    comp_held_par_.assign(comp_range_.size(), 0);
     return (int)comp_range_.size();
+}
+
+void FemFrame::held_rhs_col(const SoftBody& b, int kk) {
+    const vec3* F = b.force.data();
+    const float step = held_step_;
+    const int i = perm_[kk];
+    double* r = &rhs_[(size_t)kk * 6];
+    if (fixed_[i] || b.nodes[node[i]].inv_mass <= 0) {
+        for (int j = 0; j < 6; j++) r[j] = 0;
+        return;
+    }
+    const vec3 d = (F[node[i]] - pred_[i]) * step, t = (torque[i] - tpred_[i]) * step;
+    r[0] = d.x, r[1] = d.y, r[2] = d.z, r[3] = t.x, r[4] = t.y, r[5] = t.z;
+    impulse[i] += pred_[i] * step; // (the prediction's debt for this step paid)
+}
+
+void FemFrame::held_vel_col(SoftBody& b, int kk, int& clamps) {
+    vec3* F = b.force.data();
+    const float step = held_step_;
+    const int i = perm_[kk];
+    if (fixed_[i]) return;
+    const double* x = &rhs_[(size_t)kk * 6];
+    const Node& nd = b.nodes[node[i]];
+    vec3 dv((float)x[0], (float)x[1], (float)x[2]);
+    const vec3 dw((float)x[3], (float)x[4], (float)x[5]);
+    if (!std::isfinite(dv.x + dv.y + dv.z + dw.x + dw.y + dw.z)) {
+        F[node[i]] = vec3(0);
+        return;
+    }
+    const float kMaxDv = 40.0f, kMaxW = 3000.0f;
+    static const bool dbg = getenv("BL_CLAMPDBG") != nullptr; // (diagnostics: which nodes are cut, and how)
+    if (const float l = length(dv); l > kMaxDv) {
+        if (dbg) printf("clamp dv node %u %.0f m/s\n", node[i], l);
+        dv *= kMaxDv / l, clamps++;
+    }
+    F[node[i]] = dv * (nd.mass / step);
+    w[i] += dw;
+    if (const float l = length(w[i]); l > kMaxW) {
+        if (dbg) printf("clamp w node %u %.0f rad/s\n", node[i], l);
+        w[i] *= kMaxW / l, clamps++;
+    }
+}
+
+// held_component in the team's stages: group g's right side, its one-sided springs' share, its forward substitution
+void FemFrame::held_front(SoftBody& b, int comp, int g) {
+    PROFILE_ACCUM("Frame held");
+    const ParPlan& pl = plans_[comp_plan_[comp]];
+    for (int x = pl.gptr[g]; x < pl.gptr[g + 1]; x++) held_rhs_col(b, pl.gcols[x]);
+    if (comp < (int)comp_onesided_.size())
+        for (const OneSided& o : comp_onesided_[comp])
+            if (col_group_[iperm_[o.frame_node]] == g) one_sided_entry(b, o, held_step_);
+    for (int x = pl.gptr[g]; x < pl.gptr[g + 1]; x++) {
+        const int k = pl.gcols[x];
+        double* y = &rhs_[(size_t)k * 6];
+        forward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], y);
+        for (int p = col_ptr_[k]; p < row_split_[k]; p++) sub_mv(&off_[(size_t)p * 36], y, &rhs_[(size_t)row_[p] * 6]);
+    }
+}
+
+// ... the columns above: their right side, both substitutions, their velocities
+void FemFrame::held_top(SoftBody& b, int comp) {
+    PROFILE_ACCUM("Frame held");
+    static const bool femprof = getenv("BL_FEMPROF") != nullptr;
+    const uint64_t t0 = femprof ? prof::now() : 0;
+    const ParPlan& pl = plans_[comp_plan_[comp]];
+    for (int k : pl.top) held_rhs_col(b, k);
+    if (comp < (int)comp_onesided_.size())
+        for (const OneSided& o : comp_onesided_[comp])
+            if (col_group_[iperm_[o.frame_node]] < 0) one_sided_entry(b, o, held_step_);
+    for (size_t t = 0; t < pl.top.size(); t++) {
+        const int r = pl.top[t];
+        double* y = &rhs_[(size_t)r * 6];
+        for (int q = pl.tptr[t]; q < pl.tptr[t + 1]; q++) sub_mv(&off_[(size_t)pl.tblk[q] * 36], &rhs_[(size_t)pl.tcol[q] * 6], y);
+        forward6(&diag_[(size_t)r * 36], &dinv_[(size_t)r * 6], y);
+    }
+    for (int t = (int)pl.top.size() - 1; t >= 0; t--) {
+        const int k = pl.top[t];
+        double* x = &rhs_[(size_t)k * 6];
+        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) sub_mtv(&off_[(size_t)p * 36], &rhs_[(size_t)row_[p] * 6], x);
+        backward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], x);
+    }
+    CompStats& st = comp_stats_[comp];
+    for (int k : pl.top) held_vel_col(b, k, st.clamps);
+    if (comp < (int)comp_held_par_.size()) comp_held_par_[comp] = 1; // (its one-sided springs' reaction in held_end)
+    if (femprof) st.t[5] += prof::ticks_to_ms(prof::now() - t0), st.held++;
+}
+
+// ... group g's backward substitution, last column first, and its nodes' velocities
+void FemFrame::held_back(SoftBody& b, int comp, int g) {
+    PROFILE_ACCUM("Frame held");
+    const int pi = comp_plan_[comp];
+    const ParPlan& pl = plans_[pi];
+    for (int x = pl.gptr[g + 1] - 1; x >= pl.gptr[g]; x--) {
+        const int k = pl.gcols[x];
+        double* xk = &rhs_[(size_t)k * 6];
+        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) sub_mtv(&off_[(size_t)p * 36], &rhs_[(size_t)row_[p] * 6], xk);
+        backward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], xk);
+    }
+    int& clamps = par_clamps_[(size_t)par_fail_ptr_[pi] + g];
+    for (int x = pl.gptr[g]; x < pl.gptr[g + 1]; x++) held_vel_col(b, pl.gcols[x], clamps);
 }
 
 void FemFrame::held_component(SoftBody& b, int comp) {
     PROFILE_ACCUM("Frame held");
+    static const bool femprof = getenv("BL_FEMPROF") != nullptr;
+    struct Lap {
+        double* t = nullptr;
+        uint64_t t0 = 0;
+        ~Lap() { if (t) *t += prof::ticks_to_ms(prof::now() - t0); }
+    } lap;
+    if (femprof) lap.t = &comp_stats_[comp].t[5], lap.t0 = prof::now(), comp_stats_[comp].held++;
     const int k0 = comp_range_[comp].first, k1 = comp_range_[comp].second;
     const float step = held_step_;
     vec3* F = b.force.data();
@@ -1483,67 +2426,29 @@ void FemFrame::held_component(SoftBody& b, int comp) {
         return;
     }
     // the right side: this step's force beyond the prediction (the step took it for its whole length), its torque
-    for (int kk = k0; kk < k1; kk++) {
-        const int i = perm_[kk];
-        double* r = &rhs_[(size_t)kk * 6];
-        if (fixed_[i] || b.nodes[node[i]].inv_mass <= 0) {
-            for (int j = 0; j < 6; j++) r[j] = 0;
-            continue;
-        }
-        const vec3 d = (F[node[i]] - pred_[i]) * step, t = (torque[i] - tpred_[i]) * step;
-        r[0] = d.x, r[1] = d.y, r[2] = d.z, r[3] = t.x, r[4] = t.y, r[5] = t.z;
-        impulse[i] += pred_[i] * step; // (the prediction's debt for this step paid)
-    }
+    for (int kk = k0; kk < k1; kk++) held_rhs_col(b, kk);
     one_sided_rhs(b, comp, step);
     // L L^T x = r with the last step's factor
     for (int k = k0; k < k1; k++) {
         double* y = &rhs_[(size_t)k * 6];
         forward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], y);
-        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) {
-            const double* L = &off_[(size_t)p * 36];
-            double* r = &rhs_[(size_t)row_[p] * 6];
-            for (int i = 0; i < 6; i++) {
-                double s = 0;
-                for (int j = 0; j < 6; j++) s += L[i * 6 + j] * y[j];
-                r[i] -= s;
-            }
-        }
+        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) sub_mv(&off_[(size_t)p * 36], y, &rhs_[(size_t)row_[p] * 6]);
     }
     for (int k = k1 - 1; k >= k0; k--) {
         double* x = &rhs_[(size_t)k * 6];
-        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) {
-            const double* L = &off_[(size_t)p * 36];
-            const double* xr = &rhs_[(size_t)row_[p] * 6];
-            for (int j = 0; j < 6; j++) {
-                double s = 0;
-                for (int i = 0; i < 6; i++) s += L[i * 6 + j] * xr[i];
-                x[j] -= s;
-            }
-        }
+        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) sub_mtv(&off_[(size_t)p * 36], &rhs_[(size_t)row_[p] * 6], x);
         backward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], x);
     }
     one_sided_react(b, comp, step); // (the held step's share of the one-sided springs, as the step's)
     CompStats& st = comp_stats_[comp];
-    for (int kk = k0; kk < k1; kk++) {
-        const int i = perm_[kk];
-        if (fixed_[i]) continue;
-        const double* x = &rhs_[(size_t)kk * 6];
-        const Node& nd = b.nodes[node[i]];
-        vec3 dv((float)x[0], (float)x[1], (float)x[2]);
-        const vec3 dw((float)x[3], (float)x[4], (float)x[5]);
-        if (!std::isfinite(dv.x + dv.y + dv.z + dw.x + dw.y + dw.z)) {
-            F[node[i]] = vec3(0);
-            continue;
-        }
-        const float kMaxDv = 40.0f, kMaxW = 3000.0f;
-        if (const float l = length(dv); l > kMaxDv) dv *= kMaxDv / l, st.clamps++;
-        F[node[i]] = dv * (nd.mass / step);
-        w[i] += dw;
-        if (const float l = length(w[i]); l > kMaxW) w[i] *= kMaxW / l, st.clamps++;
-    }
+    for (int kk = k0; kk < k1; kk++) held_vel_col(b, kk, st.clamps);
 }
 
 void FemFrame::held_end(SoftBody& b) {
+    prof_flush();
+    for (int c = 0; c < (int)comp_held_par_.size(); c++)
+        if (comp_held_par_[c]) one_sided_react(b, c, held_step_), comp_held_par_[c] = 0;
+    for (int& n : par_clamps_) clamps += n, n = 0;
     apply_reacts(b, held_step_);
     for (const CompStats& cs : comp_stats_) clamps += cs.clamps;
     for (CompStats& cs : comp_stats_) cs.clamps = 0;
@@ -1572,6 +2477,12 @@ int FemFrame::solve_begin(SoftBody& b, float h, float step, float theta, float d
     pred_.resize(node.size(), vec3(0));
     tpred_.resize(node.size(), vec3(0));
     comp_factored_.assign(comp_range_.size(), 0);
+    comp_pass_.assign(comp_range_.size(), 0);
+    comp_repass_.assign(comp_range_.size(), 0);
+    comp_back_.assign(comp_range_.size(), 0);
+    comp_held_par_.assign(comp_range_.size(), 0);
+    comp_blocks_.assign(comp_range_.size(), 0);
+    rdamp_.resize(node.size() * 6);
     comp_stats_.assign(comp_range_.size(), CompStats());
     comp_onesided_.resize(comp_range_.size());
     comp_react_.resize(comp_range_.size());
@@ -1583,13 +2494,15 @@ int FemFrame::solve_begin(SoftBody& b, float h, float step, float theta, float d
 // the frame nodes' right sides (h: the step's length)
 void FemFrame::one_sided_rhs(const SoftBody& b, int comp, float h) {
     if (comp >= (int)comp_onesided_.size()) return;
-    for (const OneSided& o : comp_onesided_[comp]) {
-        if (fixed_[o.frame_node] || o.other >= b.force.size()) continue;
-        const double rb = (double)dot(o.e, b.force[o.other]) * h * o.share;
-        double* R = &rhs_[(size_t)iperm_[o.frame_node] * 6];
-        const double s = o.c / ((double)o.mb + o.c) * rb;
-        R[0] += s * o.e.x, R[1] += s * o.e.y, R[2] += s * o.e.z;
-    }
+    for (const OneSided& o : comp_onesided_[comp]) one_sided_entry(b, o, h);
+}
+
+void FemFrame::one_sided_entry(const SoftBody& b, const OneSided& o, float h) {
+    if (fixed_[o.frame_node] || o.other >= b.force.size()) return;
+    const double rb = (double)dot(o.e, b.force[o.other]) * h * o.share;
+    double* R = &rhs_[(size_t)iperm_[o.frame_node] * 6];
+    const double s = o.c / ((double)o.mb + o.c) * rb;
+    R[0] += s * o.e.x, R[1] += s * o.e.y, R[2] += s * o.e.z;
 }
 
 // ... and after the solve, the other ends' change along them: c (mb dv - rb) / (mb + c), what their frame nodes gave up
@@ -1621,21 +2534,94 @@ void FemFrame::apply_reacts(SoftBody& b, float step) {
 void FemFrame::solve_end(SoftBody& b) {
     apply_reacts(b, sv_.step);
     for (const CompStats& cs : comp_stats_) solve_failures += cs.failures, clamps += cs.clamps, passes_ += cs.passes;
+    prof_flush();
     for (vec3& t : torque) t = vec3(0); // (torques from outside, e.g. the tests, add up until the next step)
     for (vec3& c : contact_n) c = vec3(0);
     for (vec3& c : contact_f) c = vec3(0);
 }
 
-// One component's implicit step: its nodes are the range [k0, k1) of the permuted order, its pattern closed in it
 void FemFrame::solve_component(SoftBody& b, int comp) {
+    static const bool dbg = getenv("BL_SERIALDBG") != nullptr;
+    if (dbg && comp_range_[comp].second - comp_range_[comp].first >= kParNodes)
+        printf("serial: %p comp %d of %d nodes, plan %d (plans %zu)\n", (void*)this, comp, comp_range_[comp].second - comp_range_[comp].first, comp < (int)comp_plan_.size() ? comp_plan_[comp] : -9, plans_.size());
+    solve_impl(b, comp, 0);
+}
+void FemFrame::solve_assemble(SoftBody& b, int comp) { solve_impl(b, comp, par_component(comp) ? 1 : 0); }
+void FemFrame::solve_finish(SoftBody& b, int comp) { solve_impl(b, comp, 2); }
+void FemFrame::solve_repass(SoftBody& b, int comp) { solve_impl(b, comp, 3); }
+void FemFrame::solve_finish_end(SoftBody& b, int comp) { solve_impl(b, comp, 4); }
+
+// A large component's subtrees (group g of its plan): their columns factored in order, each one's updates of the
+// blocks of its own subtree (the ones above it: solve_defer)
+void FemFrame::solve_factor(int comp, int g) {
+    PROFILE_ACCUM("Frame factor");
+    const int pi = comp_plan_[comp];
+    const ParPlan& pl = plans_[pi];
+    char& fail = par_fail_[(size_t)par_fail_ptr_[pi] + g];
+    fail = 0;
+    for (int x = pl.gptr[g]; x < pl.gptr[g + 1]; x++) {
+        const int k = pl.gcols[x];
+        double* Lkk = &diag_[(size_t)k * 36];
+        double* dk = &dinv_[(size_t)k * 6];
+        if (!chol6(Lkk, dk)) {
+            fail = 1;
+            return;
+        }
+        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) right_solve_lt(Lkk, dk, &off_[(size_t)p * 36]);
+        for (int u = upd_ptr_[k]; u < upd_split_[k]; u++) {
+            const Update& up = upd_[u];
+            double* T = up.target >= 0 ? &off_[(size_t)up.target * 36] : &diag_[(size_t)(-up.target - 1) * 36];
+            sub_abt(T, &off_[(size_t)up.pj * 36], &off_[(size_t)up.pi * 36]);
+        }
+        // (the forward substitution's column: its rows in the subtree; those above take it in solve_finish)
+        double* y = &rhs_[(size_t)k * 6];
+        forward6(Lkk, dk, y);
+        for (int p = col_ptr_[k]; p < row_split_[k]; p++) sub_mv(&off_[(size_t)p * 36], y, &rhs_[(size_t)row_[p] * 6]);
+    }
+}
+
+// ... and after solve_finish's columns above, the subtrees' backward substitution: group g's columns, last first
+void FemFrame::solve_back(int comp, int g) {
+    PROFILE_ACCUM("Frame factor");
+    const ParPlan& pl = plans_[comp_plan_[comp]];
+    for (int x = pl.gptr[g + 1] - 1; x >= pl.gptr[g]; x--) {
+        const int k = pl.gcols[x];
+        double* xk = &rhs_[(size_t)k * 6];
+        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) sub_mtv(&off_[(size_t)p * 36], &rhs_[(size_t)row_[p] * 6], xk);
+        backward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], xk);
+    }
+}
+
+// ... the subtrees' updates of the blocks above them: group g's columns' blocks, each one's in the order of the
+// columns they come from
+void FemFrame::solve_defer(int comp, int g) {
+    PROFILE_ACCUM("Frame factor");
+    const ParPlan& pl = plans_[comp_plan_[comp]];
+    for (int x = pl.dptr[g]; x < pl.dptr[g + 1]; x++) {
+        const Update& up = upd_[pl.dupd[x]];
+        double* T = up.target >= 0 ? &off_[(size_t)up.target * 36] : &diag_[(size_t)(-up.target - 1) * 36];
+        sub_abt(T, &off_[(size_t)up.pj * 36], &off_[(size_t)up.pi * 36]);
+    }
+}
+
+// One component's implicit step: its nodes are the range [k0, k1) of the permuted order, its pattern closed in it.
+// stage 0: the whole step; 1: the first assembly alone (the team factors the subtrees next: solve_factor, solve_defer);
+// 2: the rest of it after those
+void FemFrame::solve_impl(SoftBody& b, int comp, int stage) {
     const float h = sv_.h, step = sv_.step, theta = sv_.theta, dissipation = sv_.dissipation;
     std::vector<char>& fixed = fixed_;
-    const vec3* F = b.force.data();
-    const vec3* E = sv_.ext;
     const int k0 = comp_range_[comp].first, k1 = comp_range_[comp].second;
     const std::vector<uint32_t>& celems = comp_elems_[comp];
     std::vector<Changed>& changed = comp_changed_[comp];
     CompStats& st = comp_stats_[comp];
+    static const bool femprof = getenv("BL_FEMPROF") != nullptr;
+    uint64_t tp = femprof ? prof::now() : 0;
+    auto tlap = [&](int i) {
+        if (!femprof) return;
+        const uint64_t t = prof::now();
+        st.t[i] += prof::ticks_to_ms(t - tp);
+        tp = t;
+    };
     const size_t d0 = (size_t)k0 * 36, d1 = (size_t)k1 * 36, o0 = (size_t)col_ptr_[k0] * 36, o1 = (size_t)col_ptr_[k1] * 36, r0 = (size_t)k0 * 6, r1 = (size_t)k1 * 6;
     bool any_yield = false;
     for (uint32_t ei : celems) any_yield |= tan_[ei].on && tan_[ei].yield;
@@ -1691,11 +2677,23 @@ void FemFrame::solve_component(SoftBody& b, int comp) {
             add_block(Of + (size_t)p * 36, ro, co, -1.0);
         }
     };
-    changed.clear();
-    for (int pass = 0; pass < 3; pass++) {
+    if (stage <= 1) {
+        changed.clear();
+        if (comp < (int)comp_pass_.size()) comp_pass_[comp] = 0;
+    }
+    if (stage == 2 && comp < (int)comp_repass_.size()) comp_repass_[comp] = 0;
+    if ((stage == 2 || stage == 4) && comp < (int)comp_back_.size()) comp_back_[comp] = 0;
+    // (stage 2 and 3 of a large component: from the pass it is at - a pass again goes through the team's stages too;
+    // 4: on from its backward substitution's subtrees, solve_back)
+    bool resume = stage == 4;
+    const bool staged = (stage == 2 || stage == 4) && par_component(comp);
+    for (int pass = stage >= 2 ? comp_pass_[comp] : 0; pass < 3; pass++) {
+    const ParPlan* plan = staged ? &plans_[comp_plan_[comp]] : nullptr;
+    if (!resume) {
     PROFILE_ACCUM("Frame assemble");
-    st.passes++;
+    if (stage != 2) st.passes++;
     if (pass > 0) {
+        if (stage != 2) {
         // again with the unloaded hinges' elastic tangents: those members' change into the system assembled before
         // (kept: the factorization works in place), not the whole assembly again
         for (const Changed& ch : changed) {
@@ -1708,130 +2706,12 @@ void FemFrame::solve_component(SoftBody& b, int comp) {
         std::copy(diagA_.begin() + d0, diagA_.begin() + d1, diag_.begin() + d0);
         std::copy(offA_.begin() + o0, offA_.begin() + o1, off_.begin() + o0);
         std::copy(rhsA_.begin() + r0, rhsA_.begin() + r1, rhs_.begin() + r0);
-    } else {
-    std::fill(diag_.begin() + d0, diag_.begin() + d1, 0.0);
-    std::fill(off_.begin() + o0, off_.begin() + o1, 0.0);
-    for (int kk = k0; kk < k1; kk++) {
-        const int i = perm_[kk];
-        const Node& x = b.nodes[node[i]];
-        const int k = iperm_[i];
-        double* D = &diag_[(size_t)k * 36];
-        double* r = &rhs_[(size_t)k * 6];
-        if (x.inv_mass <= 0) {
-            fixed[i] = 1;
-            for (int j = 0; j < 6; j++) D[j * 7] = 1.0, r[j] = 0.0;
-            continue;
         }
-        D[0] = D[7] = D[14] = x.mass;
-        D[21] = D[28] = D[35] = inertia[i];
-        const vec3 f = F[node[i]], m = torque[i], J = impulse[i];
-        // (all of it for h but the contacts; the smooth forces' guess for the later short steps comes off the held
-        // impulse, which then tells the next step how far off it was)
-        vec3 fc = i < (int)contact_f.size() ? contact_f[i] : vec3(0);
-        if (h > step && E) fc += E[node[i]];
-        const double hs = (double)h - (double)step;
-        const vec3 fm = i < (int)member_f.size() ? member_f[i] : vec3(0);
-        const vec3 tm = i < (int)member_t_.size() ? member_t_[i] : vec3(0);
-        // (the smooth forces taken for the whole of h, corrected by what they turn out to be in the steps between:
-        // held_component at once, hold at the next step; taken for this step alone they loaded the structure every
-        // other step, and a cantilever's static twist came out 14% short)
-        r[0] = h * (double)f.x - hs * fc.x + J.x, r[1] = h * (double)f.y - hs * fc.y + J.y, r[2] = h * (double)f.z - hs * fc.z + J.z;
-        impulse[i] = (f - fm - fc) * -(float)hs;
-        pred_[i] = f - fm - fc;
-        r[3] = h * (double)m.x, r[4] = h * (double)m.y, r[5] = h * (double)m.z;
-        tpred_[i] = m - tm;
-        if (i < (int)contact_n.size() && length2(contact_n[i]) > 0) {
-            // a ground contact: kappa n n^T towards the normal velocity change the contact asked for (step f.n / m, its
-            // force being in f: for its short step, the later ones hold theirs); kappa 200 m makes it 99.5% of it
-            // whatever the members do
-            const bool stick = length2(contact_n[i]) > 2.0f;
-            const vec3 cn = stick ? contact_n[i] * 0.5f : contact_n[i];
-            const double kap = 200.0 * x.mass, want = step * (double)dot(f, cn) / x.mass;
-            const double nn[3] = {cn.x, cn.y, cn.z};
-            for (int p = 0; p < 3; p++) {
-                for (int q2 = 0; q2 < 3; q2++) D[p * 6 + q2] += kap * nn[p] * nn[q2];
-                r[p] += kap * want * nn[p];
-            }
-            // sticking (see World::collide_static): along the ground too, towards what its friction asked (a ring's node
-            // on the ground slid a little every step under its members' forces, and a lying drum with frame rings
-            // crept along at a centimetre a second)
-            if (stick) { // (its sliding stopped)
-                const vec3 vt = x.v - cn * dot(x.v, cn);
-                const double wt[3] = {-vt.x, -vt.y, -vt.z};
-                for (int p = 0; p < 3; p++) {
-                    for (int q2 = 0; q2 < 3; q2++) D[p * 6 + q2] += kap * ((p == q2 ? 1.0 : 0.0) - nn[p] * nn[q2]);
-                    r[p] += kap * wt[p];
-                }
-            }
-        }
-    }
-    for (uint32_t ei : celems) {
-        if (!tan_[ei].on || elems[ei].broken) continue;
-        add_member(ei, effective(tan_[ei]), 1.0, true, diag_.data(), off_.data(), rhs_.data());
-    }
-    // the triangles: their local stiffness turned into the world's axes, block by block (R K_ij R^T, R the element's
-    // axes for the translations and the rotations alike), with the geometric stiffness of their tension
-    for (uint32_t ti : comp_tris_[comp]) {
-        const TriTan& tg = tri_tan_[ti];
-        const FrameTri& t = tris[ti];
-        if (!tg.on || t.broken || !tri_k_ok_[ti]) continue;
-        double Kl[18][18];
-        unpack_k(&tri_k_[(size_t)ti * kTriK], Kl);
-        const double beta = (double)shell_sections[t.section].damping * h;
-        const double c = h2 + beta, cr = hd + beta;
-        const double E[3][3] = {{tg.e1.x, tg.e2.x, tg.e3.x}, {tg.e1.y, tg.e2.y, tg.e3.y}, {tg.e1.z, tg.e2.z, tg.e3.z}}; // (E[p][a]: axis a)
-        bool fx[3];
-        int kk[3];
-        for (int i = 0; i < 3; i++) fx[i] = fixed[t.n[i]], kk[i] = iperm_[t.n[i]];
-        // the material damping's part of the right side: -(theta_d h^2 + beta h) K v, in the element's axes
-        if (cr != 0) {
-            double vl[18], fl[18];
-            for (int i = 0; i < 3; i++) {
-                const vec3 v = b.nodes[node[t.n[i]]].v, om = w[t.n[i]];
-                for (int a = 0; a < 3; a++) {
-                    vl[6 * i + a] = E[0][a] * v.x + E[1][a] * v.y + E[2][a] * v.z;
-                    vl[6 * i + 3 + a] = E[0][a] * om.x + E[1][a] * om.y + E[2][a] * om.z;
-                }
-            }
-            for (int r = 0; r < 18; r++) {
-                double v = 0;
-                for (int q = 0; q < 18; q++) v += Kl[r][q] * vl[q];
-                fl[r] = v;
-            }
-            for (int i = 0; i < 3; i++) {
-                if (fx[i]) continue;
-                double* R = &rhs_[(size_t)kk[i] * 6];
-                for (int p = 0; p < 3; p++) {
-                    R[p] -= cr * (E[p][0] * fl[6 * i] + E[p][1] * fl[6 * i + 1] + E[p][2] * fl[6 * i + 2]);
-                    R[3 + p] -= cr * (E[p][0] * fl[6 * i + 3] + E[p][1] * fl[6 * i + 4] + E[p][2] * fl[6 * i + 5]);
-                }
-            }
-        }
-        // the block of corners (i, j) in the world's axes, times c, into D (row-major 6 x 6)
-        auto block = [&](int i, int j, double* D, double gsign) {
-            for (int ra = 0; ra < 2; ra++)
-                for (int cb = 0; cb < 2; cb++) {
-                    double T[3][3];
-                    const int r0 = 6 * i + 3 * ra, c0 = 6 * j + 3 * cb;
-                    for (int p = 0; p < 3; p++)
-                        for (int bb = 0; bb < 3; bb++) T[p][bb] = E[p][0] * Kl[r0][c0 + bb] + E[p][1] * Kl[r0 + 1][c0 + bb] + E[p][2] * Kl[r0 + 2][c0 + bb];
-                    for (int p = 0; p < 3; p++)
-                        for (int q = 0; q < 3; q++) D[(3 * ra + p) * 6 + 3 * cb + q] += c * (T[p][0] * E[q][0] + T[p][1] * E[q][1] + T[p][2] * E[q][2]);
-                }
-            const double g = gsign * h2 * tg.g[i][j];
-            if (g != 0)
-                for (int p = 0; p < 3; p++) D[p * 7] += g;
-        };
-        for (int i = 0; i < 3; i++)
-            if (!fx[i]) block(i, i, &diag_[(size_t)kk[i] * 36], 1.0);
-        for (int e = 0; e < 3; e++) {
-            const int i = e, j = (e + 1) % 3, p = tri_block_[ti][e];
-            if (p < 0 || fx[i] || fx[j]) continue;
-            // (the block's row is the later corner in the order)
-            if (tri_swap_[ti][e]) block(i, j, &off_[(size_t)p * 36], 1.0);
-            else block(j, i, &off_[(size_t)p * 36], 1.0);
-        }
-    }
+    } else if (stage != 2) {
+    // the nodes' masses, the members' and the triangles' blocks (solve_gather: a large component's in the team's chunks,
+    // before this)
+    if (stage == 0)
+        for (int ch = 0, nch = asm_chunks(comp); ch < nch; ch++) solve_gather(b, comp, ch);
     // the body's springs on frame nodes: (theta h^2 k + h d) e e^T, their tangent now (a shock past or near its bound:
     // the bound's stiffness; a slack rope: none)
     if (pass == 0 && comp < (int)comp_onesided_.size()) comp_onesided_[comp].clear();
@@ -1919,9 +2799,26 @@ void FemFrame::solve_component(SoftBody& b, int comp) {
         std::copy(rhs_.begin() + r0, rhs_.begin() + r1, rhsA_.begin() + r0);
     }
     }
-    // block Cholesky, right-looking over the precomputed pattern (the diagonal blocks' inverse diagonals kept)
+    if (stage == 1 || stage == 3) { // (the factor's subtrees next, in the team's stages)
+        tlap(0);
+        return;
+    }
+    // block Cholesky, right-looking over the precomputed pattern (the diagonal blocks' inverse diagonals kept); after
+    // the team's stages the columns above the subtrees alone
     PROFILE_ACCUM("Frame factor");
-    for (int k = k0; k < k1; k++) {
+    tlap(0);
+    if (plan) {
+        bool failed = false;
+        for (int g = 0; g + 1 < (int)plan->gptr.size(); g++) failed |= par_fail_[(size_t)par_fail_ptr_[comp_plan_[comp]] + g] != 0;
+        if (failed) {
+            st.failures++;
+            for (int kk = k0; kk < k1; kk++) impulse[perm_[kk]] = vec3(0);
+            return; // (as below)
+        }
+    }
+    const int nk = plan ? (int)plan->top.size() : k1 - k0;
+    for (int ik = 0; ik < nk; ik++) {
+        const int k = plan ? plan->top[ik] : k0 + ik;
         double* Lkk = &diag_[(size_t)k * 36];
         double* dk = &dinv_[(size_t)k * 6];
         if (!chol6(Lkk, dk)) {
@@ -1940,33 +2837,44 @@ void FemFrame::solve_component(SoftBody& b, int comp) {
         }
     }
     comp_factored_[comp] = 1;
-    // L L^T x = r
-    for (int k = k0; k < k1; k++) {
-        double* y = &rhs_[(size_t)k * 6];
-        forward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], y);
-        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) {
-            const double* L = &off_[(size_t)p * 36];
-            double* r = &rhs_[(size_t)row_[p] * 6];
-            for (int i = 0; i < 6; i++) {
-                double s = 0;
-                for (int j = 0; j < 6; j++) s += L[i * 6 + j] * y[j];
-                r[i] -= s;
-            }
+    tlap(1);
+    if (plan) {
+        // L L^T x = r above the subtrees (theirs forward in solve_factor, backward in solve_back next): forward, each
+        // column's row from the columns before it in their order (the same subtractions as the sweep's), then backward
+        for (size_t t = 0; t < plan->top.size(); t++) {
+            const int r = plan->top[t];
+            double* y = &rhs_[(size_t)r * 6];
+            for (int q = plan->tptr[t]; q < plan->tptr[t + 1]; q++) sub_mv(&off_[(size_t)plan->tblk[q] * 36], &rhs_[(size_t)plan->tcol[q] * 6], y);
+            forward6(&diag_[(size_t)r * 36], &dinv_[(size_t)r * 6], y);
+        }
+        for (int t = (int)plan->top.size() - 1; t >= 0; t--) {
+            const int k = plan->top[t];
+            double* x = &rhs_[(size_t)k * 6];
+            for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) sub_mtv(&off_[(size_t)p * 36], &rhs_[(size_t)row_[p] * 6], x);
+            backward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], x);
+        }
+        if (subst_staged(comp)) {
+            comp_back_[comp] = 1;
+            tlap(2);
+            return;
+        }
+        for (int g = 0; g + 1 < (int)plan->gptr.size(); g++) solve_back(comp, g); // (a smaller one's subtrees here, in turn)
+    } else {
+        // L L^T x = r
+        for (int k = k0; k < k1; k++) {
+            double* y = &rhs_[(size_t)k * 6];
+            forward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], y);
+            for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) sub_mv(&off_[(size_t)p * 36], y, &rhs_[(size_t)row_[p] * 6]);
+        }
+        for (int k = k1 - 1; k >= k0; k--) {
+            double* x = &rhs_[(size_t)k * 6];
+            for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) sub_mtv(&off_[(size_t)p * 36], &rhs_[(size_t)row_[p] * 6], x);
+            backward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], x);
         }
     }
-    for (int k = k1 - 1; k >= k0; k--) {
-        double* x = &rhs_[(size_t)k * 6];
-        for (int p = col_ptr_[k]; p < col_ptr_[k + 1]; p++) {
-            const double* L = &off_[(size_t)p * 36];
-            const double* xr = &rhs_[(size_t)row_[p] * 6];
-            for (int j = 0; j < 6; j++) {
-                double s = 0;
-                for (int i = 0; i < 6; i++) s += L[i * 6 + j] * xr[i];
-                x[j] -= s;
-            }
-        }
-        backward6(&diag_[(size_t)k * 36], &dinv_[(size_t)k * 6], x);
+    tlap(2);
     }
+    resume = false;
     // did the step unload a yielding hinge (bar, twist)? then its elastic tangent, and the step again
     if (!any_yield || pass == 2) break;
     bool again = false;
@@ -1997,6 +2905,12 @@ void FemFrame::solve_component(SoftBody& b, int comp) {
         if ((y & 8) && dot(t.e1, wb - wa) * t.T < 0) u |= 8;
         if (u) changed.push_back({(uint32_t)ei, t.unload}), t.unload |= u, t.elastic_hold = 16, again = true;
     }
+    tlap(3);
+    if (again && plan) { // (the pass again in the team's stages: solve_repass, solve_factor, solve_defer, solve_finish)
+        comp_pass_[comp] = (uint8_t)(pass + 1);
+        comp_repass_[comp] = 1;
+        return;
+    }
     if (!again) break;
     }
     one_sided_react(b, comp, h);
@@ -2026,6 +2940,53 @@ void FemFrame::solve_component(SoftBody& b, int comp) {
         static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
         if (dbg && (length(dv) >= kMaxDv * 0.999f || length(w[i]) >= kMaxW * 0.999f))
             printf("frame: node %u (component %d of %d nodes) clamped: dv %.1f m/s, spin %.0f rad/s\n", node[i], comp, k1 - k0, length(dv), length(w[i]));
+    }
+    tlap(4);
+}
+
+// (diagnostics, BL_FEMPROF: the components' times summed over the run, printed at the exit)
+namespace {
+struct FemProfRow {
+    const void* frame = nullptr;
+    int comp = 0, nodes = 0, blocks = 0, updates = 0, members = 0, tris = 0;
+    long long calls = 0, passes = 0, held = 0;
+    double t[6] = {};
+};
+std::mutex g_femprof_mx;
+std::vector<FemProfRow> g_femprof;
+void femprof_print() {
+    std::lock_guard<std::mutex> lk(g_femprof_mx);
+    std::sort(g_femprof.begin(), g_femprof.end(), [](const FemProfRow& a, const FemProfRow& b) { return a.t[0] + a.t[1] + a.t[2] + a.t[5] > b.t[0] + b.t[1] + b.t[2] + b.t[5]; });
+    printf("femprof: frame comp nodes blocks updates members tris calls passes held assemble_ms factor_ms subst_ms unload_ms rest_ms held_ms\n");
+    for (const FemProfRow& r : g_femprof)
+        if (r.calls + r.held > 0)
+            printf("femprof: %p %d %d %d %d %d %d %lld %lld %lld %.3f %.3f %.3f %.3f %.3f %.3f\n", r.frame, r.comp, r.nodes, r.blocks, r.updates, r.members, r.tris, r.calls,
+                   r.passes, r.held, r.t[0], r.t[1], r.t[2], r.t[3], r.t[4], r.t[5]);
+}
+} // namespace
+
+void FemFrame::prof_flush() {
+    static const bool femprof = getenv("BL_FEMPROF") != nullptr;
+    if (!femprof) return;
+    std::lock_guard<std::mutex> lk(g_femprof_mx);
+    static bool registered = (atexit(femprof_print), true);
+    (void)registered;
+    for (size_t c = 0; c < comp_stats_.size() && c < comp_range_.size(); c++) {
+        CompStats& cs = comp_stats_[c];
+        if (cs.passes == 0 && cs.held == 0) continue;
+        const int a = comp_range_[c].first, e = comp_range_[c].second;
+        FemProfRow* row = nullptr;
+        for (FemProfRow& r : g_femprof)
+            if (r.frame == this && r.comp == (int)c && r.nodes == e - a) row = &r;
+        if (!row) {
+            g_femprof.push_back({});
+            row = &g_femprof.back();
+            row->frame = this, row->comp = (int)c, row->nodes = e - a, row->blocks = col_ptr_[e] - col_ptr_[a], row->updates = upd_ptr_[e] - upd_ptr_[a];
+            row->members = (int)comp_elems_[c].size(), row->tris = c < comp_tris_.size() ? (int)comp_tris_[c].size() : 0;
+        }
+        row->calls += cs.passes > 0, row->passes += cs.passes, row->held += cs.held;
+        for (int i = 0; i < 6; i++) row->t[i] += cs.t[i], cs.t[i] = 0;
+        cs.passes = 0, cs.held = 0;
     }
 }
 
@@ -2080,6 +3041,7 @@ void set_mass(Node& n, float m, bool fixed) {
 } // namespace
 
 int FemFrame::split(SoftBody& b, uint32_t ei, float t) {
+    PROFILE_ACCUM("Frame split");
     if (ei >= elems.size() || elems[ei].broken) return -1;
     Kin k;
     if (!kinematics(*this, elems[ei], k)) return -1;
@@ -2137,6 +3099,7 @@ int FemFrame::split(SoftBody& b, uint32_t ei, float t) {
 }
 
 bool FemFrame::tear(SoftBody& b, uint32_t ei, int end) {
+    PROFILE_ACCUM("Frame tear");
     if (ei >= elems.size() || elems[ei].broken) return false;
     FrameElement& e = elems[ei];
     e.torn |= (uint8_t)(end ? 2 : 1);
@@ -2199,8 +3162,22 @@ bool FemFrame::process_events(SoftBody& b) {
             break;
         }
     }
-    // a mount whose seat tore (a member torn off one of its nodes) lets go
+    // a mount whose seat tore (a member torn off one of its nodes) lets go (the members at each frame node counted once:
+    // members_at for every mount's node was a millisecond a crash's substep)
     static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
+    std::vector<int> at(node.size(), 0);
+    for (const FrameElement& e : elems)
+        if (!e.broken) {
+            if (e.a < at.size()) at[e.a]++;
+            if (e.b < at.size() && e.b != e.a) at[e.b]++;
+        }
+    for (const FrameTri& t : tris)
+        if (!t.broken)
+            for (int c = 0; c < 3; c++) {
+                const uint32_t f = t.n[c];
+                if (f < at.size() && (c == 0 || f != t.n[0]) && (c < 2 || f != t.n[1])) at[f]++;
+            }
+    auto members_now = [&](uint32_t fn) { return fn < at.size() ? at[fn] : 0; };
     for (size_t i = 0; i < mounts.size(); i++) {
         FrameMount& m = mounts[i];
         if (m.broken || !m.made) continue;
@@ -2208,10 +3185,10 @@ bool FemFrame::process_events(SoftBody& b) {
         const int na = std::max(1, m.na);
         for (int j = 0; j < na && !torn; j++) {
             const int sj = slot(m.na > 0 ? m.an[j] : m.a);
-            torn = sj < 0 || members_at((uint32_t)sj) < m.members[j];
+            torn = sj < 0 || members_now((uint32_t)sj) < m.members[j];
         }
         const int sb = slot(m.b);
-        torn |= sb < 0 || members_at((uint32_t)sb) < m.members[4];
+        torn |= sb < 0 || members_now((uint32_t)sb) < m.members[4];
         if (!torn) continue;
         if (dbg) printf("frame: mount %zu (%u-%u) lets go at %.0f N (breaks at %.0f): its seat tore\n", i, m.a, m.b, m.f, m.brk);
         m.broken = true;
@@ -2230,7 +3207,7 @@ bool FemFrame::process_events(SoftBody& b) {
         for (int e = 0; e < 2 && !torn; e++) {
             if (s.seat[e] == 0 || s.seat[e] == 255) continue;
             const int sl = slot(e ? b.beams[s.beam].b : b.beams[s.beam].a);
-            torn = sl < 0 || (members_at((uint32_t)sl) < s.seat[e] && members_at((uint32_t)sl) <= 1);
+            torn = sl < 0 || (members_now((uint32_t)sl) < s.seat[e] && members_now((uint32_t)sl) <= 1);
         }
         if (!torn) continue;
         if (dbg) printf("frame: shock %zu (%u-%u) lets go: its seat tore\n", i, b.beams[s.beam].a, b.beams[s.beam].b);
@@ -2250,8 +3227,10 @@ bool FemFrame::process_events(SoftBody& b) {
     return b.nodes.size() != n0;
 }
 
-void FemFrame::sync_positions(SoftBody& b, float h) {
-    for (size_t i = 0; i < node.size(); i++) {
+void FemFrame::sync_positions(SoftBody& b, float h) { sync_positions(b, h, 0, node.size()); }
+
+void FemFrame::sync_positions(SoftBody& b, float h, size_t i0, size_t i1) {
+    for (size_t i = i0; i < i1 && i < node.size(); i++) {
         Node& n = b.nodes[node[i]];
         double* x = &xd[i * 3];
         // (the step the integrator made, x += h v', in double; the orientation turned as far)
@@ -2323,56 +3302,76 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
         if (a < n && c < n) up[find(a)] = find(c);
     };
     std::vector<char> other(n, 0); // (held by something else than frame members)
+    std::vector<char> held(n, 0);  // (... than frame members, triangle elements and their collision triangles)
     for (const FrameElement& e : elems)
         if (!e.broken) join(node[e.a], node[e.b]);
-    // (a shell of triangle elements stays in the body: held by them)
+    // (a part of members alone leaves as debris; one with triangle elements too, if nothing else holds it: a panel torn
+    // off the shell, a corner of it - a rigid body of its own then, and the shell's step no longer pays for it)
+    std::vector<char> fem_coll(b.tris.size(), 0);
     for (const FrameTri& t : tris)
         if (!t.broken) {
             join(node[t.n[0]], node[t.n[1]]), join(node[t.n[1]], node[t.n[2]]);
             for (uint32_t v : t.n) other[node[v]] = 1;
+            if (t.coll >= 0 && t.coll < (int)fem_coll.size()) fem_coll[t.coll] = 1;
         }
+    auto hold = [&](uint32_t v) {
+        if (v < n) other[v] = held[v] = 1;
+    };
     // (a part on mounts, a sheet on welds: held by them; a part's frame and its skin go together)
     for (const FrameMount& m : mounts)
         if (!m.broken) {
-            join(m.a, m.b), other[m.a] = other[m.b] = 1;
-            for (int k = 1; k < m.nb; k++) join(m.a, m.bn[k]), other[m.bn[k]] = 1;
+            join(m.a, m.b), hold(m.a), hold(m.b);
+            for (int k = 1; k < m.nb; k++) join(m.a, m.bn[k]), hold(m.bn[k]);
         }
     for (const Weld& wd : b.welds) {
         if (wd.broken) continue;
         for (uint32_t i = wd.first; i < wd.first + wd.count && i < b.weld_nodes.size(); i++) join(wd.anchor, b.weld_nodes[i]);
-        other[wd.anchor] = 1;
+        hold(wd.anchor);
     }
     for (const Beam& bm : b.beams)
-        if (!(bm.flags & BF_BROKEN)) join(bm.a, bm.b), other[bm.a] = other[bm.b] = 1;
-    for (const Shell& sh : b.shells) join(sh.n[0], sh.n[1]), join(sh.n[1], sh.n[2]), other[sh.n[0]] = other[sh.n[1]] = other[sh.n[2]] = 1;
-    for (const Triangle& t : b.tris) // (a hull triangle holds nothing: it goes with the debris, torn)
-        if (!t.torn && t.two_sided) join(t.a, t.b), join(t.b, t.c), other[t.a] = other[t.b] = other[t.c] = 1;
+        if (!(bm.flags & BF_BROKEN)) join(bm.a, bm.b), hold(bm.a), hold(bm.b);
+    for (const Shell& sh : b.shells) join(sh.n[0], sh.n[1]), join(sh.n[1], sh.n[2]), hold(sh.n[0]), hold(sh.n[1]), hold(sh.n[2]);
+    for (size_t ti = 0; ti < b.tris.size(); ti++) { // (a hull triangle holds nothing: it goes with the debris, torn)
+        const Triangle& t = b.tris[ti];
+        if (t.torn || !t.two_sided) continue;
+        join(t.a, t.b), join(t.b, t.c);
+        if (fem_coll[ti]) other[t.a] = other[t.b] = other[t.c] = 1; // (a triangle element's: it goes with it)
+        else hold(t.a), hold(t.b), hold(t.c);                        // (the body's skin, its mesh's: it stays)
+    }
     for (const Joint& j : b.joints)
-        if (!j.broken && j.parent_frame < b.frames.size()) join(b.frames[j.parent_frame].node, j.child_node), other[j.child_node] = 1;
-    for (const Capsule& c : b.capsules) join(c.a, c.b), other[c.a] = other[c.b] = 1;
+        if (!j.broken && j.parent_frame < b.frames.size()) join(b.frames[j.parent_frame].node, j.child_node), hold(j.child_node);
+    for (const Capsule& c : b.capsules) join(c.a, c.b), hold(c.a), hold(c.b);
     for (const SlideNode& sl : b.slides) {
-        other[sl.node] = 1;
-        for (uint32_t r : sl.rail) join(sl.node, r), other[r] = 1;
+        hold(sl.node);
+        for (uint32_t r : sl.rail) join(sl.node, r), hold(r);
     }
     for (const Wheel& wh : b.wheels) {
-        for (uint32_t v : wh.nodes) other[v] = 1;
-        for (uint32_t v : wh.rim) other[v] = 1;
-        other[wh.axle0] = other[wh.axle1] = 1;
+        for (uint32_t v : wh.nodes) hold(v);
+        for (uint32_t v : wh.rim) hold(v);
+        hold(wh.axle0), hold(wh.axle1);
     }
+    // (a collision volume's anchors: its part stays - the volume fit to the debris' nodes left behind pushed the other
+    // car off with its engine's mass, MN)
+    for (const CollisionVolume& cv : b.volumes)
+        if (!cv.broken)
+            for (uint32_t a : cv.anchors) hold(a);
     struct Part {
         float mass = 0;
-        int members = 0;
-        bool other = false, fixed = false;
+        int members = 0, tris = 0;
+        bool other = false, held = false, fixed = false;
     };
     std::vector<Part> parts(n);
     for (uint32_t i = 0; i < n; i++) {
         Part& p = parts[find(i)];
         p.mass += b.nodes[i].mass;
         p.other |= other[i] != 0;
+        p.held |= held[i] != 0;
         p.fixed |= b.nodes[i].inv_mass <= 0 && b.nodes[i].mass > 0 && (b.info[i].flags & NF_FIXED);
     }
     for (const FrameElement& e : elems)
         if (!e.broken) parts[find(node[e.a])].members++;
+    for (const FrameTri& t : tris)
+        if (!t.broken) parts[find(node[t.n[0]])].tris++;
     uint32_t main = 0;
     for (uint32_t i = 0; i < n; i++)
         if (parts[find(i)].mass > parts[main].mass) main = find(i);
@@ -2400,6 +3399,60 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
             if (find(i) == i && parts[i].members > 0)
                 printf("frame: part of %s: %.1f kg, %d members%s%s%s\n", b.name.c_str(), parts[i].mass, parts[i].members, parts[i].other ? ", held by other elements" : "",
                        parts[i].fixed ? ", fixed" : "", i == main ? " (main)" : "");
+    // a fragment torn off the shell - a few triangle elements, no members, held by nothing else: out of the frame's
+    // step (each was a component of its own, a few light nodes at a steel plate's stiffness), its triangles kept to be
+    // drawn (loose_tris) and its shape held by stiff springs of the body along their edges and across the shared ones;
+    // its nodes stay the body's (its contacts, its group, the volumes as before - a torn-off panel made a rigid body
+    // of its own, wedged between two cars, pushed them apart)
+    static const bool no_loose = getenv("BL_NOLOOSE") != nullptr; // (diagnostics: fragments stay in the frame's step)
+    bool changed = false;
+    if (!no_loose) {
+        std::vector<char> loose(n, 0);
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t r = find(i);
+            const Part& p = parts[r];
+            loose[i] = r != main && p.tris > 0 && p.tris <= kLooseTris && p.members == 0 && !p.held && !p.fixed && p.mass <= max_mass;
+        }
+        const float h = std::max(last_h_, 5e-4f); // (the frame's step or the substep's, the longer: a body stepping alone after its sub-cycling)
+        std::vector<std::pair<uint32_t, uint32_t>> edges;   // (a body node pair each, its triangle's third node)
+        std::vector<uint32_t> third;
+        std::vector<uint32_t> roots_done;
+        for (size_t ti = 0; ti < tris.size(); ti++) {
+            FrameTri& t = tris[ti];
+            if (t.broken || !loose[node[t.n[0]]]) continue;
+            const uint32_t r = find(node[t.n[0]]);
+            if (std::find(roots_done.begin(), roots_done.end(), r) != roots_done.end()) continue;
+            roots_done.push_back(r);
+            // (the fragment's triangles, its edges)
+            edges.clear(), third.clear();
+            float mmin = 1e30f;
+            for (size_t tj = ti; tj < tris.size(); tj++) {
+                FrameTri& u = tris[tj];
+                if (u.broken || find(node[u.n[0]]) != r) continue;
+                const uint32_t v[3] = {node[u.n[0]], node[u.n[1]], node[u.n[2]]};
+                loose_tris.push_back({{v[0], v[1], v[2]}, u.section});
+                for (int e = 0; e < 3; e++) {
+                    const uint32_t x = std::min(v[e], v[(e + 1) % 3]), y = std::max(v[e], v[(e + 1) % 3]);
+                    edges.push_back({x, y}), third.push_back(v[(e + 2) % 3]);
+                    mmin = std::min(mmin, b.nodes[v[e]].mass);
+                }
+                u.broken = true;
+            }
+            // (springs at a fifth of the explicit limit of its lightest node, a tenth of critical damping)
+            const float k = 0.2f * mmin / (h * h), d = 0.1f * mmin / h;
+            for (size_t e = 0; e < edges.size(); e++) {
+                bool first = true;
+                for (size_t f2 = 0; f2 < e; f2++)
+                    if (edges[f2] == edges[e]) {
+                        first = false;
+                        if (third[f2] != third[e]) b.add_beam(third[f2], third[e], 0.5f * k, d, 1e30f, 1e30f, BT_NORMAL, BF_NO_DEFORM); // (across it)
+                    }
+                if (first) b.add_beam(edges[e].first, edges[e].second, k, d, 1e30f, 1e30f, BT_NORMAL, BF_NO_DEFORM);
+            }
+            loose_count++;
+            changed = true;
+        }
+    }
     // the debris: parts of frame members alone, light, not the body's main part
     std::vector<int32_t> piece_of(n, -1);
     std::vector<uint32_t> roots;
@@ -2410,7 +3463,16 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
         if (piece_of[r] < 0) piece_of[r] = (int32_t)roots.size(), roots.push_back(r);
         piece_of[i] = piece_of[r];
     }
-    if (roots.empty()) return 0;
+    if (roots.empty()) {
+        if (changed) {
+            compact(b);
+            b.topo_log.overflow = true; // (the plates' mid points' pairs: searched again)
+            b.topo_changed = true;
+            b.topo_version++;
+            b.shk.version++;
+        }
+        return 0;
+    }
     const size_t first = out.size();
     std::vector<int32_t> new_idx(n, -1);
     for (size_t k = 0; k < roots.size(); k++) {
@@ -2475,6 +3537,9 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
 void FemFrame::renumber(const SoftBody& b, const std::vector<uint32_t>& nidx) {
     for (uint32_t& v : node)
         if (v < nidx.size()) v = nidx[v];
+    for (LooseTri& t : loose_tris)
+        for (uint32_t& v : t.n)
+            if (v < nidx.size()) v = nidx[v];
     for (FrameMount& m : mounts) {
         auto re = [&](uint32_t& v) {
             if (v < nidx.size()) v = nidx[v];
@@ -2492,6 +3557,18 @@ void FemFrame::renumber(const SoftBody& b, const std::vector<uint32_t>& nidx) {
 }
 
 void FemFrame::split_off(SoftBody& b, const std::vector<int>& part_of, const std::vector<uint32_t>& nidx, const std::vector<SoftBody*>& pieces) {
+    { // (the loose fragments on the kept nodes follow them; the others are dropped)
+        size_t m = 0;
+        for (const LooseTri& t : loose_tris) {
+            bool keep = true;
+            for (uint32_t v : t.n) keep &= v < part_of.size() && part_of[v] < 0 && v < nidx.size();
+            if (!keep) continue;
+            LooseTri c = t;
+            for (uint32_t& v : c.n) v = nidx[v];
+            loose_tris[m++] = c;
+        }
+        loose_tris.resize(m);
+    }
     if (elems.empty()) return;
     std::vector<uint8_t> moved(pieces.size(), 0);
     for (FrameElement& e : elems) {
@@ -2690,6 +3767,7 @@ int FemFrame::part_tris(SoftBody& b, const std::vector<uint32_t>& crossed, const
 }
 
 int FemFrame::tear_tri(SoftBody& b, uint32_t ti, vec3 pull) {
+    PROFILE_ACCUM("Frame tear tri");
     if (ti >= tris.size() || tris[ti].broken || tris[ti].tears >= 3) return 0;
     const FrameTri& t0 = tris[ti];
     const vec3 P[3] = {b.nodes[node[t0.n[0]]].p, b.nodes[node[t0.n[1]]].p, b.nodes[node[t0.n[2]]].p};

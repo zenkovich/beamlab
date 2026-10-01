@@ -1077,7 +1077,6 @@ int App::run(const AppOptions& opt) {
         static const bool live = getenv("BL_LIVE") != nullptr; // (diagnostics: scripted runs stepped like the interactive app)
         const bool fixed = (bench || !opt.screenshot.empty() || !opt.shots.empty()) && !opt.realtime && !live;
         if (fixed) dt = 1.0f / 60.0f; // deterministic stepping
-        m_game.world.settings.lag_rate = !fixed;  // (and the frames' step at one rate)
         dt = std::min(dt, 0.1f);
         m_frame_ms = dt * 1000.0;
         m_fps = m_fps * 0.9f + 0.1f * (dt > 0 ? 1.0f / dt : 0);

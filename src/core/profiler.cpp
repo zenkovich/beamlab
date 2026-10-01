@@ -3,6 +3,8 @@
 
 #include "NanoProfiler.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 
@@ -32,7 +34,9 @@ thread_local ThreadData* t_data = &g_threads[0];
 double g_tick_ms = 1e-6;
 struct TickInit {
     TickInit() {
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(__aarch64__)
+        g_tick_ms = 1e3 / (double)__builtin_arm_rsr64("CNTFRQ_EL0");
+#elif defined(__APPLE__)
         mach_timebase_info_data_t tb;
         mach_timebase_info(&tb);
         g_tick_ms = (double)tb.numer / (double)tb.denom * 1e-6;
@@ -42,6 +46,7 @@ struct TickInit {
 } g_tick_init;
 } // namespace
 
+#if !(defined(__APPLE__) && defined(__aarch64__))
 uint64_t now() {
 #if defined(__APPLE__)
     return mach_absolute_time();
@@ -49,6 +54,7 @@ uint64_t now() {
     return (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
 #endif
 }
+#endif
 
 double ticks_to_ms(uint64_t t) { return (double)t * g_tick_ms; }
 
@@ -142,5 +148,58 @@ void end_frame() {
 const std::vector<ThreadTimeline>& last_timeline() { return g_last_timeline; }
 uint64_t last_frame_begin() { return g_last_begin; }
 uint64_t last_frame_end() { return g_last_end; }
+
+// ---- trace (diagnostics)
+std::atomic<bool> g_trace{false};
+namespace {
+struct TraceEvent {
+    const Zone* zone;
+    const char* mark;
+    int value;
+    uint64_t t0, t1;
+};
+struct TraceBuf {
+    int thread = 0;
+    std::vector<TraceEvent> ev;
+};
+std::mutex g_trace_mx;
+std::vector<TraceBuf*> g_trace_bufs;
+TraceBuf& trace_buf() {
+    thread_local TraceBuf* b = nullptr;
+    if (!b) {
+        b = new TraceBuf();
+        b->thread = t_zone_slot;
+        b->ev.reserve(1 << 16);
+        std::lock_guard<std::mutex> lk(g_trace_mx);
+        g_trace_bufs.push_back(b);
+    }
+    return *b;
+}
+} // namespace
+
+void trace_event(const Zone* z, uint64_t t0, uint64_t t1) { trace_buf().ev.push_back({z, nullptr, 0, t0, t1}); }
+void trace_mark(const char* what, int value) {
+    const uint64_t t = now();
+    trace_buf().ev.push_back({nullptr, what, value, t, t});
+}
+
+void trace_dump(const char* path) {
+    std::lock_guard<std::mutex> lk(g_trace_mx);
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    uint64_t t0 = ~0ull;
+    for (TraceBuf* b : g_trace_bufs)
+        for (const TraceEvent& e : b->ev) t0 = std::min(t0, e.t0);
+    fprintf(f, "{\"events\": [");
+    bool first = true;
+    for (TraceBuf* b : g_trace_bufs)
+        for (const TraceEvent& e : b->ev) {
+            fprintf(f, "%s\n[%d, \"%s\", %.3f, %.3f, %d]", first ? "" : ",", b->thread, e.zone ? e.zone->name : e.mark, ticks_to_ms(e.t0 - t0) * 1e3,
+                    ticks_to_ms(e.t1 - t0) * 1e3, e.zone ? -1 : e.value);
+            first = false;
+        }
+    fprintf(f, "]}\n");
+    fclose(f);
+}
 
 } // namespace bl::prof

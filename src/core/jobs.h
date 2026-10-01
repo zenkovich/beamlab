@@ -63,6 +63,10 @@ public:
     // Runs one phase on a board: fn(chunk) for every chunk in [0, count), the caller working too. Returns when all
     // chunks are done (it never waits for a helper to arrive: no deadlock, whatever the number of free threads).
     void run_board(Board* b, int count, const ChunkFn& fn);
+    // The same in two: post_board publishes the phase and returns at once (the helpers take its chunks while the caller
+    // does something else; fn must live until wait_board), wait_board works on what is left and returns when all are done.
+    void post_board(Board* b, int count, const ChunkFn& fn);
+    void wait_board(Board* b, int count);
     // Phase ends the owner waited for helpers still in a chunk: total wait (us) and waits over 0.2 ms, since the last call.
     void take_board_waits(double& wait_ms, int& stalls) {
         wait_ms = m_wait_ms.exchange(0) * 1e-3;
@@ -70,6 +74,11 @@ public:
     }
     // Takes and runs one chunk of an open board; false if there was none.
     bool help_boards();
+    // (diagnostics: the chunks the owners ran themselves and the ones the helpers took, since the last call)
+    void take_chunk_counts(long long& own, long long& helped) {
+        own = m_own_chunks.exchange(0);
+        helped = m_helped_chunks.exchange(0);
+    }
 
 private:
     void worker_main(int index);
@@ -82,6 +91,7 @@ private:
     alignas(128) std::atomic<int> m_parked{0};
     void wake_parked();
     std::atomic<int> m_stalls{0};
+    std::atomic<long long> m_own_chunks{0}, m_helped_chunks{0};
 
     std::vector<std::thread> m_workers;
     std::mutex m_mutex;
@@ -106,6 +116,7 @@ class Team {
 public:
     explicit Team(bool parallel) : m_board(parallel ? JobSystem::get().open_board() : nullptr) {}
     ~Team() {
+        wait();
         if (m_board) JobSystem::get().close_board(m_board);
     }
     Team(const Team&) = delete;
@@ -121,9 +132,27 @@ public:
         const JobSystem::ChunkFn fn = [&f](int c) { f(c); };
         JobSystem::get().run_board(m_board, count, fn);
     }
+    // A phase posted, its chunks taken by the helpers while the caller goes on; wait() works on the rest and returns
+    // when it is all done (the posted function kept here till then; without helpers it runs at wait)
+    void post(int count, JobSystem::ChunkFn fn) {
+        wait();
+        if (count <= 0) return;
+        m_posted = std::move(fn), m_posted_count = count;
+        if (m_board) JobSystem::get().post_board(m_board, count, m_posted);
+    }
+    void wait() {
+        if (m_posted_count <= 0) return;
+        if (m_board) JobSystem::get().wait_board(m_board, m_posted_count);
+        else
+            for (int i = 0; i < m_posted_count; i++) m_posted(i);
+        m_posted_count = 0;
+        m_posted = nullptr;
+    }
 
 private:
     JobSystem::Board* m_board;
+    JobSystem::ChunkFn m_posted;
+    int m_posted_count = 0;
 };
 
 } // namespace bl

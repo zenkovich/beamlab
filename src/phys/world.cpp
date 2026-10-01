@@ -141,9 +141,12 @@ struct World::Island {
     struct NT { uint16_t bn, bt; uint32_t node, tri; };
     struct NC { uint16_t bn, bc; uint32_t node, cap; };
     struct CT { uint16_t bc, bt; uint32_t cap, tri; };
+    struct MT { uint16_t bm, bt; uint32_t mid, tri; }; // (a FEM plate's mid point, SoftBody::tri_mids: its FemFrame::tris)
     std::vector<NT> nt;
     std::vector<NC> nc;
     std::vector<CT> ct;
+    std::vector<MT> mt;
+    std::vector<std::vector<MT>> q_mt;       // (their broadphase's, per chunk of triangles)
     std::vector<SoftBody*> sph;              // the sheet bodies with sphere contacts stepping now (scratch)
     std::vector<int> mem_bodies;             // the sheets whose membranes are projected this short step (scratch)
     std::vector<float> mem_speed;            // their top speed after it (-1: not projected)
@@ -155,8 +158,11 @@ struct World::Island {
         uint16_t body;
         uint32_t node;
         int x, y, z;
+        vec3 p;                              // (its place: a query's box test before the body's arrays)
     };
     std::vector<Pt> pts;
+    std::vector<Pt> mpts;                    // (the plates' mid points in the hash: node = its FemFrame::tris)
+    std::vector<vec3> mpos;                  // (their positions)
     std::vector<uint32_t> fill;
     std::vector<PrimRef> prims;
     std::vector<std::pair<uint32_t, uint32_t>> entries; // (bucket, prim)
@@ -187,6 +193,7 @@ struct World::Island {
     struct Work {
         uint32_t body;
         uint32_t kind;  // 0: internal forces of the body (beams, shocks, wheels ...), 1: chunk `a` of its triangles, 2: nodes [a, b),
+                        // 5, 6: chunk `a` of the narrow phase (pair_detect, mid_detect), 7: of the volumes' (volume_find),
                         // 3: a rigid body's step, 4: chunk `a` of its frame's members
         uint32_t a, b;
     };
@@ -194,6 +201,48 @@ struct World::Island {
     std::vector<char> fem_parts;    // (bodies whose frame members are evaluated in chunks of their own this short step)
     std::vector<char> fem_defer;    // (integration items whose frame solves this short step, apart: then they integrate)
     std::vector<std::pair<uint32_t, int>> fem_work;   // (those frames' components: the item, the component)
+    std::vector<std::pair<uint32_t, int>> fem_par;    // (their large components, factored in the team's stages)
+    std::vector<std::pair<uint32_t, int>> fem_small;  // (the rest: solved whole, or held)
+    std::vector<std::pair<uint32_t, int>> fem_hpar;   // (the large ones held, in the team's stages: FemFrame::held_par)
+    std::vector<std::pair<int, int>> fem_htasks;      // (their groups: one of fem_hpar, the group)
+    std::vector<char> fem_chunked;                    // (per body: a frame's body integrated in chunks of nodes)
+    std::vector<int> vmid_bodies;                     // (collide_volumes: the bodies with plates' mid points)
+    std::vector<int> ev_bodies;                       // (the bodies with frame events this short step)
+    std::vector<char> ev_done;                        // (per body: its events done beside the others', 2 changed)
+    std::vector<char> fem_pre;                        // (per body: its frame's step begun beside the contacts)
+    std::vector<int> fem_pre_nc;                      // (... its components)
+    struct PreTask { int k, c, chunk; };              // (... their blocks: body, component, chunk or -1 the whole of it)
+    std::vector<PreTask> pre_tasks;
+    std::vector<std::pair<int, uint32_t>> smid_tasks; // (their plates' mid points' static contacts: body, range of plates)
+    std::vector<int> smid_first;                      // (per body: its first of those, -1 none)
+    std::vector<std::vector<World::StaticMid>> smid;  // (each one's contacts found)
+    // the collision volumes' look (collide_volumes): the volumes, their parts' chunks, the hits of each
+    struct VTask {
+        int ka;
+        CollisionVolume* V;
+    };
+    struct VHit {
+        uint8_t kind;       // 0 own part's node, 1 own part's plate, 2 node, 3 plate, 4 ball, 5 volume's vertex, 6 static vertex, 7 pole
+        uint8_t moves, fem, pad;
+        int kb;             // (the other body)
+        uint32_t i;         // node, capsule's node, volume, the plate's triangle, the surface
+        uint32_t n3[3];
+        float w[3];
+        vec3 p, n;
+        float pen, extra;   // (a volume's vertex: its mass share; static: the force's cap)
+    };
+    struct VSub {
+        int t, kb;
+        uint8_t part;   // 0 own parts, 1 nodes of kb, 2 plates of kb, 3 balls and volumes of kb, 4 static
+        uint32_t i0, i1; // (plates: a range of kb's mid points in their order)
+    };
+    std::vector<VTask> vtasks;
+    std::vector<VSub> vsubs;
+    std::vector<int> vsub_ptr;
+    std::vector<std::vector<VHit>> vhits;
+    std::vector<const SoftBody::MidCache*> vmids;
+    bool vbodies = false;
+    std::vector<std::pair<int, int>> fem_tasks;       // (a stage's chunks: the large component, its group)
     struct NodePart {
         vec3 mn, mx;
         float max_v2;
@@ -208,6 +257,7 @@ struct World::Island {
         float pen;
     };
     std::vector<std::vector<Hit>> hits;      // per chunk of candidate pairs
+    std::vector<std::vector<Hit>> mhits;     // (the plates' mid points' pairs: per chunk of them)
     struct QChunk {                          // broadphase query: triangles [t0, t1) of `body` (and its capsules when caps)
         uint16_t body, other;
         uint32_t t0, t1;
@@ -259,16 +309,17 @@ void World::wake_all() {
 
 void World::step_frame(float frame_dt) {
     // Spiral of death guard, only while the physics itself makes the frames long (its last frame took more than half an
-    // average frame): then a frame may take at most 1.25x the substeps of an average frame (+1), and after a hitch the
-    // simulation runs slow for a moment instead of doubling the next frame's work (which makes it slow too ...). Frames
-    // that are long for other reasons (uneven presentation, the window system) are always simulated in full: dropping
-    // their time made the motion jerk.
+    // average frame): then a frame may take at most the substeps of an average frame (+1), and after a hitch the
+    // simulation runs slow for a moment instead of doubling the next frame's work (which makes it slow too ...; with
+    // 1.25x of them a crash's frames of 35 ms took 45 and more the next frames, 60 ms in the app). Frames that are long
+    // for other reasons (uneven presentation, the window system) are always simulated in full: dropping their time made
+    // the motion jerk.
     const double want = (double)frame_dt * settings.time_scale;
     m_avg_frame = m_avg_frame <= 0 ? std::clamp(want, 1.0 / 240.0, 1.0 / 15.0) : m_avg_frame * 0.95 + 0.05 * std::clamp(want, 1.0 / 240.0, 1.0 / 15.0);
     m_accum += want;
     int n = (int)(m_accum / settings.dt);
     const bool overloaded = m_stats.step_ms > 0.5 * m_avg_frame * 1000.0;
-    const int maxn = overloaded ? std::min(settings.max_substeps_per_frame, (int)std::ceil(1.25 * m_avg_frame / settings.dt) + 1)
+    const int maxn = overloaded ? std::min(settings.max_substeps_per_frame, (int)std::ceil(m_avg_frame / settings.dt) + 1)
                                 : settings.max_substeps_per_frame;
     if (n > maxn) {
         n = maxn;
@@ -277,18 +328,47 @@ void World::step_frame(float frame_dt) {
     } else {
         m_accum -= n * (double)settings.dt;
     }
-    // (a lagging frame: half again the substeps of an average one to catch up, or the physics not keeping up with the
-    // clock - its frames' implicit step at the lower rate)
-    m_lagging = settings.lag_rate && (m_stats.step_ms > m_avg_frame * 1000.0 || n > (int)std::ceil(1.5 * m_avg_frame / settings.dt));
     if (n > 0) step_substeps(n);
     else m_stats.substeps = 0;
-    m_lagging = false;
     float got = n * settings.dt;
     m_stats.realtime_factor = m_stats.realtime_factor * 0.9f + 0.1f * (want > 0 ? std::min(1.5f, got / frame_dt) : 1.0f);
 }
 
+// (diagnostics, BL_TRACE=<frame>,<first substep>,<substeps>[,<file>]: those substeps' every profiled scope on its thread,
+// as JSON - prof::trace_dump)
+namespace {
+struct TraceArm {
+    int frame = -1, s0 = 0, count = 0;
+    std::string path = "trace.json";
+    TraceArm() {
+        if (const char* e = getenv("BL_TRACE")) {
+            char buf[512] = {};
+            if (sscanf(e, "%d,%d,%d,%511s", &frame, &s0, &count, buf) >= 3 && buf[0]) path = buf;
+        }
+    }
+};
+const TraceArm& trace_arm() {
+    static TraceArm a;
+    return a;
+}
+int g_trace_frame = 0;
+} // namespace
+
 void World::step_substeps(int n) {
     PROFILE_ZONE("Physics");
+    g_trace_frame++;
+    struct DumpAtEnd {
+        uint64_t t0 = prof::now();
+        ~DumpAtEnd() {
+            if (trace_arm().frame == g_trace_frame) prof::g_trace = false, prof::trace_dump(trace_arm().path.c_str());
+            static const bool helpdbg = getenv("BL_HELPDBG") != nullptr; // (diagnostics: the team's chunks, the owners' and the helpers')
+            if (helpdbg) {
+                long long own, helped;
+                JobSystem::get().take_chunk_counts(own, helped);
+                printf("help %d: %.1f ms, chunks own %lld helped %lld (%.0f%%)\n", g_trace_frame, prof::ticks_to_ms(prof::now() - t0), own, helped, own + helped ? 100.0 * helped / (own + helped) : 0.0);
+            }
+        }
+    } dump_at_end;
     uint64_t t0 = prof::now();
     float frame_time = n * settings.dt;
     {
@@ -684,6 +764,12 @@ void World::collide_static(SoftBody& b, size_t n0, size_t n1, const std::vector<
     uint8_t* touch = b.ground_touch.size() == b.nodes.size() ? b.ground_touch.data() : nullptr;
     if (touch) // (bit 0: in this short step, the membrane's; bit 1: in this frame, the rest damping's support)
         for (size_t i = n0; i < n1; i++) touch[i] &= 2;
+    vec3* pen_out = nullptr; // (the plates' mid points take what their corners leave: SoftBody::tri_mids)
+    if (b.tri_mids && !b.fem.tris.empty()) {
+        if (b.static_pen.size() != b.nodes.size()) b.static_pen.assign(b.nodes.size(), vec3(0));
+        pen_out = b.static_pen.data();
+        for (size_t i = n0; i < n1; i++) pen_out[i] = vec3(0);
+    }
     for (int i = (int)n0; i < (int)n1; i++) {
         Node& x = nd[i];
         if (!(inf[i].flags & NF_GROUND) || x.inv_mass <= 0) continue;
@@ -724,6 +810,7 @@ void World::collide_static(SoftBody& b, size_t n0, size_t n1, const std::vector<
         if (!statics.collide_point(x.p, r, bp, nb, cp, nc, near_terrain, c)) continue;
         contacts++;
         if (touch) touch[i] = 3;
+        if (pen_out) pen_out[i] = c.normal * std::max(0.0f, c.depth);
         const GroundModel& gm = gms[c.surface < gms.size() ? c.surface : 0];
         if (c.max_force > 0) { // yielding obstacle (bush, bendable tree): it pushes back up to a limit
             vec3 f = primitive_collision(F[i], x.v, x.mass, c.normal, dt, gm, c.depth, inf[i].friction * fric_body, b.contact_push_max, b.contact_slop);
@@ -775,6 +862,212 @@ void World::collide_static(SoftBody& b, size_t n0, size_t n1, const std::vector<
     }
 }
 
+// A FEM plate's mid point (SoftBody::tri_mids): its triangle's three body nodes; false if it is torn out, a corner is
+// not `flag`'s or none can move
+static inline bool tri_mid(const SoftBody& b, size_t k, uint32_t* n, uint16_t flag) {
+    const FrameTri& t = b.fem.tris[k];
+    if (t.broken) return false;
+    float im = 0;
+    for (int j = 0; j < 3; j++) {
+        if (t.n[j] >= b.fem.node.size()) return false;
+        n[j] = b.fem.node[t.n[j]];
+        if (n[j] >= b.nodes.size() || !(b.info[n[j]].flags & flag)) return false;
+        im += b.nodes[n[j]].inv_mass;
+    }
+    return im > 0;
+}
+static inline vec3 tri_mid_p(const SoftBody& b, const uint32_t* n) { return (b.nodes[n[0]].p + b.nodes[n[1]].p + b.nodes[n[2]].p) * (1.0f / 3.0f); }
+// a plate against the collision volumes (collide_volumes): a FEM triangle (idx its FemFrame::tris) or a sheet
+// triangle (its Shell), its middle p and how far its corners stand off it (rad); parts: the body's volumes whose parts
+// hold all its corners, a bit each
+using MidPt = SoftBody::MidPoint;
+// ... its effective mass at its point of barycentric weights w (1 / sum w^2 / m), the point's velocity and the force
+// on it so far (that mass times its acceleration: what a contact there cancels)
+static inline float tri_state(const SoftBody& b, const uint32_t* n, const float* w, vec3& v, vec3& F) {
+    float W = 0;
+    vec3 acc(0);
+    v = vec3(0);
+    for (int j = 0; j < 3; j++) {
+        const Node& x = b.nodes[n[j]];
+        W += w[j] * w[j] * x.inv_mass;
+        v += x.v * w[j];
+        acc += b.force[n[j]] * (w[j] * x.inv_mass);
+    }
+    const float m = 1.0f / std::max(W, 1e-12f);
+    F = acc * m;
+    return m;
+}
+// A triangle against a collision volume's hull: the part of it inside (the triangle clipped by the hull's faces - none:
+// they do not meet), and the way out for it: through the face that part is nearest behind (its deepest point's way out
+// through each, the least) or across the triangle's plane (the hull's corners through it on the fewer side: a
+// volume's corner or edge through the middle of a plate). The contact at the inside part's middle: its barycentric
+// weights w, the normal (the triangle's way out) and the depth
+static bool tri_hull(const CollisionVolume& V, const vec3* T, float* w, vec3& nrm, float& depth) {
+    const size_t np = V.wplanes.size();
+    for (size_t k = 0; k < np; k++) { // (all three corners out past one face: apart)
+        const vec4& pl = V.wplanes[k];
+        const vec3 n = pl.xyz();
+        if (dot(n, T[0]) > pl.w && dot(n, T[1]) > pl.w && dot(n, T[2]) > pl.w) return false;
+    }
+    vec3 buf[2][24];
+    int cnt = 3;
+    buf[0][0] = T[0], buf[0][1] = T[1], buf[0][2] = T[2];
+    int cur = 0;
+    for (size_t k = 0; k < np && cnt > 0; k++) { // (Sutherland-Hodgman: kept where n . x <= d)
+        const vec3 n = V.wplanes[k].xyz();
+        const float d = V.wplanes[k].w;
+        const vec3* in = buf[cur];
+        vec3* out = buf[cur ^ 1];
+        int m = 0;
+        for (int i = 0; i < cnt && m < 22; i++) {
+            const vec3 a = in[i], b = in[(i + 1) % cnt];
+            const float sa = dot(n, a) - d, sb = dot(n, b) - d;
+            if (sa <= 0) out[m++] = a;
+            if ((sa < 0) != (sb < 0) && std::fabs(sa - sb) > 1e-12f) out[m++] = a + (b - a) * (sa / (sa - sb));
+        }
+        cnt = m, cur ^= 1;
+    }
+    if (cnt == 0) return false;
+    const vec3* poly = buf[cur];
+    vec3 c(0);
+    for (int i = 0; i < cnt; i++) c += poly[i] / (float)cnt;
+    float best = 1e30f;
+    for (size_t k = 0; k < np; k++) {
+        const vec3 n = V.wplanes[k].xyz();
+        float e = 0;
+        for (int i = 0; i < cnt; i++) e = std::max(e, V.wplanes[k].w - dot(n, poly[i]));
+        if (e < best) best = e, nrm = n;
+    }
+    const vec3 tn = cross(T[1] - T[0], T[2] - T[0]);
+    const float tl = length(tn);
+    if (tl > 1e-12f) {
+        const vec3 nt = tn / tl;
+        float hmin = 1e30f, hmax = -1e30f;
+        for (const vec3& h : V.wverts) {
+            const float s = dot(nt, h - T[0]);
+            hmin = std::min(hmin, s), hmax = std::max(hmax, s);
+        }
+        if (hmax > 0 && hmin < 0) {
+            if (hmax < best) best = hmax, nrm = nt;   // (the plate moved along its normal past the hull's corners)
+            if (-hmin < best) best = -hmin, nrm = -nt;
+        }
+        // (the middle's weights on the corners)
+        const vec3 e0 = T[1] - T[0], e1 = T[2] - T[0], q = c - T[0];
+        const float d00 = dot(e0, e0), d01 = dot(e0, e1), d11 = dot(e1, e1), d20 = dot(q, e0), d21 = dot(q, e1);
+        const float den = d00 * d11 - d01 * d01;
+        float v = den != 0 ? (d11 * d20 - d01 * d21) / den : 1.0f / 3, u = den != 0 ? (d00 * d21 - d01 * d20) / den : 1.0f / 3;
+        v = clampf(v, 0, 1), u = clampf(u, 0, 1);
+        if (v + u > 1) v /= v + u, u = 1 - v;
+        w[0] = 1 - v - u, w[1] = v, w[2] = u;
+    } else {
+        w[0] = w[1] = w[2] = 1.0f / 3;
+    }
+    depth = best;
+    return best > 0 && best < 1e29f;
+}
+// ... its effective mass at the middle (1 / sum w^2 / m), its velocity and the force on it so far (that mass times its
+// acceleration: what a contact there cancels)
+static inline float tri_mid_state(const SoftBody& b, const uint32_t* n, vec3& v, vec3& F) {
+    constexpr float kW = 1.0f / 3.0f;
+    float W = 0;
+    vec3 acc(0);
+    v = vec3(0);
+    for (int j = 0; j < 3; j++) {
+        const Node& x = b.nodes[n[j]];
+        W += kW * kW * x.inv_mass;
+        v += x.v * kW;
+        acc += b.force[n[j]] * (kW * x.inv_mass);
+    }
+    const float m = 1.0f / std::max(W, 1e-12f);
+    F = acc * m;
+    return m;
+}
+
+void World::collide_static_mids(SoftBody& b, const std::vector<int>& box_ids, const std::vector<int>& cyl_ids, float terrain_max_h, float dt, int& contacts) {
+    std::vector<StaticMid> hits;
+    static_mids_find(b, 0, b.fem.tris.size(), box_ids, cyl_ids, terrain_max_h, hits);
+    static_mids_apply(b, hits, dt, contacts);
+}
+
+void World::static_mids_find(const SoftBody& b, size_t k0, size_t k1, const std::vector<int>& box_ids, const std::vector<int>& cyl_ids, float terrain_max_h,
+                             std::vector<StaticMid>& out) const {
+    out.clear();
+    static const bool off = getenv("BL_NOMIDS") != nullptr;
+    if (off || !b.tri_mids || b.fem.tris.empty() || b.rigid || b.static_pen.size() != b.nodes.size() || b.force.size() != b.nodes.size()) return;
+    const int nbox = (int)box_ids.size(), ncyl = (int)cyl_ids.size();
+    const bool test_terrain = statics.has_terrain;
+    if (!test_terrain && nbox == 0 && ncyl == 0) return;
+    for (size_t k = k0; k < k1 && k < b.fem.tris.size(); k++) {
+        uint32_t n[3];
+        if (!tri_mid(b, k, n, NF_GROUND)) continue;
+        const vec3 p = tri_mid_p(b, n);
+        const bool near_terrain = test_terrain && p.y <= terrain_max_h + 0.05f;
+        if (!near_terrain && nbox == 0 && ncyl == 0) continue;
+        // (the obstacles it is within: most plates are near none)
+        int bids[16], cids[16];
+        const int* bp = box_ids.data();
+        const int* cp = cyl_ids.data();
+        int nb = nbox, nc = ncyl;
+        if (nbox <= 16 && ncyl <= 16) {
+            nb = nc = 0;
+            for (int q = 0; q < nbox; q++) {
+                const AABB& a = statics.boxes[box_ids[q]].aabb;
+                if (p.x >= a.mn.x - 0.01f && p.x <= a.mx.x + 0.01f && p.y >= a.mn.y - 0.01f && p.y <= a.mx.y + 0.01f && p.z >= a.mn.z - 0.01f && p.z <= a.mx.z + 0.01f)
+                    bids[nb++] = box_ids[q];
+            }
+            for (int q = 0; q < ncyl; q++) {
+                const StaticCylinder& cy = statics.cylinders[cyl_ids[q]];
+                const float cr = cy.radius + 0.01f;
+                if (std::fabs(p.x - cy.base.x) <= cr && std::fabs(p.z - cy.base.z) <= cr && p.y >= cy.base.y - 0.01f && p.y <= cy.base.y + cy.height + 0.01f)
+                    cids[nc++] = cyl_ids[q];
+            }
+            bp = bids;
+            cp = cids;
+            if (!near_terrain && nb == 0 && nc == 0) continue;
+        }
+        ContactInfo c;
+        if (!statics.collide_point(p, 0.0f, bp, nb, cp, nc, near_terrain, c) || !(c.depth > 0)) continue;
+        out.push_back({(uint32_t)k, {n[0], n[1], n[2]}, p, c});
+    }
+}
+
+void World::static_mids_apply(SoftBody& b, const std::vector<StaticMid>& hits, float dt, int& contacts) {
+    if (hits.empty()) return;
+    const auto& gms = ground_models();
+    const NodeInfo* inf = b.info.data();
+    const vec3* pen = b.static_pen.data();
+    vec3* F = b.force.data();
+    const float fric_body = b.ground_friction * (b.resting ? b.rest_friction : 1.0f);
+    if (b.mid_touch.size() != b.fem.tris.size()) b.mid_touch.assign(b.fem.tris.size(), 0);
+    constexpr float kW = 1.0f / 3.0f;
+    for (const StaticMid& h : hits) {
+        const uint32_t* n = h.n;
+        const ContactInfo& c = h.c;
+        // (of its depth, what its corners' own contacts leave at the middle)
+        const float depth = c.depth - kW * (std::max(0.0f, dot(pen[n[0]], c.normal)) + std::max(0.0f, dot(pen[n[1]], c.normal)) + std::max(0.0f, dot(pen[n[2]], c.normal)));
+        if (depth <= 0) continue;
+        vec3 v, Fm;
+        const float m = tri_mid_state(b, n, v, Fm);
+        const float fr = kW * (inf[n[0]].friction + inf[n[1]].friction + inf[n[2]].friction);
+        const GroundModel& gm = gms[c.surface < gms.size() ? c.surface : 0];
+        vec3 f = primitive_collision(Fm, v, m, c.normal, dt, gm, depth, fr * fric_body, b.contact_push_max, b.contact_slop, b.bounce);
+        if (c.max_force > 0 && length(f) > c.max_force) f *= c.max_force / length(f);
+        // (its corners' normal motion held in the frame's implicit step as a pressed node's, FemFrame::contact_n: a plate
+        // on a beam under its middle, pushed off by its mid point and back by its members, shook at 0.3 m/s)
+        const bool press = dot(f, c.normal) > 0;
+        for (int j = 0; j < 3; j++) {
+            F[n[j]] += f * kW;
+            if (const int sl = b.fem.slot(n[j]); sl >= 0) {
+                if (sl < (int)b.fem.contact_f.size()) b.fem.contact_f[sl] += f * kW;
+                if (press && sl < (int)b.fem.contact_n.size() && length2(b.fem.contact_n[sl]) == 0) b.fem.contact_n[sl] = c.normal;
+            }
+        }
+        contacts++;
+        b.mid_contacts++;
+        b.mid_touch[h.k] |= 1;
+    }
+}
+
 // A candidate pair of a node and a collision triangle (the broadphase): within r of it; a hull triangle (one-sided,
 // see Triangle::two_sided) also takes a node up to `depth` behind it over its face. tu: the triangle's unit normal.
 static inline bool near_triangle(vec3 p, vec3 a, vec3 b, vec3 c, vec3 tu, float r, bool two_sided, float depth) {
@@ -791,127 +1084,565 @@ static inline bool near_triangle(vec3 p, vec3 a, vec3 b, vec3 c, vec3 tu, float 
 // into it, their volumes' vertices inside it - and against the static world (its vertices; a pole through a face).
 // Each contact as the ground's (primitive_collision) on the effective mass of the pair, the volume's side onto its
 // anchors. Serial: a few volumes, a few contacts.
-void World::collide_volumes(Island& isl, float dt, bool bodies) {
+int World::collide_volumes(Island& isl, float dt, bool bodies, int stage) {
     PROFILE_ACCUM("Volumes");
-    bool any = false;
-    for (SoftBody* b : isl.bodies) any |= !b->volumes.empty() && !b->volume_pass;
-    if (!any) return;
-    for (SoftBody* b : isl.bodies)
-        if (!b->volumes.empty()) b->place_volumes();
     const GroundModel& gm = ground_models()[SURF_METAL];
     constexpr float kFric = 0.4f;
+    if (stage != 2) {
+    isl.vtasks.clear();
+    bool any = false;
+    for (SoftBody* b : isl.bodies) any |= !b->volumes.empty() && !b->volume_pass;
+    if (!any) return 0;
+    {
+        // (their fits side by side: a crash's crushed volumes, a few iterations each)
+        thread_local std::vector<std::pair<SoftBody*, uint32_t>> place;
+        place.clear();
+        for (SoftBody* b : isl.bodies)
+            for (uint32_t k = 0; k < (uint32_t)b->volumes.size(); k++) place.push_back({b, k});
+        std::vector<std::pair<SoftBody*, uint32_t>>& pl = place;
+        if (isl.team) isl.team->run((int)pl.size(), [&](int i) { pl[i].first->place_volume(pl[i].second); });
+        else
+            for (auto& x : pl) x.first->place_volume(x.second);
+    }
+    static const bool mids_off = getenv("BL_NOMIDS") != nullptr;
     const int nb = (int)isl.bodies.size();
+    // the bodies' plates' mid points this substep (SoftBody::tri_mids): each body's once, sorted along its longest axis
+    // (two cars side by side share their x) - its FEM triangles' and its sheet's (a sheet triangle on FEM nodes is its FEM
+    // triangle's), and of which of its volumes' parts all three corners are (the bit of each: a part's plate held off its
+    // body's volume). A volume looks at those in its range (each volume over every triangle of the other car cost 8 ms a
+    // frame in a head-on). Kept from substep to substep: their places moved and their order mended (insertion: nearly in
+    // order), made again when the body's triangles, sheet or volumes' parts change
+    using MidCache = SoftBody::MidCache;
+    // (each body's on a thread of its own: below)
+    auto mids_of = [&](int kb) -> MidCache& {
+        SoftBody& B = *isl.bodies[kb];
+        MidCache& mc = B.mid_cache;
+        size_t nparts = 0;
+        for (const CollisionVolume& cv : B.volumes) nparts += cv.parts.size();
+        if (mc.ntris != B.fem.tris.size() || mc.nshells != B.shells.size() || mc.nparts != nparts || mc.nnodes != B.nodes.size()) {
+            mc.ntris = B.fem.tris.size(), mc.nshells = B.shells.size(), mc.nparts = nparts, mc.nnodes = B.nodes.size();
+            mc.pts.clear();
+            std::vector<uint32_t> part_bits(B.nodes.size(), 0u);
+            for (size_t k = 0; k < B.volumes.size() && k < 32; k++)
+                for (uint32_t i : B.volumes[k].parts)
+                    if (i < part_bits.size()) part_bits[i] |= 1u << k;
+            mc.max_rad = 0;
+            auto add = [&](const uint32_t* n, uint32_t idx, bool fem) {
+                MidPt m;
+                m.p = tri_mid_p(B, n);
+                m.rad = 0;
+                for (int j = 0; j < 3; j++) m.rad = std::max(m.rad, length(B.nodes[n[j]].p - m.p));
+                m.rad += 0.05f; // (it stretches a little before it is made again)
+                mc.max_rad = std::max(mc.max_rad, m.rad);
+                m.n[0] = n[0], m.n[1] = n[1], m.n[2] = n[2];
+                m.idx = idx, m.fem = fem;
+                m.parts = part_bits[n[0]] & part_bits[n[1]] & part_bits[n[2]];
+                mc.pts.push_back(m);
+            };
+            for (uint32_t k = 0; k < (uint32_t)B.fem.tris.size(); k++) {
+                uint32_t n[3];
+                if (tri_mid(B, k, n, NF_CONTACTER)) add(n, k, true);
+            }
+            const bool fem_tris = !B.fem.tris.empty();
+            for (uint32_t si = 0; si < (uint32_t)B.shells.size(); si++) {
+                const Shell& sh = B.shells[si];
+                bool ok = true, on_fem = fem_tris;
+                float im = 0;
+                for (int j = 0; j < 3 && ok; j++) {
+                    ok = sh.n[j] < B.nodes.size() && (B.info[sh.n[j]].flags & NF_CONTACTER);
+                    if (ok) im += B.nodes[sh.n[j]].inv_mass, on_fem = on_fem && B.fem.slot(sh.n[j]) >= 0;
+                }
+                if (ok && !on_fem && im > 0) add(sh.n, si, false);
+            }
+            const vec3 ext = B.aabb.mx - B.aabb.mn;
+            mc.axis = ext.x >= ext.y && ext.x >= ext.z ? 0 : ext.y >= ext.z ? 1 : 2;
+            const int ax = mc.axis;
+            std::sort(mc.pts.begin(), mc.pts.end(), [ax](const MidPt& a, const MidPt& b) { return a.p[ax] < b.p[ax]; });
+            return mc;
+        }
+        // (their places now; a torn one out of reach; the order mended)
+        const int ax = mc.axis;
+        for (MidPt& m : mc.pts) {
+            const bool gone = m.fem ? (m.idx >= B.fem.tris.size() || B.fem.tris[m.idx].broken)
+                                    : (m.idx >= B.shells.size() || (B.shells[m.idx].tri < B.tris.size() && B.tris[B.shells[m.idx].tri].torn));
+            m.p = gone ? vec3(1e30f) : tri_mid_p(B, m.n);
+        }
+        for (size_t i = 1; i < mc.pts.size(); i++)
+            for (size_t j = i; j > 0 && mc.pts[j].p[ax] < mc.pts[j - 1].p[ax]; j--) std::swap(mc.pts[j], mc.pts[j - 1]);
+        return mc;
+    };
     auto overlap = [](vec3 amn, vec3 amx, vec3 bmn, vec3 bmx, float r) {
         return amn.x - r <= bmx.x && bmn.x - r <= amx.x && amn.y - r <= bmx.y && bmn.y - r <= amx.y && amn.z - r <= bmx.z && bmn.z - r <= amx.z;
     };
+    using VTask = Island::VTask;
+    using VHit = Island::VHit;
+    std::vector<VTask>& vtasks = isl.vtasks;
+    std::vector<std::vector<VHit>>& vhits = isl.vhits;
+    vtasks.clear();
     for (int ka = 0; ka < nb; ka++) {
         SoftBody& A = *isl.bodies[ka];
         if (A.volumes.empty() || A.volume_pass || A.force.size() != A.nodes.size()) continue;
-        const bool a_moves = !A.sleeping && !A.rigid;
         for (CollisionVolume& V : A.volumes) {
             if (!V.placed || !(V.mass > 0)) continue;
-            // a contact at p along n (out of the volume) pen deep, of a side of mass m moving at vel with force F on it;
-            // returns the force on that side (the volume takes it back)
-            auto contact = [&](vec3 p, vec3 n, float pen, float m, vec3 vel, vec3 F, bool other_moves) -> vec3 {
-                const float mv = a_moves ? V.mass : 1e30f, mo = other_moves ? m : 1e30f;
-                if (mv > 1e29f && mo > 1e29f) return vec3(0);
-                const float me = 1.0f / (1.0f / mv + 1.0f / mo);
-                const vec3 f = primitive_collision(other_moves ? F * (me / m) : vec3(0), vel - V.vel_at(p), me, n, dt, gm, pen, kFric);
-                if (a_moves) A.push_volume(V, p, -f);
-                return other_moves ? f : vec3(0);
-            };
-            int face;
-            // its body's parts (a door pushed in, the hood folded back): their nodes out of it, the reaction on its anchors
-            if (a_moves)
-                for (uint32_t i : V.parts) {
-                    if (i >= A.nodes.size()) continue;
-                    const Node& x = A.nodes[i];
-                    if (x.inv_mass <= 0) continue;
-                    if (x.p.x < V.mn.x || x.p.x > V.mx.x || x.p.y < V.mn.y || x.p.y > V.mx.y || x.p.z < V.mn.z || x.p.z > V.mx.z) continue;
-                    const float s = V.depth(x.p, face);
-                    if (s >= 0) continue;
-                    A.force[i] += contact(x.p, V.wplanes[face].xyz(), -s, x.mass, x.v, A.force[i], true);
+            if (V.break_force > 0) { // (its contacts of the last substep against its crush force)
+                V.crush = std::max(0.0f, V.crush + (V.load / V.break_force - 1.0f) * dt);
+                V.load = 0;
+                if (V.crush > CollisionVolume::kCrushTime) {
+                    V.broken = true, V.placed = false;
+                    continue;
                 }
-            if (bodies)
-                for (int kb = 0; kb < nb; kb++) {
-                    if (kb == ka) continue;
-                    SoftBody& B = *isl.bodies[kb];
-                    if (B.volume_pass || (A.sleeping && B.sleeping) || B.force.size() != B.nodes.size()) continue;
-                    if (!overlap(V.mn, V.mx, B.aabb.mn, B.aabb.mx, 0.5f)) continue;
-                    const bool b_moves = !B.sleeping && !B.rigid;
-                    // its nodes
-                    for (size_t i = 0; i < B.nodes.size(); i++) {
-                        const Node& x = B.nodes[i];
-                        if (x.inv_mass <= 0 || !(B.info[i].flags & NF_CONTACTER)) continue;
-                        if (x.p.x < V.mn.x || x.p.x > V.mx.x || x.p.y < V.mn.y || x.p.y > V.mx.y || x.p.z < V.mn.z || x.p.z > V.mx.z) continue;
-                        const float s = V.depth(x.p, face);
-                        if (s >= 0) continue;
-                        B.force[i] += contact(x.p, V.wplanes[face].xyz(), -s, x.mass, x.v, B.force[i], b_moves);
-                        B.body_contacts++;
-                    }
-                    // its balls
-                    for (const Capsule& cp : B.capsules) {
-                        if (cp.a != cp.b || cp.a >= B.nodes.size()) continue;
-                        const Node& x = B.nodes[cp.a];
-                        if (x.inv_mass <= 0) continue;
-                        const float s = V.depth(x.p, face);
-                        if (s >= cp.radius) continue;
-                        B.force[cp.a] += contact(x.p - V.wplanes[face].xyz() * s, V.wplanes[face].xyz(), cp.radius - s, x.mass, x.v, B.force[cp.a], b_moves);
-                        B.body_contacts++;
-                    }
-                    // its volumes' vertices
-                    for (CollisionVolume& W : B.volumes) {
-                        if (!W.placed || !(W.mass > 0) || !overlap(V.mn, V.mx, W.mn, W.mx, 0.0f)) continue;
-                        const float mw = W.mass / (float)W.wverts.size();
-                        for (const vec3& p : W.wverts) {
-                            const float s = V.depth(p, face);
-                            if (s >= 0) continue;
-                            const vec3 f = contact(p, V.wplanes[face].xyz(), -s, mw, W.vel_at(p), vec3(0), b_moves);
-                            if (b_moves) B.push_volume(W, p, f);
-                        }
-                    }
-                }
-            if (!a_moves) continue;
-            // the static world: its vertices (the effective mass shared by the ones touching), a pole through a face
-            const std::vector<int>& bids = isl.box_ids[ka];
-            const std::vector<int>& cids = isl.cyl_ids[ka];
-            thread_local std::vector<std::pair<int, ContactInfo>> hits;
-            hits.clear();
-            const bool near_terrain = statics.has_terrain && V.mn.y <= isl.terrain_max[ka] + 0.05f;
-            for (int k = 0; k < (int)V.wverts.size(); k++) {
-                ContactInfo ci;
-                if (statics.collide_point(V.wverts[k], 0.0f, bids.data(), (int)bids.size(), cids.data(), (int)cids.size(), near_terrain, ci) && ci.depth > 0)
-                    hits.push_back({k, ci});
             }
-            for (const auto& [k, ci] : hits) {
-                const vec3 p = V.wverts[k];
-                const GroundModel& g = ground_models()[ci.surface < SURF_COUNT ? ci.surface : 0];
-                vec3 f = primitive_collision(vec3(0), V.vel_at(p), V.mass / (float)hits.size(), ci.normal, dt, g, ci.depth, kFric);
-                if (ci.max_force > 0 && length(f) > ci.max_force) f *= ci.max_force / length(f);
-                A.push_volume(V, p, f);
-            }
-            for (int id : cids) {
-                if (id < 0 || id >= (int)statics.cylinders.size()) continue;
-                const StaticCylinder& cy = statics.cylinders[id];
-                if (cy.base.x + cy.radius < V.mn.x || cy.base.x - cy.radius > V.mx.x || cy.base.z + cy.radius < V.mn.z || cy.base.z - cy.radius > V.mx.z) continue;
-                const float y0 = std::max(V.mn.y, cy.base.y), y1 = std::min(V.mx.y, cy.base.y + cy.height);
-                if (y1 <= y0) continue;
-                // (its axis at a few heights through the hull: the deepest one)
-                float best = 1e30f;
-                vec3 bp(0), bn(0);
-                for (int m = 0; m < 5; m++) {
-                    const vec3 q(cy.base.x, y0 + (y1 - y0) * (m + 0.5f) / 5.0f, cy.base.z);
-                    const float s = V.depth(q, face);
-                    vec3 nh = V.wplanes[face].xyz();
-                    nh.y = 0;
-                    if (s < best && length2(nh) > 0.25f) best = s, bp = q, bn = normalize(nh);
+            vtasks.push_back({ka, &V});
+        }
+    }
+    if (vtasks.empty()) return 0;
+    // (the plates' mid points of every body a volume may look at, made here: the chunks only read them)
+    std::vector<const MidCache*>& mids = isl.vmids;
+    mids.assign(nb, nullptr);
+    isl.vbodies = bodies;
+    if (!mids_off) {
+        PROFILE_ACCUM("Volume mids");
+        std::vector<int>& with = isl.vmid_bodies;
+        with.clear();
+        for (int kb = 0; kb < nb; kb++)
+            if (isl.bodies[kb]->tri_mids) with.push_back(kb);
+        auto one = [&](int q) { mids[with[q]] = &mids_of(with[q]); };
+        if (isl.team) isl.team->run((int)with.size(), one);
+        else
+            for (int q = 0; q < (int)with.size(); q++) one(q);
+    }
+    // (each volume's look in parts, each a chunk of the team: its own body's parts, then per other body its nodes, its
+    // plates, the rest of it, then the static world - the hits in that order; one chunk a volume, the bumpers' against
+    // the other car were the whole stage)
+    using VSub = Island::VSub;
+    std::vector<VSub>& vsubs = isl.vsubs;
+    std::vector<int>& vsub_ptr = isl.vsub_ptr;
+    vsubs.clear(), vsub_ptr.assign(vtasks.size() + 1, 0);
+    for (size_t t = 0; t < vtasks.size(); t++) {
+        const int ka = vtasks[t].ka;
+        const SoftBody& A = *isl.bodies[ka];
+        const CollisionVolume& V = *vtasks[t].V;
+        vsubs.push_back({(int)t, ka, 0, 0, 0});
+        if (bodies)
+            for (int kb = 0; kb < nb; kb++) {
+                if (kb == ka) continue;
+                const SoftBody& B = *isl.bodies[kb];
+                if (B.volume_pass || (A.sleeping && B.sleeping) || B.force.size() != B.nodes.size()) continue;
+                if (!overlap(V.mn, V.mx, B.aabb.mn, B.aabb.mx, 0.5f)) continue;
+                vsubs.push_back({(int)t, kb, 1, 0, 0});
+                // (the plates in the volume's range along their axis, in chunks: a bumper against the other car's
+                // crushed front was one long chunk)
+                if (B.tri_mids && mids[kb]) {
+                    const MidCache& mc = *mids[kb];
+                    const int ax = mc.axis;
+                    const float lo = V.mn[ax] - mc.max_rad, hi = V.mx[ax] + mc.max_rad;
+                    const uint32_t a = (uint32_t)(std::lower_bound(mc.pts.begin(), mc.pts.end(), lo, [ax](const MidPt& m, float x) { return m.p[ax] < x; }) - mc.pts.begin());
+                    const uint32_t e = (uint32_t)(std::upper_bound(mc.pts.begin(), mc.pts.end(), hi, [ax](float x, const MidPt& m) { return x < m.p[ax]; }) - mc.pts.begin());
+                    constexpr uint32_t kMidChunk = 48;
+                    for (uint32_t c = a; c < e; c += kMidChunk) vsubs.push_back({(int)t, kb, 2, c, std::min(e, c + kMidChunk)});
                 }
-                if (best >= cy.radius) continue;
-                const GroundModel& g = ground_models()[cy.surface < SURF_COUNT ? cy.surface : 0];
-                const vec3 f = primitive_collision(vec3(0), V.vel_at(bp), V.mass, -bn, dt, g, cy.radius - best, kFric);
-                A.push_volume(V, bp - bn * best, f);
+                vsubs.push_back({(int)t, kb, 3, 0, 0});
+            }
+        vsubs.push_back({(int)t, ka, 4, 0, 0});
+        vsub_ptr[t + 1] = (int)vsubs.size();
+    }
+    if (vhits.size() < vsubs.size()) vhits.resize(vsubs.size());
+    if (stage == 1) return (int)vsubs.size(); // (volume_find in the forces' team stage, then stage 2)
+    {
+        PROFILE_ACCUM("Volume find");
+        if (isl.team) isl.team->run((int)vsubs.size(), [&](int sq) { volume_find(isl, sq); });
+        else
+            for (int t = 0; t < (int)vsubs.size(); t++) volume_find(isl, t);
+    }
+    }
+    // the contacts' forces, in order
+    PROFILE_ACCUM("Volume push");
+    using VHit = Island::VHit;
+    const std::vector<Island::VTask>& vtasks = isl.vtasks;
+    const std::vector<std::vector<VHit>>& vhits = isl.vhits;
+    const std::vector<int>& vsub_ptr = isl.vsub_ptr;
+    for (size_t t = 0; t < vtasks.size(); t++) {
+        const int ka = vtasks[t].ka;
+        SoftBody& A = *isl.bodies[ka];
+        CollisionVolume& V = *vtasks[t].V;
+        const bool a_moves = !A.sleeping && !A.rigid;
+        // a contact at p along n (out of the volume) pen deep, of a side of mass m moving at vel with force F on it;
+        // returns the force on that side (the volume takes it back)
+        auto contact = [&](vec3 p, vec3 n, float pen, float m, vec3 vel, vec3 F, bool other_moves) -> vec3 {
+            const float mv = a_moves ? V.mass : 1e30f, mo = other_moves ? m : 1e30f;
+            if (mv > 1e29f && mo > 1e29f) return vec3(0);
+            const float me = 1.0f / (1.0f / mv + 1.0f / mo);
+            const vec3 f = primitive_collision(other_moves ? F * (me / m) : vec3(0), vel - V.vel_at(p), me, n, dt, gm, pen, kFric);
+            if (a_moves) A.push_volume(V, p, -f);
+            V.load += length(f);
+            return other_moves ? f : vec3(0);
+        };
+        for (int sq = vsub_ptr[t]; sq < vsub_ptr[t + 1]; sq++)
+        for (const VHit& h : vhits[sq]) {
+            SoftBody& B = *isl.bodies[h.kb];
+            switch (h.kind) {
+            case 0:
+            case 2:
+            case 4: {
+                const Node& x = B.nodes[h.i];
+                B.force[h.i] += contact(h.p, h.n, h.pen, x.mass, x.v, B.force[h.i], h.moves);
+                if (h.kind != 0) B.body_contacts++;
+                break;
+            }
+            case 1:
+            case 3: {
+                // (on the plate's effective mass there; the force onto the corners by their weights)
+                vec3 v, Fm;
+                const float me = tri_state(B, h.n3, h.w, v, Fm);
+                const vec3 f = contact(h.p, h.n, h.pen, me, v, Fm, h.moves);
+                for (int j = 0; j < 3; j++) B.force[h.n3[j]] += f * h.w[j];
+                if (h.fem) {
+                    if (B.mid_touch.size() != B.fem.tris.size()) B.mid_touch.assign(B.fem.tris.size(), 0);
+                    if (h.i < B.mid_touch.size()) B.mid_touch[h.i] |= 4;
+                }
+                B.mid_contacts++;
+                if (h.kind == 3) B.body_contacts++;
+                break;
+            }
+            case 5: {
+                CollisionVolume& W = B.volumes[h.i];
+                const vec3 f = contact(h.p, h.n, h.pen, h.extra, W.vel_at(h.p), vec3(0), h.moves);
+                if (h.moves) B.push_volume(W, h.p, f);
+                break;
+            }
+            case 6: {
+                const GroundModel& g = ground_models()[h.i < SURF_COUNT ? h.i : 0];
+                vec3 f = primitive_collision(vec3(0), V.vel_at(h.p), V.mass / (float)h.n3[0], h.n, dt, g, h.pen, kFric);
+                if (h.extra > 0 && length(f) > h.extra) f *= h.extra / length(f);
+                A.push_volume(V, h.p, f);
+                V.load += length(f);
+                break;
+            }
+            default: {
+                const GroundModel& g = ground_models()[h.i < SURF_COUNT ? h.i : 0];
+                const vec3 f = primitive_collision(vec3(0), V.vel_at(h.p), V.mass, -h.n, dt, g, h.pen, kFric);
+                A.push_volume(V, h.p - h.n * h.extra, f);
+                V.load += length(f);
+                break;
+            }
             }
         }
+    }
+    return 0;
+}
+
+// One part of one volume's look (Island::VSub): the geometry alone, any order and thread (collide_volumes, stage 1:
+// beside the forces); its hits in its own list
+void World::volume_find(Island& isl, int sq) {
+    PROFILE_ACCUM("Volume task");
+    static prof::Zone* const part_zone[5] = {prof::zone("Volume own"), prof::zone("Volume nodes"), prof::zone("Volume plates"), prof::zone("Volume balls"), prof::zone("Volume static")};
+    prof::AccumScope part_scope(part_zone[std::min<int>(4, isl.vsubs[sq].part)]);
+    using VHit = Island::VHit;
+    const std::vector<Island::VTask>& tasks = isl.vtasks;
+    const std::vector<Island::VSub>& subs = isl.vsubs;
+    std::vector<std::vector<VHit>>& hits = isl.vhits;
+    const std::vector<const SoftBody::MidCache*>& mid_of = isl.vmids;
+    using MidCache = SoftBody::MidCache;
+    auto overlap = [](vec3 amn, vec3 amx, vec3 bmn, vec3 bmx, float r) {
+        return amn.x - r <= bmx.x && bmn.x - r <= amx.x && amn.y - r <= bmx.y && bmn.y - r <= amx.y && amn.z - r <= bmx.z && bmn.z - r <= amx.z;
+    };
+    {
+        PROFILE_ACCUM("Volume task");
+        std::vector<VHit>& out = hits[sq];
+        out.clear();
+        const int t = subs[sq].t, part = subs[sq].part;
+        const int ka = tasks[t].ka;
+        SoftBody& A = *isl.bodies[ka];
+        CollisionVolume& V = *tasks[t].V;
+        const bool a_moves = !A.sleeping && !A.rigid;
+        int face;
+        const uint32_t vbit = (size_t)(&V - A.volumes.data()) < 32 ? 1u << (uint32_t)(&V - A.volumes.data()) : 0u;
+        // a plate in it (a FEM triangle or a sheet's, SoftBody::tri_mids): the triangle against the hull (tri_hull), the
+        // contact at the middle of its part inside, of the depth what its corners in it (their own contacts) leave at
+        // that point
+        auto mid = [&](const SoftBody& B, int kb, const MidPt& m, bool moves, uint8_t kind) {
+            const vec3 T[3] = {B.nodes[m.n[0]].p, B.nodes[m.n[1]].p, B.nodes[m.n[2]].p};
+            const vec3 lo = vmin(T[0], vmin(T[1], T[2])), hi = vmax(T[0], vmax(T[1], T[2]));
+            if (hi.x < V.mn.x || lo.x > V.mx.x || hi.y < V.mn.y || lo.y > V.mx.y || hi.z < V.mn.z || lo.z > V.mx.z) return;
+            float w[3], depth;
+            vec3 nrm;
+            if (!tri_hull(V, T, w, nrm, depth)) return;
+            float held = 0; // (its corners inside: their own contacts, their share at the point)
+            for (int j = 0; j < 3; j++) {
+                int f2;
+                const float s2 = V.depth(T[j], f2);
+                if (s2 < 0) held -= w[j] * s2;
+            }
+            // (3 mm of it let be: a panel skin resting a hair into a volume flush with it shook, 14 mm/s rms against 9)
+            constexpr float kSlop = 0.003f;
+            if (depth - held <= kSlop) return;
+            VHit h{};
+            h.kind = kind, h.moves = moves, h.fem = m.fem, h.kb = kb, h.i = m.idx;
+            for (int j = 0; j < 3; j++) h.n3[j] = m.n[j], h.w[j] = w[j];
+            h.p = T[0] * w[0] + T[1] * w[1] + T[2] * w[2];
+            h.n = nrm, h.pen = depth - held - kSlop;
+            out.push_back(h);
+        };
+        // (the mid points of a body within the volume's range along the axis they are sorted by)
+        auto in_x = [&](int kb, auto&& fn) {
+            const MidCache& mc = *mid_of[kb];
+            const int ax = mc.axis;
+            const float lo = V.mn[ax] - mc.max_rad, hi = V.mx[ax] + mc.max_rad; // (a triangle reaching in from outside)
+            auto it = std::lower_bound(mc.pts.begin(), mc.pts.end(), lo, [ax](const MidPt& m, float x) { return m.p[ax] < x; });
+            for (; it != mc.pts.end() && it->p[ax] <= hi; ++it)
+                if (it->p.x >= V.mn.x - it->rad && it->p.x <= V.mx.x + it->rad) fn(*it);
+        };
+        auto node_hit = [&](uint8_t kind, int kb, uint32_t i, vec3 p, vec3 n, float pen, bool moves) {
+            VHit h{};
+            h.kind = kind, h.moves = moves, h.kb = kb, h.i = i, h.p = p, h.n = n, h.pen = pen;
+            out.push_back(h);
+        };
+        // its body's parts (a door pushed in, the hood folded back): their nodes out of it, the reaction on its anchors
+        if (part == 0 && a_moves) {
+            static prof::Zone* const zn = prof::zone("Volume own nodes");
+            static prof::Zone* const zm = prof::zone("Volume own plates");
+            prof::AccumScope sn(zn);
+            for (uint32_t i : V.parts) {
+                if (i >= A.nodes.size()) continue;
+                const Node& x = A.nodes[i];
+                if (x.inv_mass <= 0) continue;
+                if (x.p.x < V.mn.x || x.p.x > V.mx.x || x.p.y < V.mn.y || x.p.y > V.mx.y || x.p.z < V.mn.z || x.p.z > V.mx.z) continue;
+                const float s2 = V.depth_in(x.p, face);
+                if (s2 >= 0) continue;
+                node_hit(0, ka, i, x.p, V.wplanes[face].xyz(), -s2, true);
+            }
+            prof::AccumScope sm(zm);
+            if (A.tri_mids && mid_of[ka] && vbit)
+                in_x(ka, [&](const MidPt& m) { if (m.parts & vbit) mid(A, ka, m, true, 1); });
+        }
+        if (part >= 1 && part <= 3) {
+            const int kb = subs[sq].kb;
+            {
+                const SoftBody& B = *isl.bodies[kb];
+                const bool b_moves = !B.sleeping && !B.rigid;
+                // its nodes
+                for (size_t i = 0; part == 1 && i < B.nodes.size(); i++) {
+                    const Node& x = B.nodes[i];
+                    if (x.inv_mass <= 0 || !(B.info[i].flags & NF_CONTACTER)) continue;
+                    if (x.p.x < V.mn.x || x.p.x > V.mx.x || x.p.y < V.mn.y || x.p.y > V.mx.y || x.p.z < V.mn.z || x.p.z > V.mx.z) continue;
+                    const float s2 = V.depth_in(x.p, face);
+                    if (s2 >= 0) continue;
+                    node_hit(2, kb, (uint32_t)i, x.p, V.wplanes[face].xyz(), -s2, b_moves);
+                }
+                // its plates' mid points (a range of them)
+                if (part == 2) {
+                    const MidCache& mc = *mid_of[kb];
+                    for (uint32_t q = subs[sq].i0; q < subs[sq].i1 && q < mc.pts.size(); q++) {
+                        const MidPt& m = mc.pts[q];
+                        if (m.p.x >= V.mn.x - m.rad && m.p.x <= V.mx.x + m.rad) mid(B, kb, m, b_moves, 3);
+                    }
+                }
+                if (part != 3) return;
+                // its balls
+                for (const Capsule& cp : B.capsules) {
+                    if (cp.a != cp.b || cp.a >= B.nodes.size()) continue;
+                    const Node& x = B.nodes[cp.a];
+                    if (x.inv_mass <= 0) continue;
+                    const float s2 = V.depth(x.p, face);
+                    if (s2 >= cp.radius) continue;
+                    node_hit(4, kb, cp.a, x.p - V.wplanes[face].xyz() * s2, V.wplanes[face].xyz(), cp.radius - s2, b_moves);
+                }
+                // its volumes' vertices
+                for (size_t wi = 0; wi < B.volumes.size(); wi++) {
+                    const CollisionVolume& W = B.volumes[wi];
+                    if (!W.placed || !(W.mass > 0) || !overlap(V.mn, V.mx, W.mn, W.mx, 0.0f)) continue;
+                    const float mw = W.mass / (float)W.wverts.size();
+                    for (const vec3& p : W.wverts) {
+                        const float s2 = V.depth_in(p, face);
+                        if (s2 >= 0) continue;
+                        VHit h{};
+                        h.kind = 5, h.moves = b_moves, h.kb = kb, h.i = (uint32_t)wi, h.p = p, h.n = V.wplanes[face].xyz(), h.pen = -s2, h.extra = mw;
+                        out.push_back(h);
+                    }
+                }
+            }
+            return;
+        }
+        if (part != 4 || !a_moves || V.tyre) return; // (a ring tyre's: its tyre meets the static world)
+        // the static world: its vertices (the effective mass shared by the ones touching), a pole through a face
+        const std::vector<int>& bids = isl.box_ids[ka];
+        const std::vector<int>& cids = isl.cyl_ids[ka];
+        const bool near_terrain = statics.has_terrain && V.mn.y <= isl.terrain_max[ka] + 0.05f;
+        const size_t first = out.size();
+        for (int k = 0; k < (int)V.wverts.size(); k++) {
+            ContactInfo ci;
+            if (statics.collide_point(V.wverts[k], 0.0f, bids.data(), (int)bids.size(), cids.data(), (int)cids.size(), near_terrain, ci) && ci.depth > 0) {
+                VHit h{};
+                h.kind = 6, h.kb = ka, h.i = ci.surface, h.p = V.wverts[k], h.n = ci.normal, h.pen = ci.depth, h.extra = ci.max_force;
+                out.push_back(h);
+            }
+        }
+        const uint32_t nst = (uint32_t)(out.size() - first);
+        for (size_t q = first; q < out.size(); q++) out[q].n3[0] = nst; // (how many share the mass)
+        for (int id : cids) {
+            if (id < 0 || id >= (int)statics.cylinders.size()) continue;
+            const StaticCylinder& cy = statics.cylinders[id];
+            if (cy.base.x + cy.radius < V.mn.x || cy.base.x - cy.radius > V.mx.x || cy.base.z + cy.radius < V.mn.z || cy.base.z - cy.radius > V.mx.z) continue;
+            const float y0 = std::max(V.mn.y, cy.base.y), y1 = std::min(V.mx.y, cy.base.y + cy.height);
+            if (y1 <= y0) continue;
+            // (its axis at a few heights through the hull: the deepest one)
+            float best = 1e30f;
+            vec3 bp(0), bn(0);
+            for (int m = 0; m < 5; m++) {
+                const vec3 q(cy.base.x, y0 + (y1 - y0) * (m + 0.5f) / 5.0f, cy.base.z);
+                const float s2 = V.depth(q, face);
+                vec3 nh = V.wplanes[face].xyz();
+                nh.y = 0;
+                if (s2 < best && length2(nh) > 0.25f) best = s2, bp = q, bn = normalize(nh);
+            }
+            if (best >= cy.radius) continue;
+            VHit h{};
+            h.kind = 7, h.kb = ka, h.i = cy.surface, h.p = bp, h.n = bn, h.pen = cy.radius - best, h.extra = best;
+            out.push_back(h);
+        }
+    }
+}
+
+// The ring tyres (Wheel::ring): the rim a rigid disc turning on the axle, the tyre a ring of points over it - its
+// tread's in rows across it and its sidewalls' - each pressed into the static world (the ground, a curb, a wall)
+// pushing back with a stiffness and a damping per area of the tyre; the tread's points in contact held on the ground by
+// their shear (a brush: each point's own since it came into the patch, as the rim turns it through) up to the ground's
+// grip, sliding past it (the rubber keeps 85% of it), let go as they leave. Onto the axle nodes: the force at the
+// centre and the moment across the axle as a pair; the moment along it into the rim's spin with the drive and the
+// brake (which holds the rim up to its torque), their reaction onto the wheel's arm.
+void World::ring_tyres(SoftBody& b, const std::vector<int>& box_ids, const std::vector<int>& cyl_ids, float terrain_max_h, float dt) {
+    const auto& gms = ground_models();
+    Node* nd = b.nodes.data();
+    vec3* F = b.force.data();
+    const float fric_body = b.ground_friction * (b.resting ? b.rest_friction : 1.0f) * settings.tyre_grip;
+    constexpr int kRows = Wheel::kRingRows;
+    for (Wheel& w : b.wheels) {
+        if (!w.ring || w.detached || w.axle0 >= b.nodes.size() || w.axle1 >= b.nodes.size()) continue;
+        const Node& n0 = nd[w.axle0];
+        const Node& n1 = nd[w.axle1];
+        vec3 a = n1.p - n0.p;
+        const float L = length(a);
+        if (!(L > 1e-4f)) continue;
+        a = a / L;
+        const vec3 c = (n0.p + n1.p) * 0.5f, vc = (n0.v + n1.v) * 0.5f;
+        // the rim's frame: its reference carried along as the axle turns, the rim's angle on it
+        vec3 e1 = w.ref - a * dot(w.ref, a);
+        e1 = length2(e1) > 1e-8f ? normalize(e1) : normalize(any_perpendicular(a));
+        w.ref = e1;
+        const vec3 e2 = cross(a, e1);
+        const int N = std::max(8, w.ring_n);
+        if ((int)w.shear.size() != N * kRows) w.shear.assign(N * kRows, vec3(0));
+        if ((int)w.squash.size() != N) w.squash.assign(N, 0.0f), w.shift.assign(N, vec3(0));
+        const float R = w.radius, W = w.width, rim = std::min(w.rim_radius, 0.95f * R);
+        const float wall = std::max(0.01f, R - rim);
+        const bool terrain = statics.has_terrain && c.y - R <= terrain_max_h + 0.05f;
+        vec3 Ft(0), Mt(0);
+        float load = 0;
+        if (terrain || !box_ids.empty() || !cyl_ids.empty()) {
+            const float dA = 2.0f * kPi * R / (float)N * W / (float)kRows;
+            const float dAs = 2.0f * kPi * (R - 0.5f * wall) / (float)(N / 2) * 0.5f * wall;
+            auto touch = [&](vec3 q, ContactInfo& ci) {
+                return statics.collide_point(q, 0.0f, box_ids.data(), (int)box_ids.size(), cyl_ids.data(), (int)cyl_ids.size(), terrain && q.y <= terrain_max_h + 0.05f, ci) &&
+                       ci.depth > 0;
+            };
+            for (int i = 0; i < N; i++) {
+                const float th = w.angle + 2.0f * kPi * (float)i / (float)N;
+                const vec3 d = e1 * std::cos(th) + e2 * std::sin(th);
+                float sq = 0;
+                vec3 sh(0);
+                for (int j = 0; j < kRows; j++) {
+                    vec3& u = w.shear[i * kRows + j];
+                    const vec3 q = c + a * (((float)j - 0.5f * (kRows - 1)) * W / (float)kRows) + d * R;
+                    ContactInfo ci;
+                    if (!touch(q, ci)) {
+                        u = vec3(0);
+                        continue;
+                    }
+                    const GroundModel& gm = gms[ci.surface < gms.size() ? ci.surface : 0];
+                    const vec3 n = ci.normal;
+                    const float pen = std::min(ci.depth, wall); // (no deeper than the sidewall: the rim)
+                    // (damped as the wheel comes down on the ground, not as its tread turns into the patch: that is the
+                    // rolling resistance, taken apart below)
+                    const vec3 vq = vc + cross(a * w.spin, q - c);
+                    const float fn = (w.k_area * pen - w.c_area * dot(vc, n)) * dA;
+                    if (!(fn > 0)) {
+                        u = vec3(0);
+                        continue;
+                    }
+                    // the brush: the tread's tip stuck to the ground, sheared as its base moves on
+                    const vec3 vt = vq - n * dot(vq, n);
+                    u -= n * dot(u, n);
+                    u -= vt * dt;
+                    vec3 ft = (u * w.k_shear - vt * w.c_shear) * dA;
+                    const float cap = fn * gm.ms * gm.strength * w.grip * fric_body;
+                    const float fl = length(ft);
+                    if (fl > cap) { // (sliding: the rubber keeps 85% of the grip, the shear what that holds)
+                        ft *= 0.85f * cap / fl;
+                        u = ft / (w.k_shear * dA);
+                    }
+                    const vec3 f = n * fn + ft;
+                    Ft += f;
+                    Mt += cross(q - c, f);
+                    load += fn;
+                    sq = std::max(sq, std::min(wall, pen / std::max(0.3f, -dot(d, n))));
+                    sh += u / (float)kRows;
+                }
+                w.squash[i] = sq;
+                w.shift[i] = sh;
+                // the sidewalls (every other point round them): pushed by a wall, a curb's face; their rubber's grip
+                if (i % 2) continue;
+                for (int j = 0; j < 2; j++) {
+                    const vec3 q = c + a * ((j ? 0.5f : -0.5f) * W) + d * (R - 0.5f * wall);
+                    ContactInfo ci;
+                    if (!touch(q, ci)) continue;
+                    const vec3 vq = vc + cross(a * w.spin, q - c);
+                    const float fn = (w.k_area * std::min(ci.depth, 0.5f * W) - w.c_area * dot(vc, ci.normal)) * dAs;
+                    if (!(fn > 0)) continue;
+                    const vec3 vt = vq - ci.normal * dot(vq, ci.normal);
+                    const float vl = length(vt);
+                    const vec3 f = ci.normal * fn - (vl > 1e-4f ? vt * (std::min(0.8f * fn, vl * w.c_shear * dAs) / vl) : vec3(0));
+                    Ft += f;
+                    Mt += cross(q - c, f);
+                    load += fn;
+                }
+            }
+        } else {
+            std::fill(w.shear.begin(), w.shear.end(), vec3(0));
+            std::fill(w.squash.begin(), w.squash.end(), 0.0f);
+            std::fill(w.shift.begin(), w.shift.end(), vec3(0));
+        }
+        // onto the axle: the force at the centre, the moment across it as a pair on its two nodes
+        const float Ma = dot(Mt, a);
+        const vec3 pair = cross(Mt - a * Ma, a) / L;
+        F[w.axle0] += Ft * 0.5f - pair;
+        F[w.axle1] += Ft * 0.5f + pair;
+        // the spin: the ground's moment, the drive's, the rolling resistance's (its load times Crr at its radius, no more
+        // than stops it); the brake holds the rim up to its torque
+        const float Td = w.propulsed == 2 ? -w.torque : w.torque;
+        float spin = w.spin + dt * (Td + Ma) / w.inertia, Tb = 0;
+        const float rr = dt * w.crr * load * R / w.inertia;
+        spin = std::fabs(spin) <= rr ? 0.0f : spin - std::copysign(rr, spin);
+        if (w.brake > 0) {
+            const float lim = dt * w.brake / w.inertia;
+            if (std::fabs(spin) <= lim) Tb = -spin * w.inertia / dt, spin = 0;
+            else Tb = -std::copysign(w.brake, spin), spin -= std::copysign(lim, spin);
+        }
+        if (!std::isfinite(spin)) spin = 0;
+        w.spin = spin;
+        w.angle = std::fmod(w.angle + spin * dt, 2.0f * kPi);
+        w.load = load;
+        // the drive's and the brake's reaction onto the wheel's support (as Wheel's arm takes the node wheels')
+        const float T = Td + Tb;
+        if (w.arm >= 0 && w.near_attach >= 0 && std::fabs(T) > 0.01f) {
+            const vec3 rr = nd[w.arm].p - nd[w.near_attach].p, r = rr - a * dot(rr, a);
+            const float off = length(rr - r), rl = length(r);
+            if (rl > 0.01f && 2 * off < rl) {
+                const vec3 cf = cross(a, r / rl) * (0.5f * T / rl) * (1.0f - 2.0f * off / rl);
+                F[w.arm] -= cf;
+                F[w.near_attach] += cf;
+            }
+        }
+        w.torque = 0;
     }
 }
 
@@ -922,8 +1653,11 @@ void World::rebuild_pairs(Island& isl) {
     const double bp_t0 = bp_dbg ? time_seconds() : 0.0;
     double bp_t[8] = {};
     int bp_k = 0;
+    int bp_mark = 0;
     auto bp_lap = [&]() {
         if (bp_dbg && bp_k < 8) bp_t[bp_k++] = time_seconds();
+        if (prof::g_trace) prof::trace_mark("bp", bp_mark);
+        bp_mark++;
     };
     isl.nt.clear();
     isl.nc.clear();
@@ -1041,7 +1775,7 @@ void World::rebuild_pairs(Island& isl) {
             if (!(b.info[ni].flags & NF_CONTACTER)) continue;
             vec3 p = b.nodes[ni].p;
             if (!near_partner(bi, p, p)) continue;
-            Island::Pt pt{(uint16_t)bi, ni, cell_of(p.x), cell_of(p.y), cell_of(p.z)};
+            Island::Pt pt{(uint16_t)bi, ni, cell_of(p.x), cell_of(p.y), cell_of(p.z), p};
             isl.entries.push_back({cell_hash(pt.x, pt.y, pt.z), (uint32_t)isl.pts.size()});
             isl.pts.push_back(pt);
         }
@@ -1072,7 +1806,7 @@ void World::rebuild_pairs(Island& isl) {
             }
         }
         // ---- 2) triangles and capsules query the node hash, in chunks of triangles (shared by the team)
-        constexpr uint32_t kTriChunk = 512;
+        constexpr uint32_t kTriChunk = 16; // (a crash's queries: 512 a chunk were a few chunks of 0.3 ms)
         isl.qchunks.clear();
         for (int bt = 0; bt < nb; bt++) {
             SoftBody& o = *isl.bodies[bt];
@@ -1125,6 +1859,8 @@ void World::rebuild_pairs(Island& isl) {
                                     continue;
                                 }
                                 if (pt.x != x || pt.y != y || pt.z != z) continue; // hash collision
+                                // (out of the widest reach of the triangle's box: most of a cell's nodes)
+                                if (pt.p.x < tmn.x - rq || pt.p.y < tmn.y - rq || pt.p.z < tmn.z - rq || pt.p.x > tmx.x + rq || pt.p.y > tmx.y + rq || pt.p.z > tmx.z + rq) continue;
                                 const int bn = pt.body;
                                 SoftBody& b = *isl.bodies[bn];
                                 bool self = bn == bt;
@@ -1256,7 +1992,98 @@ void World::rebuild_pairs(Island& isl) {
             }
         }
     }
-    isl.pair_count = (int)(isl.nt.size() + isl.nc.size() + isl.ct.size());
+    // ---- 4) the FEM plates' mid points (SoftBody::tri_mids) against the other bodies' triangles: the mid points of the
+    // bodies with partners in a hash of their own, the partners' triangles query it (the margins as the nodes': the
+    // triangle's body's and the mid point's, fast or slow; each mid point in one cell, a triangle scans each cell once)
+    if (prof::g_trace) prof::trace_mark("bp", 10);
+    isl.mt.clear();
+    static const bool no_mids = getenv("BL_NOMIDS") != nullptr;
+    if (!no_mids && any_tris) {
+        isl.mpts.clear();
+        isl.mpos.clear();
+        isl.entries.clear();
+        float mid_extra = 0;
+        for (int bi = 0; bi < nb; bi++) {
+            SoftBody& b = *isl.bodies[bi];
+            if (!b.tri_mids || b.fem.tris.empty() || b.rigid || isl.partners[bi].empty()) continue;
+            for (uint32_t k = 0; k < (uint32_t)b.fem.tris.size(); k++) {
+                uint32_t n[3];
+                if (!tri_mid(b, k, n, NF_CONTACTER)) continue;
+                const vec3 p = tri_mid_p(b, n);
+                if (!near_partner(bi, p, p)) continue;
+                Island::Pt pt{(uint16_t)bi, k, cell_of(p.x), cell_of(p.y), cell_of(p.z), p};
+                isl.entries.push_back({cell_hash(pt.x, pt.y, pt.z), (uint32_t)isl.mpts.size()});
+                isl.mpts.push_back(pt);
+                isl.mpos.push_back(p);
+                mid_extra = std::max(mid_extra, isl.extra[bi]);
+            }
+        }
+        if (prof::g_trace) prof::trace_mark("bp", 11);
+        if (!isl.mpts.empty()) {
+            uint32_t mask;
+            build_buckets(mask);
+            if (prof::g_trace) prof::trace_mark("bp", 12);
+            // (the partners' triangles in chunks shared by the team, each chunk's pairs of its own, then in order)
+            struct MChunk {
+                int body;
+                uint32_t t0, t1;
+            };
+            std::vector<MChunk> mch;
+            for (int bt = 0; bt < nb; bt++) {
+                SoftBody& o = *isl.bodies[bt];
+                if (isl.partners[bt].empty() || o.tris.empty()) continue;
+                bool mids_near = false; // (a partner with mid points)
+                for (int q : isl.partners[bt]) mids_near |= isl.bodies[q]->tri_mids && !isl.bodies[q]->fem.tris.empty();
+                if (!mids_near) continue;
+                for (uint32_t t0 = 0; t0 < (uint32_t)o.tris.size(); t0 += 8) mch.push_back({bt, t0, std::min((uint32_t)o.tris.size(), t0 + 8)});
+            }
+            if ((int)isl.q_mt.size() < (int)mch.size()) isl.q_mt.resize(mch.size());
+            isl.team->run((int)mch.size(), [&](int qc) {
+                PROFILE_ACCUM("Broadphase query");
+                auto& out = isl.q_mt[qc];
+                out.clear();
+                const int bt = mch[qc].body;
+                const SoftBody& o = *isl.bodies[bt];
+                const float rq = rmax + margin + isl.extra[bt] + mid_extra;
+                for (uint32_t t = mch[qc].t0; t < mch[qc].t1; t++) {
+                    const Triangle& tr = o.tris[t];
+                    if (tr.torn) continue;
+                    const vec3 a = o.nodes[tr.a].p, bb = o.nodes[tr.b].p, c = o.nodes[tr.c].p;
+                    const vec3 tmn = vmin(a, vmin(bb, c)), tmx = vmax(a, vmax(bb, c));
+                    if (!near_partner(bt, tmn - vec3(rq), tmx + vec3(rq))) continue;
+                    const vec3 tn = cross(bb - a, c - a);
+                    const float tn2 = dot(tn, tn);
+                    const vec3 tu = tn2 > 1e-20f ? tn * (1.0f / std::sqrt(tn2)) : vec3(0);
+                    const int x0 = cell_of(tmn.x - rq), x1 = cell_of(tmx.x + rq), y0 = cell_of(tmn.y - rq), y1 = cell_of(tmx.y + rq), z0 = cell_of(tmn.z - rq),
+                              z1 = cell_of(tmx.z + rq);
+                    if ((x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1) > 512) continue;
+                    for (int z = z0; z <= z1; z++)
+                        for (int y = y0; y <= y1; y++)
+                            for (int x = x0; x <= x1; x++) {
+                                const uint32_t bk = cell_hash(x, y, z) & mask;
+                                for (uint32_t kk = isl.bucket_start[bk]; kk < isl.bucket_start[bk + 1]; kk++) {
+                                    const uint32_t mi = isl.bucket_items[kk];
+                                    const Island::Pt& pt = isl.mpts[mi];
+                                    if (pt.x != x || pt.y != y || pt.z != z || pt.body == bt) continue;
+                                    if (pt.p.x < tmn.x - rq || pt.p.y < tmn.y - rq || pt.p.z < tmn.z - rq || pt.p.x > tmx.x + rq || pt.p.y > tmx.y + rq || pt.p.z > tmx.z + rq) continue;
+                                    if (same_group(pt.body, bt)) continue;
+                                    const SoftBody& b = *isl.bodies[pt.body];
+                                    if (b.sleeping && o.sleeping) continue;
+                                    const vec3 p = isl.mpos[mi];
+                                    const float r = b.collision_radius + margin + isl.extra[bt] + isl.extra[pt.body];
+                                    if (p.x < tmn.x - r || p.y < tmn.y - r || p.z < tmn.z - r || p.x > tmx.x + r || p.y > tmx.y + r || p.z > tmx.z + r) continue;
+                                    if (!near_triangle(p, a, bb, c, tu, r, true, 0.0f)) continue;
+                                    out.push_back({pt.body, (uint16_t)bt, pt.node, t});
+                                }
+                            }
+                }
+            });
+            if (prof::g_trace) prof::trace_mark("bp", 13);
+            for (size_t qc = 0; qc < mch.size(); qc++) isl.mt.insert(isl.mt.end(), isl.q_mt[qc].begin(), isl.q_mt[qc].end());
+        }
+    }
+    if (prof::g_trace) prof::trace_mark("bp", 14);
+    isl.pair_count = (int)(isl.nt.size() + isl.nc.size() + isl.ct.size() + isl.mt.size());
     if (bp_t0 > 0) {
         double ms = (time_seconds() - bp_t0) * 1000.0;
         if (ms > 0.1) {
@@ -1269,9 +2096,9 @@ void World::rebuild_pairs(Island& isl) {
             fprintf(stderr, "BP parts: %s\n", parts.c_str());
             size_t ntri = 0, ncap = 0;
             for (SoftBody* b : isl.bodies) ntri += b->tris.size(), ncap += b->capsules.size();
-            fprintf(stderr, "BP %.2f ms: bodies %zu pts %zu tris %zu caps %zu entries %zu -> nt %zu nc %zu ct %zu teamed %d interval %d\n", ms,
-                    isl.bodies.size(), isl.pts.size(), ntri, ncap, isl.entries.size(), isl.nt.size(), isl.nc.size(), isl.ct.size(), (int)isl.teamed,
-                    isl.rebuild_interval);
+            fprintf(stderr, "BP %.2f ms: bodies %zu pts %zu tris %zu caps %zu entries %zu -> nt %zu nc %zu ct %zu mt %zu teamed %d interval %d margin %.3f rmax %.3f cell %.2f\n", ms,
+                    isl.bodies.size(), isl.pts.size(), ntri, ncap, isl.entries.size(), isl.nt.size(), isl.nc.size(), isl.ct.size(), isl.mt.size(), (int)isl.teamed,
+                    isl.rebuild_interval, margin, rmax, 1.0f / isl.inv_cell);
         }
     }
 }
@@ -1294,7 +2121,7 @@ void World::fast_pairs(Island& isl) {
     const float slow_reach = 2.0f * isl.slow_speed * isl.fast_interval * isl.dt + 0.01f;
     const double t_g0 = getenv("BL_FASTDBG") ? time_seconds() : 0.0;
     if (isl.grids.size() < (size_t)nb) isl.grids.resize(nb);
-    constexpr uint32_t kTriChunk = 64;
+    constexpr uint32_t kTriChunk = 16;
     isl.qchunks.clear();
     for (int bf = 0; bf < nb; bf++) {
         if (fast_extra(bf) <= 0) continue;
@@ -1497,7 +2324,7 @@ void World::near_pairs(Island& isl) {
     if (n == 0) return;
     const float T = (float)std::max(isl.rebuild_interval, 1) * isl.dt;
     isl.near_keep.assign(n, 1);
-    constexpr size_t kChunk = 2048;
+    constexpr size_t kChunk = 512;
     const int nch = (int)((n + kChunk - 1) / kChunk);
     auto pass = [&](int c) {
         const size_t i0 = (size_t)c * kChunk, i1 = std::min(n, i0 + kChunk);
@@ -1572,6 +2399,25 @@ void World::inherit_pairs(Island& isl, int k) {
     };
     const uint32_t tmin = tsrc.empty() ? UINT32_MAX : tsrc.front().first, tmax = tsrc.empty() ? 0 : tsrc.back().first;
     const uint32_t nmin = nsrc.empty() ? UINT32_MAX : nsrc.front().first, nmax = nsrc.empty() ? 0 : nsrc.back().first;
+    // (the sources marked: a pair looks its node and triangle up at once - their range alone had most pairs in it, each
+    // a search, a crash's topology change a millisecond)
+    static thread_local std::vector<uint8_t> nmark, tmark;
+    if (nmark.size() < (size_t)nmax + 1 && !nsrc.empty()) nmark.resize((size_t)nmax + 1, 0);
+    if (tmark.size() < (size_t)tmax + 1 && !tsrc.empty()) tmark.resize((size_t)tmax + 1, 0);
+    for (auto& x : nsrc) nmark[x.first] = 1;
+    for (auto& x : tsrc) tmark[x.first] = 1;
+    std::vector<uint8_t>& nm = nmark;
+    std::vector<uint8_t>& tm = tmark;
+    struct Unmark {
+        std::vector<std::pair<uint32_t, uint32_t>>& ns;
+        std::vector<std::pair<uint32_t, uint32_t>>& ts;
+        std::vector<uint8_t>& nm;
+        std::vector<uint8_t>& tm;
+        ~Unmark() {
+            for (auto& x : ns) nm[x.first] = 0;
+            for (auto& x : ts) tm[x.first] = 0;
+        }
+    } unmark{nsrc, tsrc, nm, tm};
     static thread_local std::vector<Island::NT> nt_new;
     static thread_local std::vector<Island::NC> nc_new;
     static thread_local std::vector<Island::CT> ct_new;
@@ -1579,9 +2425,9 @@ void World::inherit_pairs(Island& isl, int k) {
         nt_new.clear();
         for (size_t i = b0; i < b1; i++) {
             const Island::NT p = isl.nt[i];
-            if (p.bn == k && p.node >= nmin && p.node <= nmax)
+            if (p.bn == k && p.node >= nmin && p.node <= nmax && nm[p.node])
                 children(nsrc, p.node, [&](uint32_t c) { nt_new.push_back({p.bn, p.bt, c, p.tri}); });
-            if (p.bt == k && p.tri >= tmin && p.tri <= tmax)
+            if (p.bt == k && p.tri >= tmin && p.tri <= tmax && tm[p.tri])
                 children(tsrc, p.tri, [&](uint32_t c) { nt_new.push_back({p.bn, p.bt, p.node, c}); });
         }
         std::sort(nt_new.begin(), nt_new.end(), [](const Island::NT& a, const Island::NT& b) {
@@ -1601,7 +2447,7 @@ void World::inherit_pairs(Island& isl, int k) {
         nc_new.clear();
         for (size_t i = b0; i < b1; i++) {
             const Island::NC p = isl.nc[i];
-            if (p.bn == k && p.node >= nmin && p.node <= nmax)
+            if (p.bn == k && p.node >= nmin && p.node <= nmax && nm[p.node])
                 children(nsrc, p.node, [&](uint32_t c) { nc_new.push_back({p.bn, p.bc, c, p.cap}); });
         }
         std::sort(nc_new.begin(), nc_new.end(), [](const Island::NC& a, const Island::NC& b) {
@@ -1618,7 +2464,7 @@ void World::inherit_pairs(Island& isl, int k) {
     isl.nc.insert(isl.nc.end(), nc_new.begin(), nc_new.end());
     ct_new.clear();
     for (const Island::CT& p : isl.ct)
-        if (p.bt == k && p.tri >= tmin && p.tri <= tmax) children(tsrc, p.tri, [&](uint32_t c) { ct_new.push_back({p.bc, p.bt, p.cap, c}); });
+        if (p.bt == k && p.tri >= tmin && p.tri <= tmax && tm[p.tri]) children(tsrc, p.tri, [&](uint32_t c) { ct_new.push_back({p.bc, p.bt, p.cap, c}); });
     isl.ct.insert(isl.ct.end(), ct_new.begin(), ct_new.end());
     isl.pair_count = (int)(isl.nt.size() + isl.nc.size() + isl.ct.size());
 }
@@ -1626,17 +2472,27 @@ void World::inherit_pairs(Island& isl, int k) {
 // Contacts of the candidate pairs: the narrow phase (closest points of the current positions: independent per pair,
 // in chunks shared by the team), then the response in pair order (serial: each contact cancels the forces of the
 // ones before it, see contact_force).
-void World::collide_pairs(Island& isl) {
+// The narrow phase's chunks of the candidate pairs (node-triangle, node-capsule, capsule-triangle): the geometry alone
+// (pair_detect, any order, in parallel: beside the forces when the pairs were not made again this substep), then the
+// response in order (collide_pairs)
+int World::pair_chunks(Island& isl) {
     const size_t nnt = isl.nt.size(), nnc = isl.nc.size(), nct = isl.ct.size();
-    m_narrow.fetch_add((long long)(nnt + nnc + nct), std::memory_order_relaxed);
-    constexpr uint32_t kPairChunk = 1024;
+    constexpr uint32_t kPairChunk = kPairChunkSize;
     const int cnt = (int)((nnt + kPairChunk - 1) / kPairChunk), cnc = (int)((nnc + kPairChunk - 1) / kPairChunk),
               cct = (int)((nct + kPairChunk - 1) / kPairChunk);
     const int nch = cnt + cnc + cct;
-    if (nch == 0) return;
     if ((int)isl.hits.size() < nch) isl.hits.resize(nch);
+    return nch;
+}
+
+void World::pair_detect(Island& isl, int c) {
+    const size_t nnt = isl.nt.size(), nnc = isl.nc.size(), nct = isl.ct.size();
+    constexpr uint32_t kPairChunk = kPairChunkSize;
+    const int cnt = (int)((nnt + kPairChunk - 1) / kPairChunk), cnc = (int)((nnc + kPairChunk - 1) / kPairChunk),
+              cct = (int)((nct + kPairChunk - 1) / kPairChunk);
+    (void)cct;
     {
-        isl.team->run(nch, [&](int c) {
+        {
             PROFILE_ACCUM("Narrow phase");
             auto& out = isl.hits[c];
             out.clear();
@@ -1670,6 +2526,10 @@ void World::collide_pairs(Island& isl) {
                             continue;
                         }
                         if (s < 0) continue; // (behind, not over this face: another face's)
+                    } else {
+                        // (off the triangle's box by more than its reach: most of the candidates)
+                        const vec3 lo = vmin(a.p, vmin(b.p, cc.p)) - vec3(r), hi = vmax(a.p, vmax(b.p, cc.p)) + vec3(r);
+                        if (n.p.x < lo.x || n.p.y < lo.y || n.p.z < lo.z || n.p.x > hi.x || n.p.y > hi.y || n.p.z > hi.z) continue;
                     }
                     vec3 cp = closest_on_triangle(n.p, a.p, b.p, cc.p, bary);
                     vec3 d = n.p - cp;
@@ -1777,7 +2637,21 @@ void World::collide_pairs(Island& isl) {
                     out.push_back({(uint32_t)i, best_s, best_bary, nrm, pen});
                 }
             }
-        });
+        }
+    }
+}
+
+void World::collide_pairs(Island& isl, bool detected) {
+    const size_t nnt = isl.nt.size(), nnc = isl.nc.size(), nct = isl.ct.size();
+    constexpr uint32_t kPairChunk = kPairChunkSize;
+    const int cnt = (int)((nnt + kPairChunk - 1) / kPairChunk), cnc = (int)((nnc + kPairChunk - 1) / kPairChunk),
+              cct = (int)((nct + kPairChunk - 1) / kPairChunk);
+    const int nch = cnt + cnc + cct;
+    m_narrow.fetch_add((long long)(nnt + nnc + nct), std::memory_order_relaxed);
+    if (nch == 0) return;
+    if (!detected) {
+        pair_chunks(isl);
+        isl.team->run(nch, [&](int c) { pair_detect(isl, c); });
     }
     PROFILE_ACCUM("Contacts");
     int contacts = 0;
@@ -1878,6 +2752,121 @@ void World::collide_pairs(Island& isl) {
     isl.contacts += contacts;
 }
 
+// The FEM plates' mid points (SoftBody::tri_mids) against the other bodies' triangles (rebuild_pairs 4): a node's contact
+// (contact_force), the mid point's side its triangle's three corners a third each; over a hull triangle's face only in
+// front of it. What the corners' own contacts with that triangle leave of its depth at the middle counts.
+int World::mid_chunks(Island& isl) {
+    const int nch = (int)((isl.mt.size() + kPairChunkSize - 1) / kPairChunkSize);
+    if ((int)isl.mhits.size() < nch) isl.mhits.resize(nch);
+    return nch;
+}
+
+void World::mid_detect(Island& isl, int ch) {
+    const float dt = isl.dt;
+    (void)dt;
+    constexpr float kW = 1.0f / 3.0f;
+    constexpr size_t kChunk = kPairChunkSize;
+    {
+        PROFILE_ACCUM("Narrow phase");
+        auto& out = isl.mhits[ch];
+        out.clear();
+        const size_t i1 = std::min(isl.mt.size(), (size_t)(ch + 1) * kChunk);
+        for (size_t i = (size_t)ch * kChunk; i < i1; i++) {
+            const Island::MT& pr = isl.mt[i];
+            const SoftBody& bm = *isl.bodies[pr.bm];
+            const SoftBody& bt = *isl.bodies[pr.bt];
+            if ((bm.sleeping && bt.sleeping) || pr.tri >= bt.tris.size() || pr.mid >= bm.fem.tris.size()) continue;
+            const Triangle& t = bt.tris[pr.tri];
+            if (t.torn) continue;
+            uint32_t n[3];
+            if (!tri_mid(bm, pr.mid, n, NF_CONTACTER)) continue;
+            const vec3 p = tri_mid_p(bm, n);
+            const Node &a = bt.nodes[t.a], &b = bt.nodes[t.b], &c = bt.nodes[t.c];
+            const float r = bm.collision_radius;
+            // (off the triangle's box by more than its reach)
+            const vec3 lo = vmin(a.p, vmin(b.p, c.p)) - vec3(r), hi = vmax(a.p, vmax(b.p, c.p)) + vec3(r);
+            if (p.x < lo.x || p.y < lo.y || p.z < lo.z || p.x > hi.x || p.y > hi.y || p.z > hi.z) continue;
+            vec3 bary;
+            const vec3 cp = closest_on_triangle(p, a.p, b.p, c.p, bary);
+            const vec3 d = p - cp;
+            const float dist2 = dot(d, d);
+            if (dist2 >= r * r) continue;
+            const vec3 fn = normalize_or(cross(b.p - a.p, c.p - a.p), vec3(0, 1, 0));
+            if (!t.two_sided && dot(p - a.p, fn) < 0) continue; // (behind a hull's face: its nodes' business)
+            const float dist = std::sqrt(dist2);
+            vec3 nrm = dist > 1e-5f ? d / dist : fn;
+            // (on the triangle's edge or corner: an edge pressed into the plate's face, along the plate's normal - the
+            // point's own off the edge tipped over and pushed a plate lying on two blades off them sideways)
+            if (std::min(bary.x, std::min(bary.y, bary.z)) < 1e-4f) {
+                const vec3 pn = normalize_or(cross(bm.nodes[n[1]].p - bm.nodes[n[0]].p, bm.nodes[n[2]].p - bm.nodes[n[0]].p), nrm);
+                nrm = dist > 1e-5f ? (dot(pn, d) >= 0 ? pn : -pn) : pn;
+            }
+            if (dist <= 1e-5f) {
+                vec3 vm(0);
+                for (int j = 0; j < 3; j++) vm += bm.nodes[n[j]].v * kW;
+                if (dot(vm - (a.v * bary.x + b.v * bary.y + c.v * bary.z), nrm) > 0) nrm = -nrm;
+            }
+            // (what its corners reach of the triangle themselves)
+            float held = 0;
+            for (int j = 0; j < 3; j++) {
+                vec3 bj;
+                const float dj = length(bm.nodes[n[j]].p - closest_on_triangle(bm.nodes[n[j]].p, a.p, b.p, c.p, bj));
+                held += std::max(0.0f, r - dj) * kW;
+            }
+            const float pen = r - dist - held;
+            if (pen > 0) out.push_back({(uint32_t)i, 0.0f, bary, nrm, pen});
+        }
+    }
+}
+
+void World::collide_mid_pairs(Island& isl, bool detected) {
+    if (isl.mt.empty()) return;
+    const float dt = isl.dt;
+    constexpr float kW = 1.0f / 3.0f;
+    // the narrow phase in chunks shared by the island's team (most pairs are off their triangle's reach: their margins
+    // take the travel until the next rebuild; beside the forces when the pairs were not made again: mid_detect), the
+    // response in order
+    const int nch = mid_chunks(isl);
+    if (!detected) isl.team->run(nch, [&](int ch) { mid_detect(isl, ch); });
+    PROFILE_ACCUM("Contacts");
+    int contacts = 0;
+    const GroundModel& gm = ground_models()[SURF_CONCRETE];
+    const float wake_speed = settings.sleep_speed;
+    auto movable = [wake_speed](SoftBody& b, const SoftBody& other) { // (as collide_pairs')
+        if (b.sleeping) {
+            if (other.max_speed > std::max(wake_speed, other.sleep_speed) * (other.rest_damp > 0 ? 3.0f : 1.0f)) b.wake_request = true;
+            return false;
+        }
+        return true;
+    };
+    auto snap = [](const SoftBody& b, uint32_t i) -> const vec3* { return b.dt_shift() > 0 && i < b.ext_force.size() ? &b.ext_force[i] : nullptr; };
+    for (int ch = 0; ch < nch; ch++)
+        for (const Island::Hit& h : isl.mhits[ch]) {
+            const Island::MT& pr = isl.mt[h.pair];
+            SoftBody& bm = *isl.bodies[pr.bm];
+            SoftBody& bt = *isl.bodies[pr.bt];
+            const Triangle& t = bt.tris[pr.tri];
+            uint32_t n[3];
+            if (!tri_mid(bm, pr.mid, n, NF_CONTACTER)) continue;
+            const bool ma = movable(bm, bt), mb = movable(bt, bm);
+            Node* A[3] = {&bm.nodes[n[0]], &bm.nodes[n[1]], &bm.nodes[n[2]]};
+            vec3* FA[3] = {&bm.force[n[0]], &bm.force[n[1]], &bm.force[n[2]]};
+            const float wa[3] = {kW, kW, kW};
+            Node* B[3] = {&bt.nodes[t.a], &bt.nodes[t.b], &bt.nodes[t.c]};
+            vec3* FB[3] = {&bt.force[t.a], &bt.force[t.b], &bt.force[t.c]};
+            const float wb[3] = {h.bary.x, h.bary.y, h.bary.z};
+            const vec3* SA[3] = {snap(bm, n[0]), snap(bm, n[1]), snap(bm, n[2])};
+            const vec3* SB[3] = {snap(bt, t.a), snap(bt, t.b), snap(bt, t.c)};
+            if (contact_force<3, 3>(A, FA, wa, B, FB, wb, ma, mb, h.nrm, h.pen, dt, gm, 0.8f, SA[0] ? SA : nullptr, SB[0] ? SB : nullptr)) {
+                contacts++, bm.touch(bt), bt.touch(bm);
+                bm.mid_contacts++;
+                if (bm.mid_touch.size() != bm.fem.tris.size()) bm.mid_touch.assign(bm.fem.tris.size(), 0);
+                bm.mid_touch[pr.mid] |= 2;
+            }
+        }
+    isl.contacts += contacts;
+}
+
 // One island for a whole frame. Every short step is a sequence of phases, each split into work items that any thread
 // of the island's team may take (Team): internal forces (per body, and the triangles of a sheet in chunks), the
 // sheets' forces gathered per node, the contacts (narrow phase in chunks, response in order), static contacts and
@@ -1899,11 +2888,14 @@ void World::simulate_island(Island& isl, int substeps) {
     isl.contacts = 0;
     const int nb = (int)isl.bodies.size();
     Team team(isl.teamed);
+    Team aside(isl.teamed); // (a phase posted beside this thread's serial parts: the frames' blocks beside the contacts)
     isl.team = &team;
     for (SoftBody* b : isl.bodies) {
         b->static_contacts = 0;
         b->sphere_touches = 0;
         b->body_contacts = 0;
+        b->mid_contacts = 0;
+        if (!b->fem.tris.empty()) b->mid_touch.assign(b->fem.tris.size(), 0);
         b->touched.clear();
         if (b->energy_guard && !b->rigid) b->motion_energy(settings.gravity, b->guard_ke, b->guard_pe);
         b->topo_log.clear();
@@ -1912,8 +2904,17 @@ void World::simulate_island(Island& isl, int substeps) {
     isl.subs.assign(nb, 0);
     constexpr uint32_t kNodeChunk = 1024;
     // a frame's implicit step this substep (every frame_every substeps; a sub-cycled sheet's own frame every short step)
-    const int fe = std::max(1, m_lagging ? settings.frame_every_lag : settings.frame_every);
+    const int fe = std::max(1, settings.frame_every);
     auto fem_due = [](const SoftBody& b) { return b.fem_left <= 0; };
+    // (the frame's step begun: its length - the numerical dissipation per step over the steps it spans, the same per
+    // second)
+    auto fem_begin = [&](int k) {
+        SoftBody& b = *isl.bodies[k];
+        const float bdt = dt / (float)isl.subs[k];
+        const float hs = b.fem_every_step ? 1.0f : (float)b.fem_period;
+        return b.fem.solve_begin(b, b.fem_every_step ? bdt : dt * (float)b.fem_period, bdt, settings.frame_theta,
+                                 (b.fem_dissipation >= 0 ? b.fem_dissipation : settings.frame_dissipation) / hs);
+    };
     // internal forces of one body other than its triangles (a sub-cycled body recomputes them for every short step)
     auto base_forces = [&](SoftBody& b, float bdt, bool controller, bool fem_parts) {
         PROFILE_ACCUM("Beam forces"); // (gravity, drag, wind, controllers, beams, shocks, joints, wheels)
@@ -1935,6 +2936,16 @@ void World::simulate_island(Island& isl, int substeps) {
         if (!b.slides.empty()) b.compute_slide_forces();
     };
     // node ranges of the bodies stepping at short step j (a body with wheels stays whole: its tyre patches share grip)
+    // (a frame's body without tyre nodes - a tyre patch shares its grip, collide_static - in chunks of nodes for its
+    // static contacts: the ring tyres and the plates' mid points after, a task each; FemFrame's step for the body)
+    isl.fem_chunked.assign(nb, 0);
+    for (int k = 0; k < nb; k++) {
+        const SoftBody& b = *isl.bodies[k];
+        if (b.fem.empty() || b.rigid || b.nodes.size() <= kFemChunk) continue;
+        bool tyre = false;
+        for (const NodeInfo& in : b.info) tyre |= (in.flags & NF_TYRE) != 0;
+        isl.fem_chunked[k] = !tyre;
+    }
     auto node_work = [&](int j, bool only_sheets) {
         isl.work.clear();
         for (int k = 0; k < nb; k++) {
@@ -1944,6 +2955,10 @@ void World::simulate_island(Island& isl, int substeps) {
             const uint32_t n = (uint32_t)b.nodes.size();
             if (b.rigid) { // (one step for the whole body: its forces add up to a force and a torque)
                 isl.work.push_back({(uint32_t)k, 3, 0, n});
+                continue;
+            }
+            if (isl.fem_chunked[k]) {
+                for (uint32_t a = 0; a < n; a += kFemChunk) isl.work.push_back({(uint32_t)k, 2, a, std::min(n, a + kFemChunk)});
                 continue;
             }
             if (!b.wheels.empty() || !b.fem.empty() || n <= kNodeChunk) { // (the frame solves all its nodes at once)
@@ -1963,7 +2978,13 @@ void World::simulate_island(Island& isl, int substeps) {
         tph = t;
     };
     isl.shell_steps = isl.beam_steps = isl.node_steps = isl.hinge_evals = 0;
+    static prof::Zone* first_zone = prof::zone("Short step first");
+    static prof::Zone* short_zone = prof::zone("Short steps later");
     for (int s = 0; s < substeps; s++) {
+        if (trace_arm().frame == g_trace_frame) {
+            prof::g_trace = s >= trace_arm().s0 && s < trace_arm().s0 + trace_arm().count;
+            if (prof::g_trace) prof::trace_mark("substep", s);
+        }
         int maxsub = 0;
         for (int k = 0; k < nb; k++) {
             SoftBody& b = *isl.bodies[k];
@@ -1978,6 +2999,8 @@ void World::simulate_island(Island& isl, int substeps) {
             isl.beam_steps += (long long)b.beams.size() * isl.subs[k];
         }
         for (int j = 0; j < maxsub; j++) {
+            prof::AccumScope short_scope(j > 0 ? short_zone : first_zone); // (diagnostics: the short steps' cost, the first and the later)
+            if (prof::g_trace) prof::trace_mark("short step", j);
             // 1) internal forces (a frame's members in chunks beside the body's other forces and its sheet: one after
             // another they were the longest item of the step)
             isl.work.clear();
@@ -1996,10 +3019,25 @@ void World::simulate_island(Island& isl, int substeps) {
                     for (int c = 0; c < ch; c++) isl.work.push_back({(uint32_t)k, 1, (uint32_t)c, 0});
                 }
             }
+            // (the narrow phase's geometry beside the forces when the pairs are not made again this substep: it needs
+            // the positions alone)
+            bool detected = false;
+            if (j == 0 && isl.needs_pairs && !(s == 0 || s >= isl.next_rebuild || rebuild_now) &&
+                !(isl.fast_interval > 0 && isl.fast_interval < isl.rebuild_interval && s >= isl.next_fast)) {
+                detected = true;
+                for (int c = 0, n = pair_chunks(isl); c < n; c++) isl.work.push_back({0u, 5, (uint32_t)c, 0});
+                for (int c = 0, n = isl.mt.empty() ? 0 : mid_chunks(isl); c < n; c++) isl.work.push_back({0u, 6, (uint32_t)c, 0});
+            }
+            // (and the collision volumes' look: their places now, the look beside the forces, their forces below - but
+            // not when the pairs are made again: a triangle stretched past tearing is torn there)
+            const bool vol_staged = j == 0 && (detected || !isl.needs_pairs);
+            if (vol_staged)
+                for (int c = 0, n = collide_volumes(isl, dt, isl.bodies.size() > 1, 1); c < n; c++) isl.work.push_back({0u, 7, (uint32_t)c, 0});
             {
                 PROFILE_ACCUM("Forces");
                 team.run((int)isl.work.size(), [&](int i) {
                     const Island::Work& w = isl.work[i];
+                    if (w.kind >= 5) return w.kind == 5 ? pair_detect(isl, (int)w.a) : w.kind == 6 ? mid_detect(isl, (int)w.a) : volume_find(isl, (int)w.a);
                     SoftBody& b = *isl.bodies[w.body];
                     if (w.kind == 0) {
                         base_forces(b, dt / (float)isl.subs[w.body], j == 0, isl.fem_parts[w.body] != 0);
@@ -2012,12 +3050,28 @@ void World::simulate_island(Island& isl, int substeps) {
                     }
                 });
                 lap(0);
+                // the frames' forces onto their nodes, in chunks of nodes (each node's in the elements' order), then
+                // their mounts and events
+                {
+                    constexpr size_t kGatherChunk = 128;
+                    isl.fem_tasks.clear();
+                    for (int k = 0; k < nb; k++)
+                        if (isl.fem_parts[k])
+                            for (size_t c = 0; c * kGatherChunk < isl.bodies[k]->fem.node.size(); c++) isl.fem_tasks.push_back({k, (int)c});
+                    team.run((int)isl.fem_tasks.size(), [&](int t) {
+                        PROFILE_ACCUM("Frame elements");
+                        SoftBody& b = *isl.bodies[isl.fem_tasks[t].first];
+                        const size_t c = (size_t)isl.fem_tasks[t].second;
+                        b.fem.gather_forces(b, c * kGatherChunk, (c + 1) * kGatherChunk);
+                    });
+                }
                 for (int k = 0; k < nb; k++)
-                    if (isl.fem_parts[k]) isl.bodies[k]->fem.end_forces(*isl.bodies[k]);
+                    if (isl.fem_parts[k]) isl.bodies[k]->fem.end_forces_rest(*isl.bodies[k]);
                 for (int k = 0; k < nb; k++)
                     if (isl.subs[k] > j && isl.bodies[k]->shk.pass.chunks > 0) isl.bodies[k]->shell_end();
                 lap(4);
             }
+            isl.fem_pre.assign(nb, 0);
             if (j == 0) {
                 // 2) the sheets' forces on their nodes before the contacts (a contact cancels the forces accumulated so
                 // far), and the snapshot of the internal forces of the sub-cycled bodies
@@ -2038,6 +3092,30 @@ void World::simulate_island(Island& isl, int substeps) {
                     });
                 }
                 lap(1);
+                if (isl.teamed && isl.needs_pairs) {
+                    // (the frames stepping now - as the integration below will find them: fem_begin -, their step begun
+                    // and their matrices' blocks gathered on the team's other board while this thread takes the contacts
+                    // in order: the elements' tangents are in, the contacts do not change them; FemFrame::gather_blocks.
+                    // After the sub-cycled bodies' arrays of the contacts' forces are made, above: solve_begin keeps them.
+                    // Without contacts between bodies there is nothing to hide them behind: gathered whole below)
+                    isl.fem_pre_nc.assign(nb, 0);
+                    isl.pre_tasks.clear();
+                    for (int k = 0; k < nb; k++) {
+                        SoftBody& b = *isl.bodies[k];
+                        if (isl.subs[k] <= j || b.rigid || b.fem.empty() || !(b.fem_every_step || (j == 0 && fem_due(b)))) continue;
+                        const int nc = fem_begin(k);
+                        isl.fem_pre[k] = 1, isl.fem_pre_nc[k] = nc;
+                        for (int c = 0; c < nc; c++)
+                            for (int g = 0, n = b.fem.par_component(c) ? b.fem.asm_chunks(c) : 1; g < n; g++) isl.pre_tasks.push_back({k, c, b.fem.par_component(c) ? g : -1});
+                    }
+                    aside.post((int)isl.pre_tasks.size(), [&isl](int t) {
+                        PROFILE_ACCUM("Frame blocks");
+                        const Island::PreTask& pt = isl.pre_tasks[t];
+                        SoftBody& b = *isl.bodies[pt.k];
+                        if (pt.chunk < 0) b.fem.gather_blocks(b, pt.c);
+                        else b.fem.gather_blocks(b, pt.c, pt.chunk);
+                    });
+                }
                 // 3) inter-body contacts (forces)
                 if (isl.needs_pairs) {
                     PROFILE_ACCUM("Collisions");
@@ -2056,18 +3134,45 @@ void World::simulate_island(Island& isl, int substeps) {
                         isl.ph_ms[7] += prof::ticks_to_ms(prof::now() - c0);
                     }
                     const uint64_t c1 = prof::now();
-                    collide_pairs(isl);
+                    collide_pairs(isl, detected);
+                    collide_mid_pairs(isl, detected);
                     isl.ph_ms[8] += prof::ticks_to_ms(prof::now() - c1);
                 }
-                collide_volumes(isl, dt, isl.bodies.size() > 1); // (the collision volumes: against the other bodies and the static world)
+                collide_volumes(isl, dt, isl.bodies.size() > 1, vol_staged ? 2 : 0); // (the collision volumes: against the other bodies and the static world)
                 lap(2);
             }
             // 4) static contacts + integration (the sheets' forces of the later short steps are gathered here)
             node_work(j, false);
             isl.fem_defer.assign(isl.work.size(), 0);
+            for (int k = 0; k < nb; k++) { // (the chunked bodies' arrays collide_static fills, made here: the chunks share them)
+                SoftBody& b = *isl.bodies[k];
+                if (isl.fem_chunked[k] && b.tri_mids && !b.fem.tris.empty() && b.static_pen.size() != b.nodes.size()) b.static_pen.assign(b.nodes.size(), vec3(0));
+            }
+            // (and their plates' mid points' static contacts found beside those, in ranges: one after another they were
+            // the step's wait before the frames' steps; their forces in order after: below)
+            constexpr uint32_t kMidChunk = 64;
+            isl.smid_tasks.clear();
+            isl.smid_first.assign(nb, -1);
+            for (int k = 0; k < nb; k++) {
+                const SoftBody& b = *isl.bodies[k];
+                if (!isl.fem_chunked[k] || b.fem.tris.empty()) continue;
+                bool any = false;
+                for (size_t i = 0; i < isl.work.size() && !any; i++) any = (int)isl.work[i].body == k && isl.work[i].a == 0;
+                if (!any) continue;
+                isl.smid_first[k] = (int)isl.smid_tasks.size();
+                for (uint32_t c = 0; (size_t)c * kMidChunk < b.fem.tris.size(); c++) isl.smid_tasks.push_back({k, c});
+            }
+            if (isl.smid.size() < isl.smid_tasks.size()) isl.smid.resize(isl.smid_tasks.size());
             {
                 PROFILE_ACCUM("Integration");
-                team.run((int)isl.work.size(), [&](int i) {
+                const int nwork = (int)isl.work.size();
+                team.run(nwork + (int)isl.smid_tasks.size(), [&](int i) {
+                    if (i >= nwork) {
+                        PROFILE_ACCUM("Static collisions");
+                        const auto [k, c] = isl.smid_tasks[i - nwork];
+                        static_mids_find(*isl.bodies[k], (size_t)c * kMidChunk, (size_t)(c + 1) * kMidChunk, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], isl.smid[i - nwork]);
+                        return;
+                    }
                     const Island::Work& w = isl.work[i];
                     const int k = (int)w.body;
                     SoftBody& b = *isl.bodies[k];
@@ -2092,12 +3197,20 @@ void World::simulate_island(Island& isl, int substeps) {
                     {
                         PROFILE_ACCUM("Static collisions");
                         collide_static(b, w.a, w.b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt, out.contacts);
+                        if (!isl.fem_chunked[k]) {
+                            if (w.a == 0 && !b.wheels.empty() && !b.rigid) ring_tyres(b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt);
+                            if (w.a == 0 && w.b == b.nodes.size() && !b.fem.tris.empty()) collide_static_mids(b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt, out.contacts);
+                        }
                     }
                     PROFILE_ACCUM("Integrate");
                     out.mn = vec3(1e30f);
                     out.mx = vec3(-1e30f);
                     out.max_v2 = 0;
                     isl.fem_defer[i] = 0;
+                    if (isl.fem_chunked[k]) { // (the rest of it once the body's chunks are in: below)
+                        isl.fem_defer[i] = 5;
+                        return;
+                    }
                     if (w.kind == 3) {
                         b.rigid_step(bdt, out.contacts > 0, out.mn, out.mx, out.max_v2);
                     } else {
@@ -2119,35 +3232,219 @@ void World::simulate_island(Island& isl, int substeps) {
                         b.integrate_nodes(w.a, w.b, bdt, out.mn, out.mx, out.max_v2);
                     }
                 });
+                // the chunked frames' bodies: their ring tyres and plates' mid points against the static world, then the
+                // frame's step (on the body's first chunk; the others integrate after it: 4)
+                {
+                    isl.fem_tasks.clear();
+                    for (int i = 0; i < (int)isl.work.size(); i++)
+                        if (isl.fem_defer[i] == 5 && isl.work[i].a == 0) isl.fem_tasks.push_back({i, 0});
+                    team.run((int)isl.fem_tasks.size(), [&](int t) {
+                        const int i0 = isl.fem_tasks[t].first;
+                        const int k = (int)isl.work[i0].body;
+                        SoftBody& b = *isl.bodies[k];
+                        const float bdt = dt / (float)isl.subs[k];
+                        {
+                            PROFILE_ACCUM("Static collisions");
+                            if (!b.wheels.empty() && !b.rigid) ring_tyres(b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt);
+                            if (const int t0 = isl.smid_first[k]; t0 >= 0)
+                                for (int q = t0; q < (int)isl.smid_tasks.size() && isl.smid_tasks[q].first == k; q++) static_mids_apply(b, isl.smid[q], bdt, isl.parts[i0].contacts);
+                        }
+                        int first = 4;
+                        static const bool no_held = getenv("BL_NOHELD") != nullptr;
+                        if (b.fem_every_step || (j == 0 && fem_due(b))) first = 1;
+                        else if (!b.rigid && !no_held) first = 2;
+                        else b.fem.hold(b, bdt);
+                        for (int i = i0; i < (int)isl.work.size() && (int)isl.work[i].body == k; i++) isl.fem_defer[i] = i == i0 ? first : 4;
+                    });
+                }
                 // the frames' implicit steps: each frame's components (parts held by mounts, solved apart) beside each
                 // other and the other frames'; then those bodies' integration
+                {
+                    PROFILE_ACCUM("Frame blocks wait");
+                    aside.wait();
+                }
+                for (const Island::PreTask& pt : isl.pre_tasks) isl.bodies[pt.k]->fem.mark_blocks(pt.c);
+                isl.pre_tasks.clear();
                 isl.fem_work.clear();
                 for (int i = 0; i < (int)isl.work.size(); i++) {
-                    if (!isl.fem_defer[i]) continue;
-                    SoftBody& b = *isl.bodies[isl.work[i].body];
-                    const float bdt = dt / (float)isl.subs[isl.work[i].body];
+                    if (!isl.fem_defer[i] || isl.fem_defer[i] == 4) continue;
+                    const int k = (int)isl.work[i].body;
+                    SoftBody& b = *isl.bodies[k];
+                    const float bdt = dt / (float)isl.subs[k];
                     int nc = 0;
                     if (isl.fem_defer[i] == 2) {
                         nc = b.fem.held_begin(b, bdt);
                         if (nc == 0) isl.fem_defer[i] = 3, b.fem.hold(b, bdt); // (no factorization yet: held)
                     } else {
-                        // (the numerical dissipation per step over the steps it spans: the same per second)
-                        const float hs = b.fem_every_step ? 1.0f : (float)b.fem_period;
-                        nc = b.fem.solve_begin(b, b.fem_every_step ? bdt : dt * (float)b.fem_period, bdt, settings.frame_theta,
-                                               (b.fem_dissipation >= 0 ? b.fem_dissipation : settings.frame_dissipation) / hs);
+                        nc = isl.fem_pre[k] ? isl.fem_pre_nc[k] : fem_begin(k);
+                        isl.fem_pre[k] = 2;
                     }
                     for (int c = 0; c < nc; c++) isl.fem_work.push_back({(uint32_t)i, c});
                 }
-                if (!isl.fem_work.empty() || std::find(isl.fem_defer.begin(), isl.fem_defer.end(), 3) != isl.fem_defer.end()) {
-                    team.run((int)isl.fem_work.size(), [&](int q) {
-                        SoftBody& b = *isl.bodies[isl.work[isl.fem_work[q].first].body];
-                        if (isl.fem_defer[isl.fem_work[q].first] == 2) {
-                            b.fem.held_component(b, isl.fem_work[q].second);
+                for (int k = 0; k < nb; k++) // (begun beside the contacts and not stepping now: never - see above)
+                    if (isl.fem_pre[k] == 1) fprintf(stderr, "frame of body %d begun beside the contacts, not stepped\n", k);
+                if (std::find_if(isl.fem_defer.begin(), isl.fem_defer.end(), [](char c) { return c != 0; }) != isl.fem_defer.end()) {
+                    // the large components (FemFrame::par_component) in the team's stages: their assembly in chunks
+                    // of columns, the rest of it, the factor's subtrees, the updates above those, then the rest of the
+                    // step beside the small components' whole steps and the held ones
+                    isl.fem_par.clear(), isl.fem_small.clear(), isl.fem_hpar.clear();
+                    for (const auto& fw : isl.fem_work) {
+                        const FemFrame& f = isl.bodies[isl.work[fw.first].body]->fem;
+                        if (isl.fem_defer[fw.first] == 1 && f.par_component(fw.second)) isl.fem_par.push_back(fw);
+                        else if (isl.fem_defer[fw.first] == 2 && f.held_par(fw.second)) isl.fem_hpar.push_back(fw);
+                        else isl.fem_small.push_back(fw);
+                    }
+                    auto small = [&](int q) {
+                        const auto& fw = isl.fem_small[q];
+                        SoftBody& b = *isl.bodies[isl.work[fw.first].body];
+                        if (isl.fem_defer[fw.first] == 2) {
+                            b.fem.held_component(b, fw.second);
                         } else {
                             PROFILE_ACCUM("Frame solve");
-                            b.fem.solve_component(b, isl.fem_work[q].second);
+                            b.fem.solve_component(b, fw.second);
                         }
-                    });
+                    };
+                    // (the large components held: their groups' right side and forward substitution beside the rest,
+                    // then the columns above, then the groups' backward substitution - held_component one after
+                    // another was a car's body's 24 us on one thread at every later short step)
+                    auto hpar_body = [&](int q) -> SoftBody& { return *isl.bodies[isl.work[isl.fem_hpar[q].first].body]; };
+                    isl.fem_htasks.clear();
+                    for (int q = 0; q < (int)isl.fem_hpar.size(); q++)
+                        for (int g = 0, n = hpar_body(q).fem.par_groups(isl.fem_hpar[q].second); g < n; g++) isl.fem_htasks.push_back({q, g});
+                    const int nsmall = (int)isl.fem_small.size(), nhf = (int)isl.fem_htasks.size();
+                    auto small_or_front = [&](int q) {
+                        if (q < nsmall) return small(q);
+                        const auto [h, g] = isl.fem_htasks[q - nsmall];
+                        hpar_body(h).fem.held_front(hpar_body(h), isl.fem_hpar[h].second, g);
+                    };
+                    auto held_rest = [&]() {
+                        if (isl.fem_hpar.empty()) return;
+                        team.run((int)isl.fem_hpar.size(), [&](int q) { hpar_body(q).fem.held_top(hpar_body(q), isl.fem_hpar[q].second); });
+                        team.run(nhf, [&](int t) {
+                            const auto [h, g] = isl.fem_htasks[t];
+                            hpar_body(h).fem.held_back(hpar_body(h), isl.fem_hpar[h].second, g);
+                        });
+                    };
+                    if (isl.fem_par.empty() && !isl.fem_hpar.empty() && team.parallel()) {
+                        // (the small ones taken by whoever is free in the large ones' three stages - the stages' own
+                        // chunks first, then the small ones till those are done, the last stage till none is left: all
+                        // of them in the first stage made it wait for them while two threads had the columns above)
+                        std::atomic<int> next_small{0}, stage_done{0};
+                        const int nfill = JobSystem::get().num_threads(), nhp = (int)isl.fem_hpar.size();
+                        auto fill = [&](int need, bool drain) {
+                            for (;;) {
+                                if (!drain && stage_done.load(std::memory_order_acquire) >= need) return;
+                                const int q = next_small.fetch_add(1, std::memory_order_acq_rel);
+                                if (q >= nsmall) return;
+                                small(q);
+                            }
+                        };
+                        auto stage = [&](int n, bool drain, auto&& own) {
+                            stage_done.store(0, std::memory_order_relaxed);
+                            team.run(n + nfill, [&](int t) {
+                                if (t >= n) return fill(n, drain);
+                                own(t);
+                                stage_done.fetch_add(1, std::memory_order_acq_rel);
+                            });
+                        };
+                        stage(nhf, false, [&](int t) {
+                            const auto [h, g] = isl.fem_htasks[t];
+                            hpar_body(h).fem.held_front(hpar_body(h), isl.fem_hpar[h].second, g);
+                        });
+                        stage(nhp, false, [&](int q) { hpar_body(q).fem.held_top(hpar_body(q), isl.fem_hpar[q].second); });
+                        stage(nhf, true, [&](int t) {
+                            const auto [h, g] = isl.fem_htasks[t];
+                            hpar_body(h).fem.held_back(hpar_body(h), isl.fem_hpar[h].second, g);
+                        });
+                        for (int q = next_small.load(); q < nsmall; q++) small(q); // (none left: the last stage drained them)
+                    } else if (isl.fem_par.empty()) {
+                        team.run(nsmall + nhf, small_or_front);
+                        held_rest();
+                    } else {
+                        auto par_body = [&](int q) -> SoftBody& { return *isl.bodies[isl.work[isl.fem_par[q].first].body]; };
+                        std::vector<int> all_par(isl.fem_par.size()), repass, back;
+                        for (int q = 0; q < (int)isl.fem_par.size(); q++) all_par[q] = q;
+                        const std::vector<int>* sel = &all_par;
+                        // (0: the assembly's chunks, 1: the subtrees' groups, 2: the deferred updates' groups, 3: the
+                        // subtrees' backward substitution)
+                        auto tasks = [&](int which) {
+                            isl.fem_tasks.clear();
+                            for (int q : *sel) {
+                                const FemFrame& f = par_body(q).fem;
+                                const int c = isl.fem_par[q].second;
+                                const int n = which == 0 ? f.asm_chunks(c) : which == 2 ? f.par_defers(c) : f.par_groups(c);
+                                for (int g = 0; g < n; g++) isl.fem_tasks.push_back({q, g});
+                            }
+                            team.run((int)isl.fem_tasks.size(), [&](int t) {
+                                const int q = isl.fem_tasks[t].first, g = isl.fem_tasks[t].second, c = isl.fem_par[q].second;
+                                SoftBody& b = par_body(q);
+                                PROFILE_ACCUM("Frame solve");
+                                if (which == 0) b.fem.solve_gather(b, c, g);
+                                else if (which == 1) b.fem.solve_factor(c, g);
+                                else if (which == 2) b.fem.solve_defer(c, g);
+                                else b.fem.solve_back(c, g);
+                            });
+                        };
+                        {
+                            PROFILE_ACCUM("FEM assemble");
+                            tasks(0);
+                            team.run((int)isl.fem_par.size(), [&](int q) {
+                                PROFILE_ACCUM("Frame solve");
+                                par_body(q).fem.solve_assemble(par_body(q), isl.fem_par[q].second);
+                            });
+                        }
+                        {
+                            PROFILE_ACCUM("FEM factor");
+                            tasks(1);
+                            tasks(2);
+                        }
+                        PROFILE_ACCUM("FEM finish");
+                        const int np = (int)isl.fem_par.size();
+                        // (the components that factored: their subtrees' backward substitution, then the rest of the pass)
+                        auto back_end = [&](const std::vector<int>& from) {
+                            back.clear();
+                            for (int q : from)
+                                if (par_body(q).fem.wants_back(isl.fem_par[q].second)) back.push_back(q);
+                            if (back.empty()) return;
+                            sel = &back;
+                            tasks(3);
+                            team.run((int)back.size(), [&](int i) {
+                                PROFILE_ACCUM("Frame solve");
+                                par_body(back[i]).fem.solve_finish_end(par_body(back[i]), isl.fem_par[back[i]].second);
+                            });
+                        };
+                        // (the finish of each - the small ones beside it)
+                        auto finish_run = [&](const std::vector<int>& list, bool with_small) {
+                            const int nl = (int)list.size();
+                            team.run(nl + (with_small ? nsmall + nhf : 0), [&](int t) {
+                                if (t >= nl) return small_or_front(t - nl);
+                                SoftBody& b = par_body(list[t]);
+                                PROFILE_ACCUM("Frame solve");
+                                b.fem.solve_finish(b, isl.fem_par[list[t]].second);
+                            });
+                        };
+                        finish_run(all_par, true);
+                        back_end(all_par);
+                        // (a hinge unloaded: that component's pass again, in the stages too - one after another it was a
+                        // whole factorization of a car's body on one thread, twice in a crash's substep)
+                        for (int round = 0; round < 2; round++) {
+                            repass.clear();
+                            for (int q = 0; q < np; q++)
+                                if (par_body(q).fem.wants_repass(isl.fem_par[q].second)) repass.push_back(q);
+                            if (repass.empty()) break;
+                            PROFILE_ACCUM("FEM repass");
+                            sel = &repass;
+                            team.run((int)repass.size(), [&](int i) {
+                                PROFILE_ACCUM("Frame solve");
+                                par_body(repass[i]).fem.solve_repass(par_body(repass[i]), isl.fem_par[repass[i]].second);
+                            });
+                            tasks(1);
+                            tasks(2);
+                            finish_run(repass, false);
+                            back_end(repass);
+                        }
+                        held_rest();
+                    }
                     for (int i = 0; i < (int)isl.work.size(); i++) {
                         if (isl.fem_defer[i] == 1) isl.bodies[isl.work[i].body]->fem.solve_end(*isl.bodies[isl.work[i].body]);
                         if (isl.fem_defer[i] == 2) isl.bodies[isl.work[i].body]->fem.held_end(*isl.bodies[isl.work[i].body]);
@@ -2204,7 +3501,42 @@ void World::simulate_island(Island& isl, int substeps) {
                     isl.mem_speed[k] = std::sqrt(m2);
                 }
             });
-            // 5) per body: bounds, top speed, frames; then the sheets' refinement and cracks
+            // 5) per body: bounds, top speed, frames; then the sheets' refinement and cracks. (The frames' double
+            // positions first, in chunks: one after another they were a millisecond of a crash's frame)
+            {
+                PROFILE_ACCUM("Frame sync");
+                constexpr size_t kSyncChunk = 64; // (a node's turn ~45 ns: 256 of them were a car's 11 us on one thread)
+                isl.fem_tasks.clear();
+                for (size_t i = 0; i < isl.work.size();) {
+                    const int k = (int)isl.work[i].body;
+                    const SoftBody& b = *isl.bodies[k];
+                    if (!b.fem.empty() && !b.rigid)
+                        for (size_t c = 0; c * kSyncChunk < b.fem.node.size(); c++) isl.fem_tasks.push_back({k, (int)c});
+                    while (i < isl.work.size() && (int)isl.work[i].body == k) i++;
+                }
+                team.run((int)isl.fem_tasks.size(), [&](int t) {
+                    SoftBody& b = *isl.bodies[isl.fem_tasks[t].first];
+                    const size_t c = (size_t)isl.fem_tasks[t].second;
+                    b.fem.sync_positions(b, dt / (float)isl.subs[isl.fem_tasks[t].first], c * kSyncChunk, (c + 1) * kSyncChunk);
+                });
+            }
+            // (the frames' splits and tears of the bodies that have some, beside each other: each one's pattern analysed
+            // again, a third of a millisecond, both cars' one after the other in a crash's substeps)
+            isl.ev_bodies.clear();
+            isl.ev_done.assign(nb, 0);
+            for (size_t i = 0; i < isl.work.size();) {
+                const int k = (int)isl.work[i].body;
+                const SoftBody& b = *isl.bodies[k];
+                if (!b.fem.empty() && !b.rigid && b.fem.pending()) isl.ev_bodies.push_back(k);
+                while (i < isl.work.size() && (int)isl.work[i].body == k) i++;
+            }
+            if (isl.ev_bodies.size() >= 2)
+                team.run((int)isl.ev_bodies.size(), [&](int q) {
+                    PROFILE_ACCUM("Frame events");
+                    const int k = isl.ev_bodies[q];
+                    SoftBody& b = *isl.bodies[k];
+                    isl.ev_done[k] = b.fem.process_events(b) ? 2 : 1;
+                });
             for (size_t i = 0; i < isl.work.size();) {
                 const int k = (int)isl.work[i].body;
                 SoftBody& b = *isl.bodies[k];
@@ -2223,13 +3555,15 @@ void World::simulate_island(Island& isl, int substeps) {
                 if (isl.mem_speed[k] >= 0) ms = isl.mem_speed[k]; // (after its membrane's projection: 5a)
                 if (ms > b.max_speed) b.max_speed = ms;
                 if (!b.fem.empty() && !b.rigid) {
-                    b.fem.sync_positions(b, dt / (float)isl.subs[k]);
+                    PROFILE_ACCUM("Frame events");
                     // the frame's splits and tears (new nodes: their contact pairs are inherited below)
-                    if (b.fem.pending() && b.fem.process_events(b)) b.topo_changed = true, b.topo_version++, b.shk.version++;
+                    const bool changed = isl.ev_done[k] ? isl.ev_done[k] == 2 : b.fem.pending() && b.fem.process_events(b);
+                    if (changed) b.topo_changed = true, b.topo_version++, b.shk.version++;
                 }
                 b.integrate_frames(dt / (float)isl.subs[k]);
                 if (!b.rigid && (!b.shell_events.empty() || b.shell_hit.speed > 0 || b.pattern_passes > 0)) {
                     lap(4);
+                    PROFILE_ACCUM("Sheet events");
                     b.process_shell_events();
                     lap(5);
                 }

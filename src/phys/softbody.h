@@ -23,7 +23,6 @@ namespace bl::phys {
 
 constexpr float kDefaultDt = 0.0005f; // 2000 Hz like RoR
 constexpr int kFrameEvery = 1;        // the FEM frames' implicit step every this many substeps: 2000 Hz (WorldSettings::frame_every)
-constexpr int kFrameEveryLag = 2;     // ... in a frame that lags (WorldSettings::frame_every_lag): 1000 Hz
 
 enum NodeFlag : uint16_t {
     NF_NONE = 0,
@@ -210,8 +209,16 @@ struct CollisionVolume {
     std::vector<vec4> planes;                // its faces at rest: n (outwards), w = d; inside n . x <= d
     std::vector<std::vector<uint8_t>> faces; // (each face's vertices in order round it: the debug view)
     float break_rms = 0.12f;
+    // a crush force (N; 0: none): the sum of its contacts' forces past it for kCrushTime and it is off - a bumper's
+    // reinforcement is crushed and gives way to the beam under it (a rigid bar met the other car's at 28 m/s: 22 MN at a
+    // point, all of it on its six anchors)
+    float break_force = 0;
+    static constexpr float kCrushTime = 0.003f;
+    float load = 0, crush = 0;               // (its contacts' forces this substep; the load past its crush force over time)
     bool broken = false;
     std::vector<uint32_t> parts;             // the body's own nodes it holds off (SoftBody::find_volume_parts)
+    vec3 color{-1, -1, -1};                  // (display) drawn as a solid of this colour (an engine block); negative: not drawn
+    bool tyre = false;                       // a ring tyre's (Wheel::ring): other bodies only - its tyre meets the static world
     // placed (SoftBody::place_volumes)
     bool placed = false;
     quat q;
@@ -232,6 +239,20 @@ struct CollisionVolume {
         for (size_t k = 0; k < wplanes.size(); k++) {
             const float s = wplanes[k].x * p.x + wplanes[k].y * p.y + wplanes[k].z * p.z - wplanes[k].w;
             if (s > best) best = s, face = (int)k;
+        }
+        return best;
+    }
+    // ... for the inside test: done at the first face it is outside of (then a positive value, not the largest) - a
+    // fitted zone has up to 60 faces, most points tested are outside
+    float depth_in(vec3 p, int& face) const {
+        float best = -1e30f;
+        face = 0;
+        for (size_t k = 0; k < wplanes.size(); k++) {
+            const float s = wplanes[k].x * p.x + wplanes[k].y * p.y + wplanes[k].z * p.z - wplanes[k].w;
+            if (s > best) {
+                best = s, face = (int)k;
+                if (s > 0) return s;
+            }
         }
         return best;
     }
@@ -463,7 +484,27 @@ struct Wheel {
     bool detached = false;
     int tag = -1;                   // user tag (vehicle builder: index of the wheel definition)
     // visual: tyre model type
-    enum Type : uint8_t { W_WHEELS, W_WHEELS2, W_MESHWHEELS, W_MESHWHEELS2, W_FLEXBODY } type = W_WHEELS;
+    enum Type : uint8_t { W_WHEELS, W_WHEELS2, W_MESHWHEELS, W_MESHWHEELS2, W_FLEXBODY, W_RING } type = W_WHEELS;
+    // (BeamLab) a ring tyre (the truck's `ringwheels`, World::ring_tyres): the rim a rigid round disc turning on the
+    // axle - its spin and its angle its own state, no rim or tread nodes (`nodes` empty; the wheel's mass on the axle
+    // nodes) - and the tyre a flexible ring over it: points round its tread (kRingRows across it) and its sidewalls,
+    // pressed in by the static world (a stiffness and a damping per area of the tyre), the tread's points in contact
+    // sheared along the ground (a brush: each held by its grip since it came into the patch, sliding past it). Other
+    // bodies meet it through a collision volume round it (CollisionVolume::tyre)
+    static constexpr int kRingRows = 3;
+    bool ring = false;
+    float spin = 0, angle = 0;       // rad/s about the axle (axle0 -> axle1), rad
+    vec3 ref{0, 1, 0};               // (the rim's reference across the axle, carried along as the axle turns)
+    float inertia = 1.0f;            // kg m2
+    float k_area = 6.0e6f, c_area = 6.0e3f;   // the tyre pressed in: N/m3 (per area, per metre), N s/m3
+    float k_shear = 9.0e6f, c_shear = 1.5e4f; // the tread sheared: N/m3, N s/m3
+    float grip = 1.0f;               // (times the ground's friction)
+    float crr = 0.012f;              // rolling resistance: its moment load x crr x radius
+    int ring_n = 40;                 // points round it
+    std::vector<vec3> shear;         // (each tread point's shear on the ground: ring_n x kRingRows, world)
+    std::vector<float> squash;       // (per point round it: how far the tread is pressed in - the visual)
+    std::vector<vec3> shift;         // (per point round it: its mean shear - the visual)
+    float load = 0;                  // (the ground's push on it at the last step, N)
 };
 
 // RoR slide node: a node pulled onto the nearest point of a rail (polyline of nodes) by a stiff spring.
@@ -526,6 +567,7 @@ public:
     // anchors or points not spanning a volume
     int add_volume(const std::string& name, const std::vector<uint32_t>& anchors, const std::vector<vec3>& points, float break_rms);
     void place_volumes();                                  // (every substep: their fits, see CollisionVolume)
+    void place_volume(size_t k);                           // (one of them: any order, side by side)
     void push_volume(CollisionVolume& cv, vec3 p, vec3 f); // a force f at p on it, onto its anchors (the force array)
     // Each volume's parts (after fem.finalize): the nodes of the frame's components held on by mounts (a part's side of
     // one) other than its anchors' - the hood, doors, lid, fenders, bumpers, not the body-in-white or the suspension -
@@ -618,6 +660,34 @@ public:
     bool is_static_like = false;        // anchored scenery (trees, bridges) -> sleeps aggressively
     int collision_group = 0;            // bodies with the same non-zero group don't collide
     float hull_depth = 0.3f;            // how deep behind a hull triangle (Triangle::two_sided false) a node is still pushed out (m)
+    // (BeamLab) the FEM plates' mid points: each of the frame's triangle elements (FemFrame::tris) has one at its
+    // centroid, collided beside its corners - against the static world, the other bodies' triangles and the collision
+    // volumes - its force onto its corners, a third each; no node of its own. Between its nodes a plate let a curb's
+    // edge, a pole, another car's corner or a volume's vertex through. Only the depth its corners' own contacts leave at
+    // the middle counts (their share of it there): a plate flat on the ground is its corners'. BL_NOMIDS=1: none
+    bool tri_mids = true;
+    // (collide_volumes: the plates' mid points - a FEM triangle's or a sheet triangle's middle p, how far its corners
+    // stand off it, the volumes whose parts hold all its corners, a bit each - sorted along the body's longest axis, kept
+    // from substep to substep. The body's own: kept per thread, a body's island taken by another thread found another
+    // thread's copy of other days, and a crash ran differently from run to run)
+    struct MidPoint {
+        vec3 p;
+        float rad;
+        uint32_t n[3];
+        uint32_t idx, parts;
+        bool fem;
+    };
+    struct MidCache {
+        size_t ntris = ~size_t(0), nshells = 0, nparts = 0, nnodes = 0;
+        int axis = 0;
+        float max_rad = 0;
+        std::vector<MidPoint> pts;
+    };
+    MidCache mid_cache;
+    std::vector<uint8_t> mid_touch;     // (per FemFrame::tris: its mid point's contacts in the last frame - bit 0 the static
+                                        // world, 1 another body's triangle, 2 a collision volume: the debug view)
+    std::vector<vec3> static_pen;       // (collide_static's, for them: each node's static contact this step, its normal x depth)
+    int mid_contacts = 0;               // (the mid points' contacts in the last frame: stats)
     // how far past its box the body reaches for other bodies' nodes: its hull triangles' depth, if it has any
     float hull_reach() const {
         if (hull_count < 0) {

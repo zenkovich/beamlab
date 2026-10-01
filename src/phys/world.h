@@ -33,15 +33,10 @@ struct WorldSettings {
     float frame_debris_mass = 40.0f;
     int max_substeps_per_frame = 100;   // slow-motion instead of spiral of death
     // the rates: the beams, shocks, wheels and contact forces every substep (2 kHz); the frames' implicit step
-    // (FemFrame: members and triangles) every frame_every substeps (1: 2 kHz), in a frame that lags (it needs half again
-    // the substeps of an average one, or the last one's physics took longer than an average frame) every
-    // frame_every_lag (2: 1 kHz;
-    // between, the frame answers the substep's forces through its factorization: FemFrame::held_begin); collision
-    // detection (the candidate pairs and the pairs within reach, see rebuild_pairs / near_pairs) at most collision_hz
-    // times a second
+    // (FemFrame: members and triangles) every frame_every substeps (1: 2 kHz; between, the frame answers the substep's
+    // forces through its factorization: FemFrame::held_begin), in every frame alike; collision detection (the candidate
+    // pairs and the pairs within reach, see rebuild_pairs / near_pairs) at most collision_hz times a second
     int frame_every = kFrameEvery;
-    int frame_every_lag = kFrameEveryLag;
-    bool lag_rate = true;               // (off: every frame at frame_every - the scripted runs' deterministic stepping)
     float collision_hz = 120.0f;
     bool inter_body_collisions = true;
     bool sleeping = true;
@@ -184,9 +179,34 @@ private:
     void fast_pairs(Island& isl);
     void refresh_fast_pairs(Island& isl);
     void near_pairs(Island& isl);
-    void collide_pairs(Island& isl);
-    void collide_volumes(Island& isl, float dt, bool bodies); // (the bodies' collision volumes: SoftBody::volumes)
+    // (detected: the narrow phase's geometry done already, pair_detect / mid_detect in the forces' team stage)
+    static constexpr uint32_t kPairChunkSize = 256;
+    static constexpr uint32_t kFemChunk = 256;       // (a frame's body's static contacts in chunks of nodes)
+    int pair_chunks(Island& isl);
+    void pair_detect(Island& isl, int c);
+    void collide_pairs(Island& isl, bool detected = false);
+    int mid_chunks(Island& isl);
+    void mid_detect(Island& isl, int c);
+    void collide_mid_pairs(Island& isl, bool detected = false); // (the FEM plates' mid points against the other bodies' triangles: SoftBody::tri_mids)
+    // (the bodies' collision volumes: SoftBody::volumes; stage 0 the whole of it, 1 their places and the look's parts -
+    // their count: volume_find for each, beside the forces - 2 the contacts' forces)
+    int collide_volumes(Island& isl, float dt, bool bodies, int stage = 0);
+    void volume_find(Island& isl, int sq);
     void inherit_pairs(Island& isl, int body);
+    // the body's ring tyres (Wheel::ring) against the static world, their spin with the drive and the brakes
+    void ring_tyres(SoftBody& b, const std::vector<int>& box_ids, const std::vector<int>& cyl_ids, float terrain_max_h, float dt);
+    // the FEM plates' mid points against the static world (SoftBody::tri_mids), after its nodes' (collide_static)
+    void collide_static_mids(SoftBody& b, const std::vector<int>& box_ids, const std::vector<int>& cyl_ids, float terrain_max_h, float dt, int& contacts);
+    // (collide_static_mids in two: the static world's contacts of the plates [k0, k1) - any thread, a range each -, then
+    // their forces in the plates' order)
+    struct StaticMid {
+        uint32_t k, n[3];
+        vec3 p;
+        ContactInfo c;
+    };
+    void static_mids_find(const SoftBody& b, size_t k0, size_t k1, const std::vector<int>& box_ids, const std::vector<int>& cyl_ids, float terrain_max_h,
+                          std::vector<StaticMid>& out) const;
+    void static_mids_apply(SoftBody& b, const std::vector<StaticMid>& hits, float dt, int& contacts);
     void collide_static(SoftBody& b, size_t n0, size_t n1, const std::vector<int>& box_ids, const std::vector<int>& cyl_ids, float terrain_max_h, float dt,
                         int& contacts);
     int repair_nodes(SoftBody& b); // resets non-finite / runaway nodes; -1 when the body cannot be repaired
@@ -200,7 +220,6 @@ private:
     int m_num_islands = 0;
     double m_accum = 0;
     double m_avg_frame = 0;         // average frame time (s), for the substep limit of step_frame
-    bool m_lagging = false;         // (step_frame: this frame lags - its frames' step at frame_every_lag)
     double m_time = 0;
     WorldStats m_stats;
     int m_next_id = 1;

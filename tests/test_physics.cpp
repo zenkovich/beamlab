@@ -1602,8 +1602,8 @@ static void test_fem_tris() {
         CHECK(std::fabs(got / want - 1) < 0.05, "clamped plate %.5g vs %.5g", got, want);
     }
     // a free plate spun about three axes: after a second it keeps its shape (little strain energy) and its energy; the
-    // frame's step at 2 kHz and at the default 1 kHz (the linearization over twice the step strains it a little more)
-    for (int fe : {1, kFrameEveryLag}) {
+    // frame's step at 2 kHz and at 1 kHz (the linearization over twice the step strains it a little more)
+    for (int fe : {1, 2}) {
         ShellSection s2 = make_shell_section("Steel", 0.002f);
         s2.yield = 0;
         auto w = world(false);
@@ -1699,11 +1699,20 @@ static void test_fem_tris() {
         for (const Node& x : b->nodes) finite &= std::isfinite(x.p.x + x.p.y + x.p.z);
         int gone = 0;
         for (const FrameTri& t : b->fem.tris) gone += t.broken;
-        // (torn, a triangle stays: the crack opens along its edges, the nodes there duplicated - none disappears)
-        printf("    strip pulled at twice its yield: %d tears, %zu -> %zu nodes, %d of %zu triangles gone, %d components\n", b->fem.tris_torn, nodes0,
-               b->nodes.size(), gone, tris0, b->fem.components());
-        CHECK(b->fem.tris_torn > 0 && finite && gone == 0 && b->nodes.size() > nodes0 && b->fem.tris.size() == tris0 && b->fem.components() >= 2,
-              "pulled strip: %d torn, finite %d, %d gone, %zu nodes, %d components", b->fem.tris_torn, (int)finite, gone, b->nodes.size(), b->fem.components());
+        // (torn, a triangle stays: the crack opens along its edges, the nodes there duplicated - none disappears; a small
+        // piece torn off loose, FemFrame::loose_tris, out of the frame but kept)
+        const size_t kept = b->fem.tris.size() + b->fem.loose_tris.size();
+        printf("    strip pulled at twice its yield: %d tears, %zu -> %zu nodes, %d of %zu triangles gone, %d components, %d fragments loose\n", b->fem.tris_torn,
+               nodes0, b->nodes.size(), gone, tris0, b->fem.components(), b->fem.loose_count);
+        // (a loose fragment keeps its shape: its springs near their lengths at the tear)
+        float worst = 0;
+        for (const Beam& bm : b->beams)
+            if (bm.flags & BF_NO_DEFORM) worst = std::max(worst, std::fabs(distance(b->nodes[bm.a].p, b->nodes[bm.b].p) - bm.L) / std::max(bm.L, 1e-6f));
+        printf("    its loose fragments' shape: springs within %.2f%% of their lengths\n", worst * 100);
+        CHECK(worst < 0.05f, "loose fragment stretched %.1f%%", worst * 100);
+        CHECK(b->fem.tris_torn > 0 && finite && gone == 0 && b->nodes.size() > nodes0 && kept == tris0 && (b->fem.components() >= 2 || b->fem.loose_count > 0),
+              "pulled strip: %d torn, finite %d, %d gone, %zu nodes, %d components, %d loose", b->fem.tris_torn, (int)finite, gone, b->nodes.size(), b->fem.components(),
+              b->fem.loose_count);
     }
     // a plate cut across by the laser: it parts along its edges into two pieces, no triangle removed, the nodes along the
     // cut duplicated
@@ -2416,11 +2425,15 @@ static void test_frame() {
             if (k == MountKind::Point) CHECK(ymin < 0.7f, "on a point mount the part did not swing down (%.3f)", ymin);
             else CHECK(ymin > 0.93f, "on a clamp the part swung down to %.3f", ymin);
         }
-        // a clamp (1000 N, 20 N m) and a load at the far corner: 20 N holds (11 N m), 80 N twists it off (46 N m)
+        // a clamp (1000 N, 55 N m) and a load at the far corner: 20 N holds (11 N m, the square's own 7.8 kg 27 N m more
+        // about the bolt), 80 N twists it off (46 N m and that)
         for (float P : {20.0f, 80.0f}) {
-            const int broken = run(make(0.96f, {{0, 0, MountKind::Clamp, 1000.0f, 20.0f, -1}}, f, q), 1500,
-                                   [&](SoftBody& x, int) { x.force[q[2]] += vec3(0, -P, 0); }, [](const SoftBody&) {});
-            printf("    a clamp (1000 N, 20 N m) with %.0f N at the far corner: %s\n", P, broken ? "let go" : "held");
+            float mmax = 0;
+            const int broken = run(make(0.96f, {{0, 0, MountKind::Clamp, 1000.0f, 55.0f, -1}}, f, q), 1500,
+                                   [&](SoftBody& x, int) { x.force[q[2]] += vec3(0, -P, 0); }, [&](const SoftBody& b) {
+                                       if (!b.fem.mounts.empty() && !b.fem.mounts[0].broken) mmax = std::max(mmax, b.fem.mounts[0].m);
+                                   });
+            printf("    a clamp (1000 N, 55 N m) with %.0f N at the far corner: %s (%.0f N m about its bolt)\n", P, broken ? "let go" : "held", mmax);
             CHECK((broken > 0) == (P > 50.0f), "the clamp with %.0f N at the far corner: %d let go", P, broken);
         }
         // one hinge (the part's two nodes on the x line): the far edge swings down, the hinge's line stays
@@ -2515,6 +2528,55 @@ static void test_hull() {
 // g as a whole (the spring's implicit part taken on the frame's side alone - the other end held still for the step -
 // took momentum out: a driven FEM car lost a third of its tyres' push); a ball of one node and a capsule rests on the
 // ground at its radius; a node thrown at a body's collision volume is kept out of it, the momentum kept
+// A ring tyre (Wheel::ring) on a quarter car: two axle nodes carrying 300 kg on flat ground - its deflection at rest
+// against the one its stiffness was given for (the patch as a circle pressed into the flat), still; driven, it rolls
+// the load on with the tread nearly not slipping; braked, it stops
+static void test_ring_tyre() {
+    printf("ring tyres\n");
+    auto make = [](World& w) {
+        w.settings.gravity = vec3(0, -9.81f, 0);
+        w.statics.terrain.create(41, 81, 1.0f, vec2(-20, -20));
+        w.statics.has_terrain = true;
+        w.statics.terrain.update_bounds();
+        auto body = std::make_unique<SoftBody>();
+        body->name = "quarter car";
+        body->can_sleep = false;
+        const uint32_t a0 = body->add_node(vec3(0, 0.35f, -0.12f), 150.0f, NF_NONE), a1 = body->add_node(vec3(0, 0.35f, 0.12f), 150.0f, NF_NONE);
+        body->add_beam(a0, a1, 1e7f, 1e3f, 1e12f, 1e12f);
+        Wheel wh;
+        wh.ring = true, wh.type = Wheel::W_RING;
+        wh.axle0 = a0, wh.axle1 = a1;
+        wh.radius = 0.32f, wh.rim_radius = 0.2f, wh.width = 0.22f, wh.mass = 20;
+        wh.inertia = 0.5f * 20 * 0.32f * 0.32f;
+        const float patch = (4.0f / 3.0f) * 0.22f * std::sqrt(2.0f * 0.32f * 0.02f);
+        wh.k_area = 2.0e5f / patch, wh.c_area = 1500.0f / patch, wh.k_shear = 1.5f * wh.k_area, wh.c_shear = 2.5f * wh.c_area;
+        wh.propulsed = 1, wh.braked = 1;
+        body->wheels.push_back(wh);
+        body->finalize();
+        return w.add_body(std::move(body));
+    };
+    World w;
+    SoftBody* b = make(w);
+    for (int f = 0; f < 120; f++) w.step_substeps(33);
+    const float y = 0.5f * (b->nodes[0].p.y + b->nodes[1].p.y), defl = 0.32f - y;
+    // (the load F = k_area w (4/3) d sqrt(2 R d) for the deflection d: solved for 300 kg)
+    const float kw = b->wheels[0].k_area * 0.22f * (4.0f / 3.0f) * std::sqrt(2.0f * 0.32f), want = std::pow(300.0f * 9.81f / kw, 1.0f / 1.5f);
+    CHECK(std::fabs(defl - want) < 0.003f && length(b->nodes[0].v) < 0.01f, "a ring tyre under 300 kg: pressed in %.4f m (want %.4f), %.3f m/s", defl, want, length(b->nodes[0].v));
+    printf("    300 kg on a ring tyre: pressed in %.1f mm (the patch's %.1f), load %.0f N\n", defl * 1e3f, want * 1e3f, b->wheels[0].load);
+    // driven: 400 N m for 2 s
+    for (int f = 0; f < 120; f++) {
+        for (int k = 0; k < 33; k++) b->wheels[0].torque = 400.0f, w.step_substeps(1);
+    }
+    const float v = -b->nodes[0].v.x, tread = b->wheels[0].spin * 0.32f; // (spin about +z: it rolls towards -x)
+    CHECK(v > 3.0f && std::fabs(tread - v) < 0.1f * v, "driven: the load at %.2f m/s, the tread at %.2f", v, tread);
+    printf("    driven 400 N m for 2 s: %.2f m/s, the tread at %.2f m/s (slip %.1f%%)\n", v, tread, 100.0f * (tread - v) / std::max(v, 1e-3f));
+    for (int f = 0; f < 180; f++) {
+        for (int k = 0; k < 33; k++) b->wheels[0].brake = 3000.0f, w.step_substeps(1);
+    }
+    CHECK(length(b->nodes[0].v) < 0.05f && std::fabs(b->wheels[0].spin) < 0.05f, "braked: %.3f m/s, spin %.3f rad/s", length(b->nodes[0].v), b->wheels[0].spin);
+    printf("    braked 3 kN m: stopped at %.3f m/s\n", length(b->nodes[0].v));
+}
+
 static void test_volumes() {
     printf("one-sided springs, a one-node ball, collision volumes\n");
     const FrameSection tube = frame_tube(2e-4f);
@@ -2599,6 +2661,24 @@ static void test_volumes() {
         printf("    a 2 kg node at 5 m/s into a box's volume: in to %.3f m past its face, momentum (%.2f %.2f %.2f), %d contacts\n", deepest - 0.1f, P.x, P.y, P.z,
                A->volumes[0].hits);
     }
+    // a volume's fit after its body turned at once (a spawn's heading, a reset): half a turn stalled the fit from the last
+    for (float deg : {90.0f, 180.0f, 179.0f}) {
+        SoftBody body;
+        std::vector<uint32_t> an;
+        for (int k = 0; k < 8; k++) an.push_back(body.add_node(vec3(2.0f * (float)(k & 1), (float)((k >> 1) & 1), 1.5f * (float)((k >> 2) & 1)), 10.0f, NF_NONE));
+        body.finalize();
+        std::vector<vec3> hull;
+        for (int k = 0; k < 8; k++) hull.push_back(vec3(0.1f + 1.8f * (float)(k & 1), 0.1f + 0.8f * (float)((k >> 1) & 1), 0.1f + 1.3f * (float)((k >> 2) & 1)));
+        body.add_volume("box", an, hull, 0.12f);
+        body.place_volumes();
+        const quat t = quat::axis_angle(vec3(0, 1, 0), deg * kDeg2Rad);
+        for (Node& n : body.nodes) n.p = vec3(5, 0, 5) + to_mat3(t) * n.p;
+        body.place_volumes();
+        const CollisionVolume& cv = body.volumes[0];
+        float err = 0;
+        for (size_t k = 0; k < hull.size() && k < cv.wverts.size(); k++) err = std::max(err, length(cv.wverts[k] - (vec3(5, 0, 5) + to_mat3(t) * hull[k])));
+        CHECK(!cv.broken && cv.placed && err < 1e-3f, "a volume turned %.0f deg at once: %s, its hull %.4f m off", deg, cv.broken ? "off" : "on", err);
+    }
     // the body's own parts (the frame's components with triangles on mounts: a hood, a door) held off its volumes, the
     // frame it rides on not: a plate on three soft mounts 10 cm over a wide box volume on a heavy frame, thrown down at
     // 8 m/s - its first blow (the mounts alone let it 20 cm into the box)
@@ -2660,6 +2740,134 @@ static void test_volumes() {
             CHECK(low < -0.1f, "the plate not held off went only %.3f m into it", -low);
             printf("    ... not held off (its nodes out of the volume's parts): %.3f m into it\n", -low);
         }
+    }
+}
+
+// the FEM plates' mid points (SoftBody::tri_mids): a plate of 2 mm steel (1 x 1 m, three cells along x: six triangles,
+// their mid points a sixth of a metre either side of its middle line, its corners half a metre) dropped 0.3 m flat on
+// a beam that runs under its middle between its corners, and on two blades (another body's triangles standing on edge
+// under its mid points, their corners far out). Held on them; without its mid points it falls through to the ground
+static void test_tri_mids() {
+    printf("the FEM plates' mid points\n");
+    const ShellSection s2 = make_shell_section("Steel", 0.002f);
+    for (int blades = 0; blades < 2; blades++)
+        for (int on = 1; on >= 0; on--) {
+            auto w = std::make_unique<World>();
+            w->statics.terrain.create(21, 21, 1.0f, vec2(-10, -10)); // (flat ground at y = 0)
+            w->statics.has_terrain = true;
+            w->statics.terrain.update_bounds();
+            if (!blades) {
+                w->statics.add_box(vec3(0, 0.45f, 0), vec3(1.0f, 0.05f, 0.2f), quat(), SURF_METAL);
+                w->statics.build_grid();
+            } else {
+                auto blade = std::make_unique<SoftBody>();
+                blade->name = "blades";
+                for (float z : {-1.0f / 6, 1.0f / 6}) {
+                    const uint32_t a = blade->add_node(vec3(-1, 0.5f, z), 10.0f, NF_FIXED | NF_CONTACTER), b = blade->add_node(vec3(1, 0.5f, z), 10.0f, NF_FIXED | NF_CONTACTER),
+                                   c = blade->add_node(vec3(0, -0.5f, z), 10.0f, NF_FIXED | NF_CONTACTER);
+                    Triangle t;
+                    t.a = a, t.b = b, t.c = c;
+                    t.rest_edge2 = 4.0f;
+                    blade->tris.push_back(t);
+                }
+                blade->finalize();
+                fix_inv_mass(*blade);
+                w->add_body(std::move(blade));
+            }
+            auto body = std::make_unique<SoftBody>();
+            body->name = "plate";
+            body->can_sleep = false;
+            const uint16_t si = body->fem.add_shell_section(s2);
+            ShellMesher m(*body);
+            m.grid(vec3(-0.5f, 0.8f, -0.5f), vec3(1.0f / 3, 0, 0), vec3(0, 0, 1), 3, 1, si, true);
+            m.finish();
+            body->fem.finalize(*body);
+            body->tri_mids = on != 0;
+            SoftBody* b = w->add_body(std::move(body));
+            int touched = 0;
+            float mass = 0;
+            for (const Node& x : b->nodes) mass += x.mass;
+            for (int f = 0; f < 60; f++) {
+                w->step_substeps(33);
+                touched += b->mid_contacts;
+            }
+            // (it lands with m g 0.3 and rings on: a thin plate on points; its ringing against that, its bulk's speed)
+            float low = 1e9f;
+            double ke = 0;
+            vec3 vm(0);
+            for (const Node& x : b->nodes) low = std::min(low, x.p.y), ke += 0.5 * x.mass * length2(x.v), vm += x.v * (x.mass / mass);
+            const double ring = ke / (mass * 9.81 * 0.3);
+            const char* on_what = blades ? "two blades (another body's triangles)" : "a beam";
+            if (on)
+                CHECK(low > 0.45f && ring < 0.01 && length(vm) < 0.1f && touched > 0 && b->fem.solve_failures == 0,
+                      "a plate dropped on %s under its mid points: its corners at %.3f m (the top 0.5), %.2f%% of its landing energy left, bulk %.3f m/s, %d mid contacts, %d failed solves",
+                      on_what, low, 100 * ring, length(vm), touched, b->fem.solve_failures);
+            else
+                CHECK(low < 0.1f, "without its mid points a plate fell through %s: its corners at %.3f m", on_what, low);
+            printf("    a 1 x 1 m plate dropped 0.3 m on %s under its middle, %s mid points: its corners at %.3f m (the top 0.5), %.2f%% of its landing energy left after 1 s, %d mid contacts\n",
+                   on_what, on ? "with" : "without", low, 100 * ring, touched);
+        }
+}
+
+// a sheet's triangles against another body's collision volume (SoftBody::tri_mids: the triangle clipped by the hull):
+// a 1 x 1 m sheet of two triangles (8 kg/m2 of steel) thrown flat at 3 m/s at a bar (a volume on a heavy body) that
+// runs under it between its corners - under its middle (0.4 m wide), or two off its triangles' middles (0.2 m wide,
+// either side of it) - it stops on it; without it goes through
+static void test_sheet_mids() {
+    printf("a sheet's triangles against a collision volume\n");
+    for (int on = 2; on >= 0; on--) {
+        auto w = std::make_unique<World>();
+        w->settings.gravity = vec3(0);
+        auto bar = std::make_unique<SoftBody>();
+        bar->name = "bar";
+        bar->can_sleep = false;
+        const std::vector<std::pair<float, float>> zs = on == 2 ? std::vector<std::pair<float, float>>{{0.25f, 0.45f}, {-0.45f, -0.25f}}
+                                                                : std::vector<std::pair<float, float>>{{-0.2f, 0.2f}};
+        for (auto [z0, z1] : zs) {
+            std::vector<uint32_t> an;
+            for (int k = 0; k < 8; k++)
+                an.push_back(bar->add_node(vec3(-1.0f + 2.0f * (float)(k & 1), 0.1f + 0.3f * (float)((k >> 1) & 1), z0 + (z1 - z0) * (float)((k >> 2) & 1)), 500.0f, NF_NONE));
+            for (int i = 0; i < 8; i++)
+                for (int j = i + 1; j < 8; j++) bar->add_beam(an[i], an[j], 1e8f, 1e4f, 1e12f, 1e12f);
+        }
+        bar->finalize();
+        for (size_t k = 0; k < zs.size(); k++) {
+            std::vector<uint32_t> an;
+            std::vector<vec3> hull;
+            for (int i = 0; i < 8; i++) {
+                an.push_back((uint32_t)(k * 8 + i));
+                hull.push_back(vec3(-1.0f + 2.0f * (float)(i & 1), 0.1f + 0.4f * (float)((i >> 1) & 1), zs[k].first + (zs[k].second - zs[k].first) * (float)((i >> 2) & 1)));
+            }
+            bar->add_volume("bar", an, hull, 0.2f);
+        }
+        w->add_body(std::move(bar));
+        auto sheet = std::make_unique<SoftBody>();
+        sheet->name = "sheet";
+        sheet->can_sleep = false;
+        uint32_t n[4];
+        for (int k = 0; k < 4; k++) n[k] = sheet->add_node(vec3(-0.5f + (float)(k & 1), 1.0f, -0.5f + (float)(k >> 1)), 0.0f);
+        sheet->add_shell(n[0], n[2], n[3], vec2(0, 0), vec2(0, 1), vec2(1, 1));
+        sheet->add_shell(n[0], n[3], n[1], vec2(0, 0), vec2(1, 1), vec2(1, 0));
+        sheet->shell_mat = mat_steel();
+        sheet->tri_mids = on != 0;
+        sheet->finalize();
+        sheet->finalize_shells(8.0f, kDefaultDt, 3, true);
+        for (Node& x : sheet->nodes) x.v = vec3(0, -3.0f, 0);
+        SoftBody* s = w->add_body(std::move(sheet));
+        float low = 1e9f;
+        int touched = 0;
+        for (int f = 0; f < 30; f++) {
+            w->step_substeps(33);
+            touched += s->mid_contacts;
+            for (const Node& x : s->nodes) low = std::min(low, x.p.y);
+        }
+        const char* where = on == 2 ? "(two) off its triangles' middles" : "under its middle";
+        if (on)
+            CHECK(low > 0.45f && touched > 0, "a sheet thrown at a bar %s went down to %.3f m (the bar's top 0.5), %d contacts", where, low, touched);
+        else
+            CHECK(low < 0.2f, "without its triangles a sheet went through the bar under its middle: down to %.3f m", low);
+        printf("    a 1 x 1 m sheet (two triangles) thrown at 3 m/s at a bar %s, %s its triangles: its corners down to %.3f m (the bar's top 0.5)\n", where,
+               on ? "with" : "without", low);
     }
 }
 
@@ -2811,6 +3019,9 @@ int main(int argc, char** argv) {
     run("fem_tri", test_fem_tris);
     run("hull", test_hull);
     run("volumes", test_volumes);
+    run("ring", test_ring_tyre);
+    run("mids", test_tri_mids);
+    run("sheet_mids", test_sheet_mids);
     if (do_bench) bench();
     printf("\n%d checks passed, %d failed\n", g_pass, g_fail);
     JobSystem::get().shutdown();
