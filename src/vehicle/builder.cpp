@@ -750,6 +750,7 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
             if (shell_id[t.shell] < 0) {
                 phys::ShellSection sec = phys::make_shell_section(d.fem_shells[t.shell].material, d.fem_shells[t.shell].thickness);
                 sec.color = d.fem_shells[t.shell].color;
+                if (d.fem_shells[t.shell].depth >= 0 && !getenv("BL_FEM_LEVEL")) sec.max_level = d.fem_shells[t.shell].depth;
                 shell_id[t.shell] = body.fem.add_shell_section(sec);
             }
             const uint32_t k = body.fem.add_tri((uint32_t)t.n1, (uint32_t)t.n2, (uint32_t)t.n3, (uint16_t)shell_id[t.shell], (int32_t)ti, fem_tri_coll[ti]);

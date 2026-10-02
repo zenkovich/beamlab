@@ -631,11 +631,12 @@ void Parser::keyword(Kw kw) {
         return;
     }
     case Kw::SET_FEM_SHELL: {
-        // (BeamLab) the shell of the triangle elements (fem_tris) that follow: material, thickness m[, r, g, b]
+        // (BeamLab) the shell of the triangle elements (fem_tris) that follow: material, thickness m[, r, g, b[, depth]]
         Document::FemShellDef d;
         if (ntok_ > 1) d.material = std::string(tok_[1]);
         if (ntok_ > 2) d.thickness = f(2);
         if (ntok_ > 5) d.color = vec3(f(3), f(4), f(5));
+        if (ntok_ > 6) d.depth = std::clamp((int)f(6), 0, 3);
         if (!(d.thickness > 0)) {
             warn_at(line_no_, "set_fem_shell: thickness %g, using 0.001", d.thickness);
             d.thickness = 0.001f;

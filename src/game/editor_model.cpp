@@ -1413,7 +1413,7 @@ std::string write_truck(const Model& m, bool preview) {
                 const FemPreset fp = m.fem_preset(k);
                 o += ";editor-fem: " + fmt("%d", k) + "\n";
                 o += "set_fem_shell " + fp.material + ", " + num(fp.thickness) + ", " + fmt("%.3f", fp.color.x) + ", " + fmt("%.3f", fp.color.y) + ", " + fmt("%.3f", fp.color.z) +
-                     "\n";
+                     (fp.depth >= 0 ? ", " + fmt("%d", fp.depth) : std::string()) + "\n";
                 for (const Tri& t : m.tris)
                     if (t.fem && std::clamp(t.fem_preset, 0, np - 1) == k) o += (mark(t.layer, -1), fmt("%d", t.a)) + ", " + fmt("%d", t.b) + ", " + fmt("%d", t.c) + "\n";
             }
@@ -1691,7 +1691,7 @@ bool import_document(const ror::Document& d, Model& m, std::vector<std::string>&
     // the FEM triangles and their shells (a preset each; the names are the editor's)
     for (const auto& fs : d.fem_shells) {
         FemPreset p;
-        p.material = fs.material, p.thickness = fs.thickness;
+        p.material = fs.material, p.thickness = fs.thickness, p.depth = fs.depth;
         if (fs.color.x >= 0) p.color = fs.color;
         p.name = fs.material + " " + fmt("%.1f", fs.thickness * 1000.0f) + " mm";
         m.fem_presets.push_back(p);

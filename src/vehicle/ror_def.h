@@ -390,12 +390,13 @@ struct Document {
     };
     std::vector<VolumeDef> volumes;
     // (BeamLab) `fem_tris`: n1, n2, n3 - triangle elements of the FEM frame (a shell: membrane and bending in the frame's
-    // implicit step; phys::FrameTri), of the `set_fem_shell material, thickness m[, r, g, b]` in effect before them (none:
-    // 1 mm steel). Their nodes are frame nodes (shared with the frame elements); their mass goes on them
+    // implicit step; phys::FrameTri), of the `set_fem_shell material, thickness m[, r, g, b[, refinement depth]]` in effect
+    // before them (none: 1 mm steel). Their nodes are frame nodes (shared with the frame elements); their mass goes on them
     struct FemShellDef {
         std::string material = "Steel";
         float thickness = 0.001f;
         vec3 color{-1, -1, -1};     // (below 0: the vehicle's paint)
+        int depth = -1;             // bisections of its triangles where they yield (ShellSection::max_level; -1: its default)
     };
     std::vector<FemShellDef> fem_shells;
     struct FemTriDef {

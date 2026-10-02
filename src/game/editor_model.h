@@ -63,6 +63,7 @@ struct FemPreset {
     std::string material = "Steel";
     float thickness = 0.001f;
     vec3 color{0.78f, 0.14f, 0.10f};
+    int depth = -1;                 // its triangles' refinement depth (set_fem_shell's last; -1: the material's default)
 };
 
 struct Layer {
