@@ -971,7 +971,7 @@ void App::frame(float dt) {
                 for (const phys::FrameTri& t : f.tris) dented += !t.broken && t.dmg > 0;
                 printf(" | tris %zu, %d torn, %d dented", f.tris.size(), f.tris_torn, dented);
                 if (!f.mounts.empty()) printf(", mounts %d of %zu let go", f.mounts_broken, f.mounts.size());
-                printf(", %d loose", f.loose_count);
+                printf(", %d loose, %d left on a corner", f.loose_count, std::max(0, f.vertex_hinges() - f.authored_hinges));
             }
             if (!v->body->volumes.empty()) { // (its collision volumes: their contacts so far, the largest force, off)
                 printf(" | volumes:");

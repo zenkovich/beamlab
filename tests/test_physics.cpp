@@ -1710,6 +1710,7 @@ static void test_fem_tris() {
             if (bm.flags & BF_NO_DEFORM) worst = std::max(worst, std::fabs(distance(b->nodes[bm.a].p, b->nodes[bm.b].p) - bm.L) / std::max(bm.L, 1e-6f));
         printf("    its loose fragments' shape: springs within %.2f%% of their lengths\n", worst * 100);
         CHECK(worst < 0.05f, "loose fragment stretched %.1f%%", worst * 100);
+        CHECK(b->fem.vertex_hinges() == 0, "pulled strip: %d triangles' groups left on one corner", b->fem.vertex_hinges());
         CHECK(b->fem.tris_torn > 0 && finite && gone == 0 && b->nodes.size() > nodes0 && kept == tris0 && (b->fem.components() >= 2 || b->fem.loose_count > 0),
               "pulled strip: %d torn, finite %d, %d gone, %zu nodes, %d components, %d loose", b->fem.tris_torn, (int)finite, gone, b->nodes.size(), b->fem.components(),
               b->fem.loose_count);
@@ -1732,6 +1733,99 @@ static void test_fem_tris() {
                b->fem.components());
         CHECK(cut > 0 && gone == 0 && b->nodes.size() > nodes0 && b->fem.components() == 2 && finite, "laser cut: %d tears, %d gone, %d components", cut, gone,
               b->fem.components());
+        CHECK(b->fem.vertex_hinges() == 0, "laser cut: %d nodes with triangles on a corner alone", b->fem.vertex_hinges());
+    }
+    // a plate held at its root torn at a corner, pulled far past its yield: the crack runs in along the triangles' edges,
+    // each torn edge parting whole (both its nodes duplicated); no triangle is left on the rest by one corner, none is
+    // removed, the pieces torn off loose or whole
+    {
+        auto w = world(false);
+        ShellSection s2 = make_shell_section("Steel", 0.002f);
+        SoftBody* b = w->add_body(tri_plate(0.4f, 0.4f, 8, 8, s2, true));
+        uint32_t corner = 0;
+        for (uint32_t i = 0; i < b->nodes.size(); i++)
+            if (b->nodes[i].p.x + b->nodes[i].p.z > b->nodes[corner].p.x + b->nodes[corner].p.z) corner = i;
+        const size_t tris0 = b->fem.tris.size(), nodes0 = b->nodes.size();
+        const float P = 1.5f * s2.yield * s2.t * 0.05f;
+        bool pulling = true;
+        const vec3 p0 = b->nodes[corner].p;
+        b->pre_substep = [&](SoftBody& x, float) { // (until it tears off: a piece pulled on flies off for good)
+            if (pulling && corner < x.force.size() && x.fem.slot(corner) >= 0 && distance(x.nodes[corner].p, p0) < 0.25f) x.force[corner] += vec3(P, 0.3f * P, P);
+        };
+        for (int i = 0; i < 4000 && b->fem.tris_torn < 6; i++) w->step_substeps(1);
+        pulling = false;
+        for (int i = 0; i < 400; i++) w->step_substeps(1);
+        bool finite = true;
+        for (const Node& x : b->nodes) finite &= std::isfinite(x.p.x + x.p.y + x.p.z);
+        int gone = 0;
+        for (const FrameTri& t : b->fem.tris) gone += t.broken;
+        const size_t kept = b->fem.tris.size() - gone + b->fem.loose_tris.size();
+        printf("    plate torn at a corner: %d tears, %zu -> %zu nodes, %zu of %zu triangles kept (%zu loose), %d left on one corner\n", b->fem.tris_torn, nodes0,
+               b->nodes.size(), kept, tris0, b->fem.loose_tris.size(), b->fem.vertex_hinges());
+        CHECK(b->fem.tris_torn > 0 && finite && kept == tris0 && b->fem.vertex_hinges() == 0, "corner tear: %d tears, finite %d, %zu of %zu kept, %d hinges",
+              b->fem.tris_torn, (int)finite, kept, tris0, b->fem.vertex_hinges());
+    }
+    // the same plate under a sheet laid over its elements (a car's skin over its body-in-white, Vehicle::make_sheet_body):
+    // the sheet parts with them (SoftBody::sheet_follow) - each shell stays on its element's corners, none is linked
+    // across a torn edge or drawn out over the crack -, it does not crack on its own; the mass is kept
+    {
+        auto w = world(false);
+        ShellSection s2 = make_shell_section("Steel", 0.002f);
+        auto pb = tri_plate(0.4f, 0.4f, 8, 8, s2, true);
+        auto uv = [&](uint32_t n) { return vec2(pb->nodes[n].p.x, pb->nodes[n].p.z); };
+        for (const FrameTri& t : pb->fem.tris) {
+            const uint32_t a = pb->fem.node[t.n[0]], c = pb->fem.node[t.n[1]], d = pb->fem.node[t.n[2]];
+            pb->add_shell(a, c, d, uv(a), uv(c), uv(d));
+        }
+        pb->shell_mat = mat_steel();
+        pb->finalize_shells(4.7f, kDefaultDt, 7, true);
+        pb->fem.bind_sheet(*pb);
+        int hosted0 = 0;
+        for (const Shell& s : pb->shells) hosted0 += pb->on_plate(s);
+        const size_t tris0 = pb->fem.tris.size();
+        SoftBody* b = w->add_body(std::move(pb));
+        uint32_t corner = 0;
+        for (uint32_t i = 0; i < b->nodes.size(); i++)
+            if (b->nodes[i].p.x + b->nodes[i].p.z > b->nodes[corner].p.x + b->nodes[corner].p.z) corner = i;
+        double mass0 = 0;
+        for (const Node& x : b->nodes) mass0 += x.mass;
+        const float P = 1.5f * s2.yield * s2.t * 0.05f;
+        bool pulling = true;
+        const vec3 p0 = b->nodes[corner].p;
+        b->pre_substep = [&](SoftBody& x, float) { // (until it tears off: a piece pulled on flies off for good)
+            if (pulling && corner < x.force.size() && x.fem.slot(corner) >= 0 && distance(x.nodes[corner].p, p0) < 0.25f) x.force[corner] += vec3(P, 0.3f * P, P);
+        };
+        for (int i = 0; i < 4000 && b->fem.tris_torn < 6; i++) w->step_substeps(1);
+        pulling = false;
+        for (int i = 0; i < 400; i++) w->step_substeps(1);
+        bool finite = true;
+        double mass = 0;
+        for (const Node& x : b->nodes) finite &= std::isfinite(x.p.x + x.p.y + x.p.z), mass += x.mass;
+        const FemFrame& f = b->fem;
+        int off = 0, across = 0, hosted = 0;
+        float worst = 0;
+        for (const Shell& s : b->shells) {
+            for (int e = 0; e < 3; e++) worst = std::max(worst, distance(b->nodes[s.n[e]].p, b->nodes[s.n[(e + 1) % 3]].p) / s.L0[e]);
+            if (!b->on_plate(s)) continue;
+            hosted++;
+            const FrameTri& h = f.tris[s.host];
+            for (uint32_t n : s.n)
+                off += f.slot(n) >= 0 && f.node[h.n[0]] != n && f.node[h.n[1]] != n && f.node[h.n[2]] != n;
+            for (int e = 0; e < 3; e++) {
+                const int j = s.nb[e];
+                if (j < 0 || !b->on_plate(b->shells[j]) || b->shells[j].host == s.host) continue;
+                int same = 0;
+                for (uint32_t x : h.n)
+                    for (uint32_t y : f.tris[b->shells[j].host].n) same += f.node[x] == f.node[y];
+                across += same < 2;
+            }
+        }
+        printf("    ... under a sheet (%d shells, one on each): %d tears, %d of the %zu shells now on their elements, %d corners off them, %d links across a tear, "
+               "longest edge x%.2f, mass %.4f -> %.4f kg\n", hosted0, f.tris_torn, hosted, b->shells.size(), off, across, worst, mass0, mass);
+        CHECK(hosted0 == (int)tris0 && f.tris_torn > 0 && finite && off == 0 && across == 0 && worst < 2.5f && f.vertex_hinges() == 0 &&
+                  std::fabs(mass - mass0) < 1e-3 * mass0,
+              "corner tear under a sheet: %d of %zu bound, %d tears, finite %d, %d off, %d across, x%.2f, %d hinges, mass %.4f -> %.4f", hosted0, tris0,
+              f.tris_torn, (int)finite, off, across, worst, f.vertex_hinges(), mass0, mass);
     }
     // a hollow steel cube (1 m, 2 mm, 5 x 5 cells a face) dropped 1 m on its face: it lands and rests, sound
     {

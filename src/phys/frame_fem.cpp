@@ -5,9 +5,11 @@
 #include "core/profiler.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -407,6 +409,7 @@ void FemFrame::finalize(const SoftBody& b) {
     tan_.assign(elems.size(), Tangent());
     tri_tan_.assign(tris.size(), TriTan());
     ready_ = true;
+    authored_hinges = vertex_hinges();
 }
 
 // The mounts' springs: b (and a clamp's, a hinge's other nodes) held at a's points (explicit; acting for the frame's
@@ -3253,8 +3256,11 @@ void FemFrame::compact(SoftBody& b) {
         if (!e.broken) es.push_back(e);
     for (const FrameElement& e : es) keep[e.a] = keep[e.b] = 0;
     std::vector<FrameTri> ts;
-    for (const FrameTri& t : tris)
-        if (!t.broken) ts.push_back(t);
+    std::vector<int32_t> tri_new(tris.size(), -1); // (a sheet over the triangles: its shells' elements renumbered too)
+    for (size_t u = 0; u < tris.size(); u++)
+        if (!tris[u].broken) tri_new[u] = (int32_t)ts.size(), ts.push_back(tris[u]);
+    for (Shell& sh : b.shells)
+        if (sh.host >= 0) sh.host = (size_t)sh.host < tri_new.size() ? tri_new[sh.host] : -1;
     for (const FrameTri& t : ts) keep[t.n[0]] = keep[t.n[1]] = keep[t.n[2]] = 0;
     std::vector<uint32_t> nn;
     std::vector<quat> qq;
@@ -3330,10 +3336,18 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
     }
     for (const Beam& bm : b.beams)
         if (!(bm.flags & BF_BROKEN)) join(bm.a, bm.b), hold(bm.a), hold(bm.b);
-    for (const Shell& sh : b.shells) join(sh.n[0], sh.n[1]), join(sh.n[1], sh.n[2]), hold(sh.n[0]), hold(sh.n[1]), hold(sh.n[2]);
+    // (a sheet over the triangle elements goes with them; any other holds its nodes)
+    for (const Shell& sh : b.shells) {
+        join(sh.n[0], sh.n[1]), join(sh.n[1], sh.n[2]);
+        if (!b.on_plate(sh)) hold(sh.n[0]), hold(sh.n[1]), hold(sh.n[2]);
+        else
+            for (uint32_t v : sh.n)
+                if (v < n) other[v] = 1;
+    }
+    const std::vector<char> of_shell = b.shell_tri_mask(); // (the sheet's own: with its shells above)
     for (size_t ti = 0; ti < b.tris.size(); ti++) { // (a hull triangle holds nothing: it goes with the debris, torn)
         const Triangle& t = b.tris[ti];
-        if (t.torn || !t.two_sided) continue;
+        if (t.torn || !t.two_sided || of_shell[ti]) continue;
         join(t.a, t.b), join(t.b, t.c);
         if (fem_coll[ti]) other[t.a] = other[t.b] = other[t.c] = 1; // (a triangle element's: it goes with it)
         else hold(t.a), hold(t.b), hold(t.c);                        // (the body's skin, its mesh's: it stays)
@@ -3706,16 +3720,23 @@ int FemFrame::release_latches(SoftBody& b) {
 
 uint32_t FemFrame::detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint32_t>& moved) {
     // the copy: the moved triangles' share of the node's mass, a third at least (a light copy on a small piece rang at
-    // the step); the node keeps the rest - its members, loads, springs
+    // the step); the node keeps the rest - its members, loads, springs. A sheet over the triangles goes with them
+    // (SoftBody::sheet_follow): the shares are of the node's own mass, its shells' thirds go with the shells
     const uint32_t v = node[fn];
+    const bool sheet = !b.shells.empty() && v < b.node_base_mass.size();
+    const float own = sheet ? b.node_base_mass[v] : b.nodes[v].mass;
     float share = 0;
     for (uint32_t u : moved) share += tris[u].mass / 3.0f;
     const bool fixed = b.nodes[v].inv_mass <= 0;
-    share = fixed ? std::max(share, 1e-3f) : std::clamp(std::max(share, b.nodes[v].mass / 3.0f), 1e-3f, 0.7f * b.nodes[v].mass);
+    share = fixed ? std::max(share, 1e-3f) : std::max(1e-3f, std::min(std::max(share, own / 3.0f), 0.7f * own));
     const uint32_t c = clone_node(b, v);
     b.info[c].flags &= (uint16_t)~NF_FIXED;
     set_mass(b.nodes[c], share, false);
     if (!fixed) set_mass(b.nodes[v], b.nodes[v].mass - share, false);
+    if (sheet) {
+        b.node_base_mass[c] = share;
+        if (!fixed) b.node_base_mass[v] = std::max(0.0f, own - share);
+    }
     const uint32_t fc = add_node(c);
     q[fc] = q[fn];
     w[fc] = w[fn];
@@ -3731,11 +3752,36 @@ uint32_t FemFrame::detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint3
             if (ct.c == v) ct.c = c;
         }
     }
+    if (!b.shells.empty()) b.sheet_follow(v, c, moved);
     node_inertia(fn, b), node_inertia(fc, b);
     debris_check = true;
     ready_ = false;
     b.topo_changed = true, b.topo_version++;
     return fc;
+}
+
+void FemFrame::bind_sheet(SoftBody& b) {
+    auto key = [](uint32_t x, uint32_t y, uint32_t z) {
+        std::array<uint32_t, 3> k{x, y, z};
+        std::sort(k.begin(), k.end());
+        return k;
+    };
+    std::map<std::array<uint32_t, 3>, int> shell_of, tri_of;
+    for (size_t si = 0; si < b.shells.size(); si++) shell_of.emplace(key(b.shells[si].n[0], b.shells[si].n[1], b.shells[si].n[2]), (int)si);
+    const std::vector<char> of_shell = b.shell_tri_mask();
+    for (size_t i = 0; i < b.tris.size(); i++)
+        if (!of_shell[i]) tri_of.emplace(key(b.tris[i].a, b.tris[i].b, b.tris[i].c), (int)i);
+    for (size_t u = 0; u < tris.size(); u++) {
+        FrameTri& t = tris[u];
+        const auto k = key(node[t.n[0]], node[t.n[1]], node[t.n[2]]);
+        if (auto s = shell_of.find(k); s != shell_of.end()) {
+            b.shells[s->second].host = (int32_t)u;
+            t.coll = -1;
+            continue;
+        }
+        const auto c = tri_of.find(k);
+        t.coll = c != tri_of.end() ? c->second : -1;
+    }
 }
 
 int FemFrame::part_tris(SoftBody& b, const std::vector<uint32_t>& crossed, const std::function<float(vec3)>& side) {
@@ -3746,6 +3792,24 @@ int FemFrame::part_tris(SoftBody& b, const std::vector<uint32_t>& crossed, const
             for (uint32_t k : tris[ti].n)
                 if (std::find(corners.begin(), corners.end(), k) == corners.end()) corners.push_back(k);
     int n = 0;
+    std::vector<uint32_t> copies;
+    // (the fans as they were round the corners and round their fans' other nodes: parted by side, a corner parts the
+    // edges from it between triangles on the two sides too, and those edges' far ends may be left joining the two by
+    // their node alone)
+    std::vector<uint32_t> near = corners;
+    for (size_t u = 0; u < tris.size(); u++) {
+        const FrameTri& t = tris[u];
+        if (t.broken) continue;
+        bool touches = false;
+        for (uint32_t v : t.n) touches |= std::find(corners.begin(), corners.end(), v) != corners.end();
+        if (touches)
+            for (uint32_t v : t.n)
+                if (std::find(near.begin(), near.end(), v) == near.end()) near.push_back(v);
+    }
+    std::vector<std::vector<uint32_t>> fan0(near.size());
+    std::vector<std::vector<int>> g0(near.size());
+    for (size_t q = 0; q < near.size(); q++) fan_groups(near[q], {}, fan0[q], g0[q]);
+    std::vector<int> copy_of;
     for (uint32_t fn : corners) {
         std::vector<uint32_t> pos;
         bool neg = false;
@@ -3756,9 +3820,13 @@ int FemFrame::part_tris(SoftBody& b, const std::vector<uint32_t>& crossed, const
             else neg = true;
         }
         if (pos.empty() || !neg) continue;
-        detach_tris(b, fn, pos);
+        copies.push_back(detach_tris(b, fn, pos));
+        copy_of.push_back((int)(std::find(corners.begin(), corners.end(), fn) - corners.begin()));
         n++;
     }
+    // (and no triangle left on the rest by one corner where the cut split a group: split_refine)
+    for (size_t q = 0; q < near.size(); q++) n += split_refine(b, near[q], fan0[q], g0[q], {});
+    for (size_t q = 0; q < copies.size(); q++) n += split_refine(b, copies[q], fan0[copy_of[q]], g0[copy_of[q]], {});
     for (uint32_t ti : crossed)
         if (ti < tris.size()) tris[ti].tears = (uint8_t)std::min(3, tris[ti].tears + 1);
     tris_torn += (int)crossed.size();
@@ -3800,97 +3868,82 @@ int FemFrame::tear_tri(SoftBody& b, uint32_t ti, vec3 pull) {
     }
     int order[3] = {0, 1, 2};
     std::sort(order, order + 3, [&](int x, int y) { return score[x] < score[y]; });
-    // the frame's triangles at a node, the node's split along a cut through its fan (the edges to `cut` nodes): the
-    // triangles on the torn element's side take a copy of the node; false if the fan stays whole
-    auto split_node = [&](uint32_t fn, uint32_t along) -> bool {
-        std::vector<uint32_t> fan;
-        for (size_t u = 0; u < tris.size(); u++)
-            if (!tris[u].broken && (tris[u].n[0] == fn || tris[u].n[1] == fn || tris[u].n[2] == fn)) fan.push_back((uint32_t)u);
-        if (fan.size() < 2) return false;
-        // (each triangle's two other corners: the edges at the node it has)
-        auto others = [&](uint32_t u, uint32_t& o1, uint32_t& o2) {
-            const FrameTri& x = tris[u];
-            const int k = x.n[0] == fn ? 0 : x.n[1] == fn ? 1 : 2;
-            o1 = x.n[(k + 1) % 3], o2 = x.n[(k + 2) % 3];
-        };
-        auto groups = [&](const std::vector<uint32_t>& cut, std::vector<int>& comp) {
-            comp.assign(fan.size(), -1);
-            int nc = 0;
-            for (size_t i = 0; i < fan.size(); i++) {
-                if (comp[i] >= 0) continue;
-                std::vector<size_t> stack{i};
-                comp[i] = nc;
-                while (!stack.empty()) {
-                    const size_t x = stack.back();
-                    stack.pop_back();
-                    uint32_t a1, a2;
-                    others(fan[x], a1, a2);
-                    for (size_t y = 0; y < fan.size(); y++) {
-                        if (comp[y] >= 0) continue;
-                        uint32_t b1, b2;
-                        others(fan[y], b1, b2);
-                        for (uint32_t e : {a1, a2})
-                            if ((e == b1 || e == b2) && std::find(cut.begin(), cut.end(), e) == cut.end()) {
-                                comp[y] = nc, stack.push_back(y);
-                                break;
-                            }
-                    }
-                }
-                nc++;
+    // The edge parts all along, both its ends duplicated: an end inside the sheet (its fan still one round it with the
+    // edge cut) takes the crack on along its edge straightest on from the torn one - shared by two triangles, not the
+    // two parted ones' third corners - and that edge's far end is the crack's tip, shared by both sides. A node is
+    // split only by its fan's groups, every group of triangles joined round it by their edges a node of its own: no
+    // triangle is left on the rest by one corner (the crack's two sides hung on a node and swung there, a hole beside).
+    constexpr uint32_t kNone = ~0u;
+    std::vector<uint32_t> fan;
+    std::vector<int> grp;
+    auto pos = [&](uint32_t fn) { return b.nodes[node[fn]].p; };
+    auto onward = [&](uint32_t v, uint32_t from, uint32_t skip1, uint32_t skip2) -> uint32_t {
+        fan_groups(v, {}, fan, grp);
+        const vec3 p = pos(v), dir = normalize_or(p - pos(from), vec3(0));
+        float best = -2.0f;
+        uint32_t next = kNone;
+        for (uint32_t u : fan)
+            for (uint32_t e : tris[u].n) {
+                if (e == v || e == from || e == skip1 || e == skip2) continue;
+                int users = 0;
+                for (uint32_t w2 : fan) users += tris[w2].n[0] == e || tris[w2].n[1] == e || tris[w2].n[2] == e;
+                if (users != 2) continue;
+                const float c = dot(normalize_or(pos(e) - p, vec3(0)), dir);
+                if (c > best) best = c, next = e;
             }
-            return nc;
-        };
-        std::vector<uint32_t> cut{along};
-        std::vector<int> comp;
-        if (groups(cut, comp) < 2) {
-            // a node inside the sheet: the crack goes on along the fan's edge straightest on from the torn one (an edge
-            // two triangles share, not the torn element's own: that would cut it off all round)
-            const vec3 p = b.nodes[node[fn]].p, dir = normalize_or(p - b.nodes[node[along]].p, vec3(0));
-            float best = -2.0f;
-            uint32_t next = along;
-            const FrameTri& tt = tris[ti];
-            for (uint32_t u : fan) {
-                uint32_t o1, o2;
-                others(u, o1, o2);
-                for (uint32_t e : {o1, o2}) {
-                    if (e == along || e == tt.n[0] || e == tt.n[1] || e == tt.n[2]) continue;
-                    int users = 0;
-                    for (uint32_t w2 : fan) {
-                        uint32_t q1, q2;
-                        others(w2, q1, q2);
-                        users += q1 == e || q2 == e;
-                    }
-                    if (users < 2) continue;
-                    const float c = dot(normalize_or(b.nodes[node[e]].p - p, vec3(0)), dir);
-                    if (c > best) best = c, next = e;
-                }
-            }
-            if (next == along) return false;
-            cut.push_back(next);
-            if (groups(cut, comp) < 2) return false;
-        }
-        int mine = -1;
-        for (size_t i = 0; i < fan.size(); i++)
-            if (fan[i] == ti) mine = comp[i];
-        std::vector<uint32_t> moved;
-        for (size_t i = 0; i < fan.size(); i++)
-            if (comp[i] == mine) moved.push_back(fan[i]);
-        detach_tris(b, fn, moved);
-        return true;
+        return next;
     };
     for (int k : order) {
-        const uint32_t a = t0.n[k], c = t0.n[(k + 1) % 3];
-        // (an edge no other triangle shares is the sheet's edge already: nothing to tear there)
-        bool shared = false;
-        for (size_t u = 0; u < tris.size() && !shared; u++) {
+        const uint32_t a = t0.n[k], c = t0.n[(k + 1) % 3], t3 = t0.n[(k + 2) % 3];
+        // (the triangle across: none - the sheet's edge already, nothing to tear there; more - a seam of three, left)
+        int tj = -1, across = 0;
+        for (size_t u = 0; u < tris.size(); u++) {
             if (u == ti || tris[u].broken) continue;
             int hit = 0;
             for (uint32_t x : tris[u].n) hit += x == a || x == c;
-            shared = hit == 2;
+            if (hit == 2) tj = (int)u, across++;
         }
-        if (!shared) continue;
-        const bool sa = split_node(a, c), sc = split_node(c, a);
-        if (!sa && !sc) continue;
+        if (across != 1) continue;
+        uint32_t j3 = kNone;
+        for (uint32_t x : tris[tj].n)
+            if (x != a && x != c) j3 = x;
+        // (an end parts when the two triangles fall in different groups round it with the cut: one inside the sheet
+        // needs the crack on along another edge for that)
+        auto parted = [&](uint32_t v, const std::vector<uint32_t>& cut) {
+            fan_groups(v, cut, fan, grp);
+            int gi = -1, gj = -2;
+            for (size_t i = 0; i < fan.size(); i++) {
+                if (fan[i] == ti) gi = grp[i];
+                if ((int)fan[i] == tj) gj = grp[i];
+            }
+            return gi != gj;
+        };
+        std::vector<uint32_t> cut_a{c}, cut_c{a};
+        uint32_t xa = kNone, xc = kNone;
+        bool ok = true;
+        if (!parted(a, cut_a)) {
+            xa = onward(a, c, t3, j3);
+            if (xa == kNone) ok = false;
+            else cut_a.push_back(xa), ok = parted(a, cut_a);
+        }
+        if (ok && !parted(c, cut_c)) {
+            xc = onward(c, a, t3, j3);
+            if (xc == kNone) ok = false;
+            else cut_c.push_back(xc), ok = parted(c, cut_c);
+        }
+        if (!ok) continue; // (it would part at one end alone: another edge, or none)
+        // the nodes' fans as they were (a node where the authored mesh joins triangles by a corner alone - a panel's
+        // corner on another's - stays so: only the groups the crack splits part)
+        std::vector<uint32_t> fan0[4];
+        std::vector<int> g0[4];
+        const uint32_t at[4] = {a, c, xa, xc};
+        for (int q = 0; q < 4; q++)
+            if (at[q] != kNone) fan_groups(at[q], {}, fan0[q], g0[q]);
+        split_refine(b, a, fan0[0], g0[0], cut_a);
+        split_refine(b, c, fan0[1], g0[1], cut_c);
+        // (the tips: on the sheet's edge or on another crack they part as well)
+        if (xa != kNone) split_refine(b, xa, fan0[2], g0[2], {});
+        if (xc != kNone) split_refine(b, xc, fan0[3], g0[3], {});
         FrameTri& t = tris[ti];
         t.tears++;
         tris_torn++;
@@ -3900,8 +3953,98 @@ int FemFrame::tear_tri(SoftBody& b, uint32_t ti, vec3 pull) {
         b.topo_changed = true, b.topo_version++;
         return 1;
     }
-    tris[ti].tears = 3; // (free all round)
+    tris[ti].tears = 3; // (free all round, or no edge of it parts whole)
     return 0;
+}
+
+// The triangles round frame node fn, grouped by their edges across it: two of them are joined where they share an edge
+// fn-x with x not in `cut`. The fan, each one's group; the groups' count.
+int FemFrame::fan_groups(uint32_t fn, const std::vector<uint32_t>& cut, std::vector<uint32_t>& fan, std::vector<int>& group) const {
+    fan.clear();
+    for (size_t u = 0; u < tris.size(); u++)
+        if (!tris[u].broken && (tris[u].n[0] == fn || tris[u].n[1] == fn || tris[u].n[2] == fn)) fan.push_back((uint32_t)u);
+    group.assign(fan.size(), -1);
+    auto shares = [&](uint32_t u, uint32_t w) { // (an edge fn-x of both, x not cut)
+        for (uint32_t x : tris[u].n) {
+            if (x == fn || std::find(cut.begin(), cut.end(), x) != cut.end()) continue;
+            if (tris[w].n[0] == x || tris[w].n[1] == x || tris[w].n[2] == x) return true;
+        }
+        return false;
+    };
+    int ng = 0;
+    std::vector<size_t> stack;
+    for (size_t i = 0; i < fan.size(); i++) {
+        if (group[i] >= 0) continue;
+        group[i] = ng;
+        stack.assign(1, i);
+        while (!stack.empty()) {
+            const size_t x = stack.back();
+            stack.pop_back();
+            for (size_t y = 0; y < fan.size(); y++)
+                if (group[y] < 0 && shares(fan[x], fan[y])) group[y] = ng, stack.push_back(y);
+        }
+        ng++;
+    }
+    return ng;
+}
+
+// fn's triangles that were one group round it (fan0, g0: before) and are several now (by their edges, `cut` taken as
+// parted): the largest of each keeps the node, every other one takes a copy. The copies made.
+int FemFrame::split_refine(SoftBody& b, uint32_t fn, const std::vector<uint32_t>& fan0, const std::vector<int>& g0, const std::vector<uint32_t>& cut) {
+    std::vector<uint32_t> fan;
+    std::vector<int> grp;
+    const int ng = fan_groups(fn, cut, fan, grp);
+    if (ng < 2) return 0;
+    int made = 0;
+    const int n0 = g0.empty() ? 0 : *std::max_element(g0.begin(), g0.end()) + 1;
+    for (int q = 0; q < n0; q++) {
+        std::vector<int> cnt(ng, 0);
+        for (size_t i = 0; i < fan.size(); i++) {
+            const auto it = std::find(fan0.begin(), fan0.end(), fan[i]);
+            if (it != fan0.end() && g0[it - fan0.begin()] == q) cnt[grp[i]]++;
+        }
+        int parts = 0, keep = 0;
+        for (int g = 0; g < ng; g++)
+            if (cnt[g] > 0) {
+                parts++;
+                if (cnt[g] > cnt[keep] || cnt[keep] == 0) keep = g;
+            }
+        if (parts < 2) continue;
+        for (int g = 0; g < ng; g++) {
+            if (g == keep || cnt[g] == 0) continue;
+            std::vector<uint32_t> moved;
+            for (size_t i = 0; i < fan.size(); i++) {
+                const auto it = std::find(fan0.begin(), fan0.end(), fan[i]);
+                if (grp[i] == g && it != fan0.end() && g0[it - fan0.begin()] == q) moved.push_back(fan[i]);
+            }
+            detach_tris(b, fn, moved);
+            made++;
+        }
+    }
+    return made;
+}
+
+int FemFrame::vertex_hinges() const {
+    std::vector<char> seen(node.size(), 0);
+    std::vector<uint32_t> fan;
+    std::vector<int> grp;
+    int n = 0;
+    static const bool dbg = getenv("BL_HINGEDBG") != nullptr; // (diagnostics: each such node, its groups' sections)
+    for (const FrameTri& t : tris)
+        if (!t.broken)
+            for (uint32_t v : t.n)
+                if (v < seen.size() && !seen[v]) {
+                    seen[v] = 1;
+                    const int ng = fan_groups(v, {}, fan, grp);
+                    n += ng > 1;
+                    if (dbg && ng > 1 && body_) {
+                        printf("hinge: frame node %u (body %u at %.3f %.3f %.3f): %d groups:", v, node[v], body_->nodes[node[v]].p.x, body_->nodes[node[v]].p.y,
+                               body_->nodes[node[v]].p.z, ng);
+                        for (size_t i = 0; i < fan.size(); i++) printf(" %d/s%d/t%d", grp[i], tris[fan[i]].section, tris[fan[i]].tears);
+                        printf("\n");
+                    }
+                }
+    return n;
 }
 
 int FemFrame::cut(SoftBody& b, uint32_t ei, float t) {

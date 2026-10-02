@@ -422,11 +422,19 @@ public:
     // removed: the sheet parts along the crack, a piece cut off all round stays a piece. finish_cuts after the last.
     // Returns 1 if a crack opened, 0 if none could (the element already free all round).
     int tear_tri(SoftBody& b, uint32_t ti, vec3 pull = vec3(0));
+    // Frame nodes whose triangles are joined round them by a corner alone (two groups not sharing an edge there): none
+    // after the tears and cuts, which split such a node (diagnostics, tests)
+    int vertex_hinges() const;
+    int authored_hinges = 0;    // (... as built: a panel's corner on another's, joined there by the node's rotation)
     // A cut through the shell (the laser's, the axe's plane): the triangles it crosses and their neighbours at those
     // triangles' corners are sorted by the side their middles are on (side(p) >= 0 or < 0), and each of those corners
     // with triangles on both sides is duplicated - the positive side's take the copy. The shell parts along its edges
     // nearest the cut; nothing is removed. finish_cuts after. Returns the corners split.
     int part_tris(SoftBody& b, const std::vector<uint32_t>& crossed, const std::function<float(vec3)>& side);
+    // A sheet laid over the triangle elements (Vehicle::make_sheet_body: their collision triangles made its shells, the
+    // others kept in their order): each shell on the element of its corners (Shell::host; the element's collision
+    // triangle is then the shell's, kept by the sheet: coll -1), the other elements' collision triangles found again
+    void bind_sheet(SoftBody& b);
     // A member cut at t along it (0 at a): torn off the joint when that is close, else split there and torn. Then
     // finish_cuts once (the solver's pattern again, the body told of its new nodes). Returns the tears.
     int cut(SoftBody& b, uint32_t elem, float t);
@@ -480,6 +488,10 @@ public:
 private:
     // (node fn duplicated: the triangles listed take the copy with their share of its mass; the copy's frame node)
     uint32_t detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint32_t>& moved);
+    // (the triangles round a frame node grouped by their edges across it, `cut` the other ends of edges taken as parted;
+    // the groups that were one before and are several now parted, the largest of each keeping the node: the copies)
+    int fan_groups(uint32_t fn, const std::vector<uint32_t>& cut, std::vector<uint32_t>& fan, std::vector<int>& group) const;
+    int split_refine(SoftBody& b, uint32_t fn, const std::vector<uint32_t>& fan0, const std::vector<int>& g0, const std::vector<uint32_t>& cut);
     std::vector<int32_t> slot_;
     std::vector<char> welded_;      // (compute_forces: the frame nodes some member is welded to, for the joints' damping)
     float last_h_ = 0;              // (the last step's length: a mount's overload accumulates over time)

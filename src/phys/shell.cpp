@@ -772,6 +772,10 @@ bool SoftBody::process_shell_events() {
     for (const ShellEvent& e : ev) {
         if (e.kind == 0 || e.shell >= ns0 || (e.shell < touched.size() && touched[e.shell])) continue;
         const Shell& s = shells[e.shell];
+        if (on_plate(s)) { // (it parts with its triangle element: sheet_follow)
+            shells[e.shell].cool = shk.aux[e.shell].cool = 40;
+            continue;
+        }
         const uint32_t a = s.n[e.edge], bb = s.n[nx(e.edge)];
         const bool ta = ops.open_fan(a), tb = ops.open_fan(bb);
         uint32_t first = a;
@@ -929,6 +933,70 @@ int SoftBody::shatter_shells(vec3 p, float radius) {
     return (int)hit.size();
 }
 
+void SoftBody::sheet_follow(uint32_t v, uint32_t c, const std::vector<uint32_t>& moved) {
+    if (shells.empty() || v >= node_shells.size() || c >= nodes.size()) return;
+    if (node_shells.size() <= c) node_shells.resize(c + 1);
+    auto on_moved = [&](const Shell& s) { return s.host >= 0 && std::find(moved.begin(), moved.end(), (uint32_t)s.host) != moved.end(); };
+    std::vector<uint8_t> touched(shells.size(), 0);
+    ShellOps ops{*this, touched, (uint32_t)shells.size() * 2654435761u + topo_version};
+    const std::vector<uint32_t> fan = node_shells[v];
+    int went = 0;
+    for (uint32_t si : fan) {
+        Shell& s = shells[si];
+        const int k = corner_of(s, v);
+        if (k < 0 || !on_moved(s)) continue;
+        s.n[k] = c;
+        ops.write_tri(s);
+        ops.remove_from_fan(v, si);
+        node_shells[c].push_back(si);
+        ops.touch(si);
+        went++;
+    }
+    ops.dirty_node(c);
+    if (!node_base_mass.empty()) ops.set_node_mass(v), ops.set_node_mass(c);
+    if (!went) return;
+    // the links between shells whose elements are no longer joined along their edge (or that no longer share it)
+    auto joined = [&](int h1, int h2) {
+        if (h1 == h2 || h1 < 0 || h2 < 0 || (size_t)h1 >= fem.tris.size() || (size_t)h2 >= fem.tris.size()) return true;
+        int same = 0;
+        for (uint32_t x : fem.tris[h1].n)
+            for (uint32_t y : fem.tris[h2].n) same += fem.node[x] == fem.node[y];
+        return same >= 2;
+    };
+    std::vector<uint32_t> own; // (the sheet's own nodes of the shells on the moved elements: midpoints of their edges)
+    for (uint32_t si = 0; si < shells.size(); si++) {
+        Shell& s = shells[si];
+        if (!on_moved(s)) continue;
+        for (int e = 0; e < 3; e++) {
+            const int j = s.nb[e];
+            if (j < 0) continue;
+            Shell& t = shells[j];
+            if (edge_of(t, s.n[e], s.n[nx(e)]) >= 0 && joined(s.host, t.host)) continue;
+            s.nb[e] = -1;
+            for (int f = 0; f < 3; f++)
+                if (t.nb[f] == (int)si) t.nb[f] = -1;
+            ops.touch(si), ops.touch((uint32_t)j);
+        }
+        for (uint32_t x : s.n)
+            if (fem.slot(x) < 0) own.push_back(x);
+    }
+    // ... on a parted edge: a copy for each side (they are held together by no link now)
+    std::sort(own.begin(), own.end());
+    own.erase(std::unique(own.begin(), own.end()), own.end());
+    for (uint32_t x : own)
+        if (node_shells[x].size() >= 2) ops.split_node(x, vec3(1, 0, 0), -1, -1, true, true);
+    // the light nodes along the new free edges within the step's budget
+    std::vector<uint32_t> vs;
+    for (uint32_t si = 0; si < touched.size() && si < shells.size(); si++)
+        if (touched[si])
+            for (int k = 0; k < 3; k++) vs.push_back(shells[si].n[k]);
+    std::sort(vs.begin(), vs.end());
+    vs.erase(std::unique(vs.begin(), vs.end()), vs.end());
+    enforce_node_budget(&vs);
+    contacter_count = -1;
+    shell_acc_stale = true;
+}
+
 int SoftBody::cut_shells(vec3 o, vec3 d0, vec3 d1, float range) {
     if (shells.empty()) return 0;
     make_soft(); // (a rigid piece is cut like a sheet: soft again)
@@ -952,6 +1020,7 @@ int SoftBody::cut_shells(vec3 o, vec3 d0, vec3 d1, float range) {
         return dot(cross(d0, w), m) >= 0 && dot(cross(w, d1), m) >= 0 && dot(w, d0 + d1) > 0 && dot(w, w) < range * range;
     };
     auto crossed = [&](const Shell& s) { // an edge of the triangle crosses the plane inside the sector
+        if (on_plate(s)) return false;  // (the sheet on a frame's triangle elements parts with them: FemFrame::part_tris)
         float sd[3];
         for (int c = 0; c < 3; c++) sd[c] = side(nodes[s.n[c]].p);
         for (int e = 0; e < 3; e++) {
@@ -989,7 +1058,7 @@ int SoftBody::cut_shells(vec3 o, vec3 d0, vec3 d1, float range) {
             const int j = s.nb[e];
             if (j < (int)si) continue; // (each pair once; -1: no neighbour)
             Shell& t = shells[j];
-            if ((cs < 0) == (side(centroid(t)) < 0)) continue;
+            if ((cs < 0) == (side(centroid(t)) < 0) || on_plate(s) || on_plate(t)) continue;
             // (the link belongs to the step of a sweep that passes its edge's middle: the point where the edge meets the
             // plane jumps to an end once a node of it lies on the plane, and could fall to a step already done)
             const vec3 x = (nodes[s.n[e]].p + nodes[s.n[nx(e)]].p) * 0.5f;
@@ -1684,7 +1753,8 @@ int SoftBody::coarsen_shells(int max_merges, float quiet_frac) {
 }
 
 int SoftBody::detach_pieces(std::vector<std::unique_ptr<SoftBody>>& out) {
-    if (shells.empty() || !beams.empty() || !joints.empty() || !frames.empty() || !wheels.empty() || !slides.empty() || !capsules.empty())
+    // (a sheet over triangle elements parts with them, its fragments let loose by the frame: FemFrame::detach_debris)
+    if (shells.empty() || !beams.empty() || !joints.empty() || !frames.empty() || !wheels.empty() || !slides.empty() || !capsules.empty() || !fem.tris.empty())
         return 0;
     {
         // parts joined only at a node (no shared edge) have no strength there: separate them first, so that a piece
@@ -1880,11 +1950,12 @@ bool SoftBody::reorder_shells() {
         if (nidx[i] == UINT32_MAX) nidx[i] = next++; // (nodes of no shell keep their order at the end)
     std::vector<Node> nodes2(nn);
     std::vector<NodeInfo> info2(nn);
-    std::vector<float> wind2(wind_area.empty() ? 0 : nn);
+    std::vector<float> wind2(wind_area.empty() ? 0 : nn), base2(node_base_mass.size() == nn ? nn : 0);
     for (uint32_t i = 0; i < nn; i++) {
         nodes2[nidx[i]] = nodes[i];
         info2[nidx[i]] = info[i];
         if (!wind_area.empty()) wind2[nidx[i]] = wind_area[i];
+        if (!base2.empty()) base2[nidx[i]] = node_base_mass[i]; // (a sheet over a frame: the nodes' own masses)
     }
     std::vector<Shell> shells2(ns);
     std::vector<Triangle> tris2(ns);
@@ -1951,6 +2022,7 @@ bool SoftBody::reorder_shells() {
     nodes.swap(nodes2);
     info.swap(info2);
     wind_area.swap(wind2);
+    if (!base2.empty()) node_base_mass.swap(base2);
     shells.swap(shells2);
     tris.swap(tris2);
     force.assign(nn, vec3(0));

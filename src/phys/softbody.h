@@ -292,6 +292,9 @@ struct Shell {
     float strain;           // (reference kernel of the tests only: the strain lives in ShellKernel::Aux, SoftBody::shell_strain)
     vec2 uv[3];
     uint32_t tri;           // collision triangle (same corners)
+    int32_t host = -1;      // a sheet laid over a frame's triangle elements: the element it lies on (FemFrame::tris; its
+                            // halves after a refinement too), -1 none. It parts with the element (SoftBody::sheet_follow)
+                            // and does not crack on its own
     uint8_t level;          // bisections since the authored triangle
     uint8_t pending;        // an event is queued for this shell
     uint8_t cool;           // substeps before it may try to crack again (after a crack that could not open)
@@ -973,6 +976,13 @@ public:
     // sides are cut there and the nodes on the cut are split (no impulse: the parts only come apart). Returns the number
     // of links cut.
     int cut_shells(vec3 o, vec3 d0, vec3 d1, float range);
+    // A shell on a live triangle element of the frame (Shell::host): it parts with it, it does not crack on its own
+    bool on_plate(const Shell& s) const { return s.host >= 0 && (size_t)s.host < fem.tris.size() && !fem.tris[s.host].broken; }
+    // The sheet follows a tear of the triangle elements under it (FemFrame::detach_tris: node v copied to c for the
+    // elements `moved`): their shells take c, the links between shells on elements no longer joined along their edge
+    // are cut, and the sheet's own nodes on such an edge (a refinement's midpoints) get a copy for each side. The masses
+    // of v and c: their own (node_base_mass) and their shells' thirds.
+    void sheet_follow(uint32_t v, uint32_t c, const std::vector<uint32_t>& moved);
     // Pieces of a cracked sheet that hang together with nothing else become bodies of their own (islands, sleep and
     // bounds of their own): every anchored piece stays (a free sheet keeps its biggest one). Only for bodies made of
     // shells alone. Returns the number of new bodies appended to `out`.

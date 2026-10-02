@@ -422,6 +422,13 @@ void Vehicle::make_sheet_body(const ShellMaterial& mat, float kg_m2, MaterialPtr
     // beam, would be put in Morton order here, and the editor's drum of 64 triangles came apart on its first frame)
     b.keep_node_order = true;
     b.finalize_shells(kg_m2, kDefaultDt, 7, true);
+    // the triangle elements under the sheet: each shell on its element (it parts with it), the elements' collision
+    // triangles found again in the new list (the template's too: a reset restores the frame)
+    if (!b.fem.tris.empty()) {
+        b.fem.bind_sheet(b);
+        if (m_spawn_fem.tris.size() == b.fem.tris.size())
+            for (size_t i = 0; i < b.fem.tris.size(); i++) m_spawn_fem.tris[i].coll = b.fem.tris[i].coll;
+    }
     // the sheet's welds on the frame (`welds`): built on the sheet as spawned, kept for the resets
     int bad_welds = 0;
     for (const auto& w : m_def.welds)
