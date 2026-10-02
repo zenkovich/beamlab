@@ -426,7 +426,7 @@ void Drivetrain::update(float dt, const VehicleInput& in, SoftBody& b) {
             tc_state[i] = 1.0f;
         }
         w.brake = 0;
-        if (w.braked == 0) continue;
+        if (w.braked == 0 || brakes_cut) continue;
         float ab = brake_force * brake_in;
         float hb = (parking && w.braked != 4) ? parking_force : 0.0f;
         float db = 0;

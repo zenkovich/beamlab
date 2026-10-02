@@ -98,6 +98,7 @@ struct Drivetrain {
     float dir_state = 0;
     float brake_in = 0;
     bool parking = false;
+    bool brakes_cut = false; // (the lines cut - the axe through the car: no brake, no hold, the halves roll apart)
     float wheel_rpm = 0;
     float speed = 0; // m/s along vehicle forward (from wheels)
 

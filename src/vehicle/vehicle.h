@@ -98,6 +98,9 @@ public:
     float brake() const;
     float steer_state() const; // -1 .. 1: where the steering is (the input rate limited)
     bool has_engine() const;
+    // The brake lines cut (the axe cutting the car in two): no brake from then on, nor the hold at a standstill - held
+    // by their brakes, the halves leaned on each other at the cut, level (until reset)
+    void cut_brakes();
     float mass() const { return m_mass; }
     int broken_beams() const;
     const ror::Document& def() const { return m_def; }
@@ -135,6 +138,7 @@ private:
     phys::World* m_world = nullptr;
     int m_cam_center = 0, m_cam_back = 0, m_cam_left = 0;
     int m_cinecam = -1;
+    int m_cinecam_broken = 0; // (the body's broken beams when its cinecam's were last looked at)
     vec3 m_local_fwd{-1, 0, 0}, m_local_left{0, 0, 1};
     float m_mass = 0;
     VehicleInput m_input;

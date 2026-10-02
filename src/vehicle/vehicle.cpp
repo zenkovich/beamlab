@@ -212,6 +212,8 @@ void Vehicle::reset(vec3 pos, float yaw_deg) {
         w.detached = false;
     }
     b.stats = BodyStats();
+    m_drive->brakes_cut = false;
+    m_cinecam_broken = 0;
     assist_speed = -1;
     peak_g = 0;
     last_com_vel = vec3(0);
@@ -318,6 +320,19 @@ void Vehicle::update_frame(float dt) {
         float g = length(v - last_com_vel) / dt / 9.81f;
         if (g < 200.0f) peak_g = std::max(peak_g, g);
         last_com_vel = v;
+    }
+    // the cinecam's node cut off from the car (its beams all cut or broken: the axe through the cabin) lands on the
+    // ground: it collided with nothing and fell through the world for good (the cockpit camera with it)
+    if (m_cinecam >= 0 && m_cinecam < (int)body->info.size() && !(body->info[m_cinecam].flags & phys::NF_GROUND) &&
+        body->stats.broken_beams != m_cinecam_broken) {
+        m_cinecam_broken = body->stats.broken_beams;
+        bool held = false;
+        for (const phys::Beam& bm : body->beams)
+            if (!(bm.flags & phys::BF_BROKEN) && ((int)bm.a == m_cinecam || (int)bm.b == m_cinecam)) {
+                held = true;
+                break;
+            }
+        if (!held) body->info[m_cinecam].flags |= phys::NF_GROUND;
     }
     // keep the player vehicle awake while it's being driven
     body->can_sleep = !(is_player && (m_input.throttle > 0 || m_input.brake > 0 || m_input.steer != 0)) && !ai;
@@ -510,6 +525,7 @@ int Vehicle::num_gears() const { return m_drive->num_gears; }
 float Vehicle::throttle() const { return m_drive->cur_acc; }
 float Vehicle::brake() const { return m_drive->brake_in; }
 bool Vehicle::has_engine() const { return m_drive->has_engine; }
+void Vehicle::cut_brakes() { m_drive->brakes_cut = true; }
 int Vehicle::broken_beams() const { return body->stats.broken_beams; }
 
 } // namespace bl
