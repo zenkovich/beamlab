@@ -710,9 +710,12 @@ void App::frame(float dt) {
                 c += n.p / (float)b->nodes.size(), low = std::min(low, n.p.y);
                 if (length(n.v) > fast) fast = length(n.v), fp = n.p;
             }
-            printf("fem f%d %-24s tris %4zu torn %3d dented %4d peak %.2f failed %d sleep %d fastest %.3f centre (%.3f %.3f %.3f) lowest %.3f\n", m_frame_index,
-                   b->name.c_str(), f.tris.size(), f.tris_torn, dented, peak, f.solve_failures, (int)b->sleeping, fast, c.x, c.y, c.z, low);
+            float p0, p1;
+            b->largest_parts(p0, p1);
+            printf("fem f%d %-24s tris %4zu torn %3d dented %4d peak %.2f failed %d sleep %d fastest %.3f centre (%.3f %.3f %.3f) lowest %.3f parts %.3f %.3f\n",
+                   m_frame_index, b->name.c_str(), f.tris.size(), f.tris_torn, dented, peak, f.solve_failures, (int)b->sleeping, fast, c.x, c.y, c.z, low, p0, p1);
             if (getenv("BL_FEMFAST")) printf("    fastest node at (%.3f %.3f %.3f)\n", fp.x - c.x, fp.y - c.y, fp.z - c.z);
+            if (f.tris_refined || !f.impacts.empty()) printf("    %d bisections, %zu fracture patterns\n", f.tris_refined, f.impacts.size());
             if (getenv("BL_FEMDENT")) // (the dented triangles: their index in the truck's fem_tris, the plastic stretch)
                 for (const phys::FrameTri& t : f.tris)
                     if (t.broken || t.dmg > 0) printf("    dent %d %.4f%s\n", t.tag, t.dmg, t.broken ? " torn" : "");
@@ -823,7 +826,7 @@ void App::frame(float dt) {
             }
             shake_t = t;
         }
-    if ((!m_opt.action.empty() || !m_opt.autoshoot.empty() || !m_opt.drive.empty() || !m_opt.crane.empty()) && m_frame_index % (getenv("BL_STATUS_EVERY") ? atoi(getenv("BL_STATUS_EVERY")) : 120) == 0)
+    if ((!m_opt.action.empty() || !m_opt.autoshoot.empty() || !m_opt.drive.empty() || !m_opt.crane.empty()) && m_frame_index % (getenv("BL_STATUS_EVERY") ? atoi(getenv("BL_STATUS_EVERY")) : 120) == 0) {
         if (Vehicle* v = m_game.player_vehicle()) {
             vec3 p = v->position();
             printf("t=%6.1fs  %5.1f km/h  pos (%.0f %.0f %.0f)  broken %4d  | %s | %s", m_game.world.time(), v->speed_kmh(), p.x, p.y, p.z,
@@ -971,7 +974,13 @@ void App::frame(float dt) {
                 for (const phys::FrameTri& t : f.tris) dented += !t.broken && t.dmg > 0;
                 printf(" | tris %zu, %d torn, %d dented", f.tris.size(), f.tris_torn, dented);
                 if (!f.mounts.empty()) printf(", mounts %d of %zu let go", f.mounts_broken, f.mounts.size());
-                printf(", %d loose, %d left on a corner", f.loose_count, std::max(0, f.vertex_hinges() - f.authored_hinges));
+                printf(", %d loose, %d left on a corner, %d bisections, %zu patterns", f.loose_count, std::max(0, f.vertex_hinges() - f.authored_hinges),
+                       f.tris_refined, f.impacts.size());
+            }
+            if (!v->body->fem.empty()) { // (its parts held together by anything: the two largest' share of its mass - a car cut in two, two halves)
+                float p0, p1;
+                v->body->largest_parts(p0, p1);
+                printf(" | parts %.0f%% %.0f%%", 100.0f * p0, 100.0f * p1);
             }
             if (!v->body->volumes.empty()) { // (its collision volumes: their contacts so far, the largest force, off)
                 printf(" | volumes:");
@@ -1002,7 +1011,10 @@ void App::frame(float dt) {
                 if (getenv("BL_JITTERDBG")) printf(" | membrane: %d edges out of band, %d moved", b.mem_edges_out, b.mem_moved);
             }
             printf("\n");
+        } else if (!m_game.scene_status.empty()) { // (a scene without a car: its own line)
+            printf("t=%6.1fs  | %s\n", m_game.world.time(), m_game.scene_status.c_str());
         }
+    }
     if (m_opt.launch_kmh > 0 && m_frame_index == 5)
         if (Vehicle* v = m_game.player_vehicle()) v->launch(v->forward() * (m_opt.launch_kmh / 3.6f));
     if (!m_opt.action.empty()) // (the scene's actions by their labels' parts: "label[@frame]; ..." - at frame 5 by default)
