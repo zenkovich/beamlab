@@ -51,4 +51,13 @@ struct PatternLine {
     bool vein = false;      // a wood vein (a weaker line than an impact's)
 };
 
+// The lines of an impact at c (m/s `speed`, by a body of radius `size`, 0: unknown) of a pattern `kind` whose zone is
+// `pattern_size` at 10 m/s (Grain: the fibres along `grain`) - the sheets' (SoftBody::add_impact) and the triangle
+// elements' (FemFrame) generator; the queries on one impact's lines: the nearest (within max_d, else d 1e30), the
+// crossing of segment xa-xb nearest its middle (its t within [lo, hi], -1: none), the zone between the lines
+ShellImpact make_pattern(ShellPattern kind, float pattern_size, vec2 grain, vec2 c, float speed, float size, uint32_t seed);
+PatternLine pattern_nearest(const ShellImpact& im, vec2 x, float max_d);
+float pattern_cross(const ShellImpact& im, vec2 xa, vec2 xb, float lo, float hi);
+float pattern_zone_radius(const ShellImpact& im);
+
 } // namespace bl::phys

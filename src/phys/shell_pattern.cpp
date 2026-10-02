@@ -102,8 +102,14 @@ float zone_radius(const ShellImpact& im) {
     }
 }
 
+} // namespace
+
 // The lines of an impact at point c.
-ShellImpact make_impact(const ShellMaterial& m, vec2 c, float speed, float size, uint32_t seed) {
+ShellImpact make_pattern(ShellPattern kind, float pattern_size, vec2 grain, vec2 c, float speed, float size, uint32_t seed) {
+    struct {
+        ShellPattern pattern;
+        float pattern_size;
+    } m{kind, pattern_size};
     ShellImpact im;
     im.c = c;
     im.speed = speed;
@@ -191,7 +197,7 @@ ShellImpact make_impact(const ShellMaterial& m, vec2 c, float speed, float size,
         }
     } else if (m.pattern == ShellPattern::Grain) {
         // the board splits along the fibres through the point of contact (and beside it), and breaks across there
-        const vec2 g = grain_dir(m), n(-g.y, g.x);
+        const vec2 g = grain, n(-g.y, g.x);
         auto split = [&](float off, float l0, float l1, uint32_t k) {
             std::vector<vec2> p;
             const float A = im.r * (0.04f + 0.06f * R(k)), w = kTwoPi / (im.r * (0.6f + R(k + 1))), ph = kTwoPi * R(k + 2);
@@ -217,6 +223,45 @@ ShellImpact make_impact(const ShellMaterial& m, vec2 c, float speed, float size,
     return im;
 }
 
+PatternLine pattern_nearest(const ShellImpact& im, vec2 x, float max_d) {
+    PatternLine best;
+    best.d = max_d;
+    if (length(x - im.c) <= im.reach + max_d)
+        visit(im, x - vec2(best.d), x + vec2(best.d), [&](const ShellImpact::Seg& s) {
+            vec2 f;
+            const float d = seg_dist(x, s.a, s.b, &f);
+            if (d < best.d) {
+                best.d = d;
+                best.foot = f;
+                best.tangent = normalize(s.b - s.a);
+                best.id = s.line;
+            }
+        });
+    if (best.id == kNone) best.d = 1e30f;
+    return best;
+}
+
+float pattern_cross(const ShellImpact& im, vec2 xa, vec2 xb, float lo, float hi) {
+    float best = -1, bd = 1e9f;
+    const vec2 d = xb - xa;
+    if (length((xa + xb) * 0.5f - im.c) > im.reach + length(d) * 0.5f) return -1;
+    visit(im, vmin2(xa, xb), vmax2(xa, xb), [&](const ShellImpact::Seg& s) {
+        const vec2 e = s.b - s.a;
+        const float den = cross2(d, e);
+        if (std::fabs(den) < 1e-14f) return;
+        const vec2 w = s.a - xa;
+        const float t = cross2(w, e) / den, u = cross2(w, d) / den;
+        if (u >= 0.0f && u <= 1.0f && t >= lo && t <= hi && std::fabs(t - 0.5f) < bd) bd = std::fabs(t - 0.5f), best = t;
+    });
+    return best;
+}
+
+float pattern_zone_radius(const ShellImpact& im) { return zone_radius(im); }
+
+namespace {
+ShellImpact make_impact(const ShellMaterial& m, vec2 c, float speed, float size, uint32_t seed) {
+    return make_pattern(m.pattern, m.pattern_size, grain_dir(m), c, speed, size, seed);
+}
 } // namespace
 
 // ------------------------------------------------------------------------------------------------ queries

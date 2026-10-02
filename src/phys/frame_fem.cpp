@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #if defined(__aarch64__)
@@ -21,6 +22,11 @@ namespace {
 // a triangle's local dofs (per corner u, v, w, theta_x, theta_y, theta_z) in its stiffness's two parts, the membrane's
 // (u, v, theta_z) and the plate's (w, theta_x, theta_y)
 constexpr int kMemDof[3] = {0, 1, 5}, kPlateDof[3] = {2, 3, 4};
+// the stretch a triangle bisected `level` times tears at, against the authored one's (sqrt(2) a level: the tear's band)
+inline float tear_band(int level) {
+    static const float table[4] = {1.0f, 1.41421356f, 2.0f, 2.82842712f};
+    return table[std::min(level, 3)];
+}
 } // namespace
 
 // ------------------------------------------------------------------------------------------------ materials, sections
@@ -138,6 +144,14 @@ ShellSection make_shell_section(const std::string& material, float thickness) {
     s.t = std::max(1e-4f, thickness);
     s.yield = m.yield, s.elongation = m.elongation;
     if (const char* d = getenv("BL_SHELL_DAMP")) s.damping = (float)atof(d); // (diagnostics: the shells' damping)
+    // its fracture pattern: metals and plastics tear out a ring and radial tears round a blow (a plug), the brittle
+    // carbon cracks in a web, wood splits along its grain
+    const std::string n = m.name;
+    s.pattern = n == "Carbon" ? ShellPattern::Radial : n == "Wood" ? ShellPattern::Grain : ShellPattern::Punch;
+    if (s.pattern == ShellPattern::Radial) s.pattern_size = 0.2f, s.pattern_weak = 0.4f;
+    if (const char* l = getenv("BL_FEM_LEVEL")) s.max_level = atoi(l); // (diagnostics: the refinement's depth, 0: none)
+    if (getenv("BL_FEM_NOPATTERN")) s.pattern = ShellPattern::None;   // (diagnostics: no fracture patterns)
+    if (const char* p = getenv("BL_FEM_MINPIECE")) s.min_piece = (float)atof(p); // (diagnostics: the smallest piece a tear cuts off, m2)
     return s;
 }
 
@@ -180,6 +194,7 @@ uint16_t FemFrame::add_section(const FrameSection& s) {
 
 uint16_t FemFrame::add_shell_section(const ShellSection& s) {
     shell_sections.push_back(s);
+    if (s.pattern != ShellPattern::None) pattern_speed_ = patterned_ ? std::min(pattern_speed_, s.pattern_speed) : s.pattern_speed, patterned_ = true;
     return (uint16_t)(shell_sections.size() - 1);
 }
 
@@ -262,6 +277,7 @@ void FemFrame::finalize(const SoftBody& b) {
     tri_k_.assign(tris.size() * kTriK, 0.0f);
     tri_b_.assign(tris.size() * kTriB, 0.0f);
     tri_k_ok_.assign(tris.size(), 0);
+    if (tri_cap_ == 0) tri_cap_ = 3 * tris.size() + 16; // (the refinement's budget, of the authored shell)
     for (size_t i = 0; i < n; i++) node_inertia((uint32_t)i, b);
     // the mounts made once, where their nodes stand now: b's point in a's frame, the spring the nodes' masses take at
     // the step unless given (a quarter of the explicit limit), the damping near a third of critical
@@ -1705,8 +1721,19 @@ void FemFrame::eval_tris(SoftBody& b, int chunk, std::vector<Event>& evs) {
             // (the plastic rotations into the rest frames past a few hundredths: the rotations measured stay small)
             for (int i = 0; i < 3; i++)
                 if (dot(t.th0[i], t.th0[i]) > 0.02f * 0.02f) t.r0[i] = normalize(t.r0[i] * quat_exp(-t.th0[i])), t.th0[i] = vec3(0);
-            // (past the elongation it tears an edge free; each further tear takes half the elongation more)
-            if (t.tears < 3 && t.dmg > s.elongation * (1.0f + 0.5f * t.tears) && b.allow_break) evs.push_back({(uint32_t)ti, (uint8_t)4, 0.0f});
+            // (past the elongation it tears an edge free, each further tear half the elongation later; a pattern's line
+            // parts sooner, the zone between the lines later: its weakest edge's; a bisected triangle a sqrt(2) later a
+            // level - its stretch is the mean over a smaller piece of the tear's band, the energy a tear takes the
+            // same on a finer shell: halved it tore at once, shreds. On its way there it is bisected: the zone that tears
+            // gets the detail first)
+            const float el = s.elongation * (1.0f + 0.5f * t.tears) * tear_band(t.level) * (float)std::min(t.es[0], std::min(t.es[1], t.es[2])) * (1.0f / 64.0f);
+            if (t.wait && t.dmg <= 2.0f * el) t.wait--; // (far past its tear it goes now, shard or not: see tear_tri)
+            else if (t.tears < 3 && t.dmg > el && b.allow_break) t.wait = 0, evs.push_back({(uint32_t)ti, (uint8_t)4, 0.0f});
+            // (one that cannot tear along an edge - a piece of it hanging on a fixed or held node - lets go of its corners
+            // far past its tear: perfectly plastic, it flowed on without end, its free corners flung round the node)
+            else if (t.tears >= 3 && !t.held && t.dmg > 3.0f * el && b.allow_break) evs.push_back({(uint32_t)ti, (uint8_t)6, 0.0f});
+            else if (!t.whole && t.level < s.max_level && t.dmg > s.refine_at * el * ((t.line & 8u) ? 0.1f : 1.0f) && b.allow_break)
+                evs.push_back({(uint32_t)ti, (uint8_t)5, 0.0f}); // (a line across it: as soon as it yields, the line resolved)
         }
         t.util = util;
         if (!tri_k_ok_[ti]) tri_build_k((uint32_t)ti);
@@ -1814,6 +1841,7 @@ void FemFrame::compute_forces(SoftBody& b) {
 
 int FemFrame::begin_forces(SoftBody& b) {
     if (!ready_) finalize(b);
+    steps_++;
     if (tan_.size() != elems.size()) tan_.assign(elems.size(), Tangent());
     // a node that is not where its double position rounds to was moved by something else (a reset, a repair)
     xd.resize(node.size() * 3);
@@ -2287,6 +2315,7 @@ void FemFrame::hold(SoftBody& b, float step) {
     for (vec3& t : torque) t = vec3(0);
     for (vec3& c : contact_n) c = vec3(0);
     for (vec3& c : contact_f) c = vec3(0);
+    for (TriPress& t : tri_press) t.kap = 0;
 }
 
 int FemFrame::held_begin(SoftBody& b, float step) {
@@ -2458,6 +2487,7 @@ void FemFrame::held_end(SoftBody& b) {
     for (vec3& t : torque) t = vec3(0);
     for (vec3& c : contact_n) c = vec3(0);
     for (vec3& c : contact_f) c = vec3(0);
+    for (TriPress& t : tri_press) t.kap = 0;
 }
 
 void FemFrame::solve(SoftBody& b, float h, float step, float theta, float dissipation) {
@@ -2541,6 +2571,7 @@ void FemFrame::solve_end(SoftBody& b) {
     for (vec3& t : torque) t = vec3(0); // (torques from outside, e.g. the tests, add up until the next step)
     for (vec3& c : contact_n) c = vec3(0);
     for (vec3& c : contact_f) c = vec3(0);
+    for (TriPress& t : tri_press) t.kap = 0;
 }
 
 void FemFrame::solve_component(SoftBody& b, int comp) {
@@ -2770,6 +2801,31 @@ void FemFrame::solve_impl(SoftBody& b, int comp, int stage) {
                 for (int j = 0; j < 3; j++) O[i * 6 + j] -= c * ee[i] * ee[j];
         }
     }
+    // the plates pressed at their middles (tri_press): kappa c c^T on their corners' translations, c the middle along the
+    // contact's normal, the right side kappa (step a) c
+    if (!tri_press.empty())
+        for (uint32_t ti : comp_tris_[comp]) {
+            if (ti >= tri_press.size() || !(tri_press[ti].kap > 0) || tris[ti].broken) continue;
+            const TriPress& tp = tri_press[ti];
+            const FrameTri& t = tris[ti];
+            const double kk = (double)tp.kap / 9.0, rr = (double)tp.kap * step * tp.a / 3.0;
+            const double ee[3] = {tp.n.x, tp.n.y, tp.n.z};
+            for (int q = 0; q < 3; q++) {
+                const uint32_t fn = t.n[q], f2 = t.n[q == 2 ? 0 : q + 1];
+                if (fixed[fn]) continue;
+                double* D = &diag_[(size_t)iperm_[fn] * 36];
+                double* R = &rhs_[(size_t)iperm_[fn] * 6];
+                for (int i = 0; i < 3; i++) {
+                    for (int j = 0; j < 3; j++) D[i * 6 + j] += kk * ee[i] * ee[j];
+                    R[i] += rr * ee[i];
+                }
+                if (const int p = tri_block_[ti][q]; p >= 0 && !fixed[f2]) {
+                    double* O = &off_[(size_t)p * 36];
+                    for (int i = 0; i < 3; i++)
+                        for (int j = 0; j < 3; j++) O[i * 6 + j] += kk * ee[i] * ee[j];
+                }
+            }
+        }
     // the released ends' damping (compute_forces put its torque from the velocities before the step in): h c on the
     // two nodes' turning, against each other, so it takes the turning after the step (explicit, a hinge of 2 N m s/rad
     // on a lid's light frame node spun it up and the lid's hinges tore off as the car stood)
@@ -3132,8 +3188,62 @@ bool FemFrame::tear(SoftBody& b, uint32_t ei, int end) {
 }
 
 bool FemFrame::process_events(SoftBody& b) {
-    if (events_.empty()) return false;
+    if (events_.empty() && !(hit_.speed > 0)) return false;
     const size_t n0 = b.nodes.size();
+    const int torn0 = tris_torn;
+    // the substep's fastest contact on a plate lays a fracture pattern (first: the bisections below put their nodes on
+    // its lines)
+    if (hit_.speed > 0) {
+        const int s0 = slot(hit_.n[0]), s1 = slot(hit_.n[1]), s2 = slot(hit_.n[2]);
+        int at = -1;
+        for (size_t u = 0; u < tris.size() && at < 0 && s0 >= 0; u++) {
+            const FrameTri& t = tris[u];
+            if (t.broken) continue;
+            auto has = [&](int x) { return x >= 0 && ((int)t.n[0] == x || (int)t.n[1] == x || (int)t.n[2] == x); };
+            if (has(s0) && has(s1) && has(s2)) at = (int)u;
+        }
+        if (at >= 0) {
+            const vec3 p = b.nodes[hit_.n[0]].p * hit_.bary.x + b.nodes[hit_.n[1]].p * hit_.bary.y + b.nodes[hit_.n[2]].p * hit_.bary.z;
+            add_impact(b, (uint32_t)at, p, hit_.speed, hit_.size, hit_.time);
+        }
+        hit_.speed = 0;
+    }
+    // the bisections, before the tears (a tear queued on a triangle bisected now waits for the finer shell), a few a
+    // substep (each is the solver's pattern again: the rest queue again while they yield)
+    std::vector<uint8_t> refined; // (the triangles bisected now, the halves that kept the index and the new ones)
+    {
+        int budget = steps_ - refine_step_ >= (uint32_t)kRefineEvery ? kRefinePerStep : 0;
+        const size_t nt = tris.size();
+        std::vector<uint8_t> lv;
+        for (const Event& x : events_) {
+            if (x.kind != 5 || budget <= 0 || x.elem >= nt || tris[x.elem].broken || tris[x.elem].whole) continue;
+            refine_step_ = steps_;
+            if (lv.empty()) {
+                lv.resize(nt);
+                for (size_t u = 0; u < nt; u++) lv[u] = tris[u].level;
+            }
+            if (tris[x.elem].level != lv[x.elem]) continue; // (bisected already, as a neighbour)
+            const int k = refine_tri(b, x.elem);
+            if (k) budget -= k;
+            else tris[x.elem].whole = true;
+        }
+        if (!lv.empty()) {
+            refined.assign(tris.size(), 1);
+            for (size_t u = 0; u < nt; u++) refined[u] = tris[u].level != lv[u];
+        }
+    }
+    if (events_.empty()) {
+        if (!ready_) {
+            torque.resize(node.size(), vec3(0));
+            member_f.resize(node.size(), vec3(0));
+            body_ = &b;
+            analyse();
+            tan_.assign(elems.size(), Tangent());
+            tri_tan_.assign(tris.size(), TriTan());
+            ready_ = true;
+        }
+        return b.nodes.size() != n0;
+    }
     // the shocks' seats before the first tear: the members at each end's frame node
     for (Shock& s : b.shocks)
         if (s.seat[0] == 255 && s.beam < b.beams.size()) {
@@ -3146,8 +3256,38 @@ bool FemFrame::process_events(SoftBody& b) {
     static const bool tdbg = getenv("BL_FRAMEDBG") != nullptr;
     for (const Event& x : ev) {
         switch (x.kind) {
-        case 4: // a triangle torn: a crack along its edge across the plastic stretch, the nodes there duplicated
+        case 5: break; // (above)
+        case 6: // a triangle that could not tear along an edge, far past it: its corners copied for it alone - if no edge
+                // of it is joined (a piece hanging on a node); one still joined by an edge stays (pulled from its corners it
+                // left a hole: two hundred of them on the curb)
             if (x.elem < tris.size() && !tris[x.elem].broken) {
+                bool joined = false;
+                for (int e = 0; e < 3 && !joined; e++) {
+                    const uint32_t p0 = tris[x.elem].n[e], p1 = tris[x.elem].n[(e + 1) % 3];
+                    for (size_t u = 0; u < tris.size() && !joined; u++) {
+                        const FrameTri& o = tris[u];
+                        if (u == x.elem || o.broken) continue;
+                        int hit = 0;
+                        for (uint32_t c : o.n) hit += c == p0 || c == p1;
+                        joined = hit == 2;
+                    }
+                }
+                if (joined) {
+                    tris[x.elem].held = true;
+                    break;
+                }
+                for (uint32_t c : tris[x.elem].n) {
+                    int users = 0;
+                    for (const FrameTri& u : tris) users += !u.broken && (u.n[0] == c || u.n[1] == c || u.n[2] == c);
+                    const Node& nc = b.nodes[node[c]];
+                    if (users > 1 || nc.inv_mass <= 0 || members_at(c) > 1) detach_tris(b, c, {x.elem});
+                }
+                tris[x.elem].dmg = 0; // (free now: not again)
+                tris_torn++;
+            }
+            break;
+        case 4: // a triangle torn: a crack along its edge across the plastic stretch, the nodes there duplicated
+            if (x.elem < tris.size() && !tris[x.elem].broken && !(x.elem < refined.size() && refined[x.elem])) {
                 const int k = tear_tri(b, x.elem);
                 if (tdbg) {
                     const FrameTri& t = tris[x.elem];
@@ -3217,6 +3357,11 @@ bool FemFrame::process_events(SoftBody& b) {
         b.beams[s.beam].flags |= BF_BROKEN;
         b.stats.broken_beams++;
     }
+    // the fragments the tears cut off loose at once (their frame's step no longer theirs)
+    if (tris_torn != torn0 && loose_mass_ > 0 && !b.rigid) {
+        std::vector<std::unique_ptr<SoftBody>> none;
+        detach_debris(b, none, loose_mass_, true);
+    }
     if (!ready_) {
         // the frame nodes' pattern again (their orientation, velocities and positions are kept)
         torque.resize(node.size(), vec3(0));
@@ -3261,6 +3406,11 @@ void FemFrame::compact(SoftBody& b) {
         if (!tris[u].broken) tri_new[u] = (int32_t)ts.size(), ts.push_back(tris[u]);
     for (Shell& sh : b.shells)
         if (sh.host >= 0) sh.host = (size_t)sh.host < tri_new.size() ? tri_new[sh.host] : -1;
+    // (the plates' mid points' pairs follow: World::inherit_pairs)
+    std::vector<int32_t>& rm = b.topo_log.mid_remap;
+    if (rm.empty()) rm = tri_new;
+    else
+        for (int32_t& x : rm) x = x >= 0 && (size_t)x < tri_new.size() ? tri_new[x] : -1;
     for (const FrameTri& t : ts) keep[t.n[0]] = keep[t.n[1]] = keep[t.n[2]] = 0;
     std::vector<uint32_t> nn;
     std::vector<quat> qq;
@@ -3282,6 +3432,7 @@ void FemFrame::compact(SoftBody& b) {
     node.swap(nn), q.swap(qq), w.swap(ww), inertia.swap(ii), torque.swap(tt), contact_n.swap(cc), impulse.swap(jj), xd.swap(xx);
     member_f.assign(node.size(), vec3(0));
     contact_f.assign(node.size(), vec3(0));
+    tri_press.clear();
     elems.swap(es);
     tris.swap(ts);
     tri_k_.assign(tris.size() * kTriK, 0.0f), tri_b_.assign(tris.size() * kTriB, 0.0f), tri_k_ok_.assign(tris.size(), 0);
@@ -3294,8 +3445,8 @@ void FemFrame::compact(SoftBody& b) {
     ready_ = true;
 }
 
-int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>& out, float max_mass) {
-    debris_check = false;
+int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>& out, float max_mass, bool loose_only) {
+    if (!loose_only) debris_check = false, loose_mass_ = max_mass;
     const size_t n = b.nodes.size();
     // the body's parts: nodes joined by anything (members, beams, sheets, triangles, joints, slides, capsules)
     std::vector<uint32_t> up(n);
@@ -3444,7 +3595,7 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
                 FrameTri& u = tris[tj];
                 if (u.broken || find(node[u.n[0]]) != r) continue;
                 const uint32_t v[3] = {node[u.n[0]], node[u.n[1]], node[u.n[2]]};
-                loose_tris.push_back({{v[0], v[1], v[2]}, u.section});
+                loose_tris.push_back({{v[0], v[1], v[2]}, u.section, u.area0});
                 for (int e = 0; e < 3; e++) {
                     const uint32_t x = std::min(v[e], v[(e + 1) % 3]), y = std::max(v[e], v[(e + 1) % 3]);
                     edges.push_back({x, y}), third.push_back(v[(e + 2) % 3]);
@@ -3477,10 +3628,9 @@ int FemFrame::detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>&
         if (piece_of[r] < 0) piece_of[r] = (int32_t)roots.size(), roots.push_back(r);
         piece_of[i] = piece_of[r];
     }
-    if (roots.empty()) {
+    if (roots.empty() || loose_only) { // (the debris: the world's, between frames)
         if (changed) {
-            compact(b);
-            b.topo_log.overflow = true; // (the plates' mid points' pairs: searched again)
+            compact(b); // (the plates' mid points' pairs renumbered: TopoLog::mid_remap)
             b.topo_changed = true;
             b.topo_version++;
             b.shk.version++;
@@ -3610,6 +3760,7 @@ void FemFrame::split_off(SoftBody& b, const std::vector<int>& part_of, const std
         f.member_f.assign(f.node.size(), vec3(0));
         f.contact_n.assign(f.node.size(), vec3(0));
         f.contact_f.assign(f.node.size(), vec3(0));
+        f.tri_press.clear();
         f.impulse.assign(f.node.size(), vec3(0));
         for (size_t i = 0; i < f.node.size(); i++) {
             const vec3 p = pb.nodes[f.node[i]].p;
@@ -3718,7 +3869,26 @@ int FemFrame::release_latches(SoftBody& b) {
     return n;
 }
 
-uint32_t FemFrame::detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint32_t>& moved) {
+void FemFrame::mass_floor(SoftBody& b, uint32_t fn) {
+    if (fn >= node.size()) return;
+    const uint32_t v = node[fn];
+    Node& n = b.nodes[v];
+    if (n.inv_mass <= 0 && n.mass > 0) return; // (fixed)
+    float share = 0;
+    for (const FrameTri& t : tris)
+        if (!t.broken && (t.n[0] == fn || t.n[1] == fn || t.n[2] == fn)) share += t.mass / 3.0f;
+    for (const FrameElement& e : elems)
+        if (!e.broken && (e.a == fn || e.b == fn)) share += 0.5f * e.mass;
+    const float need = std::max(1e-3f, 0.5f * share);
+    if (v < b.node_base_mass.size() && !b.shells.empty()) {
+        if (b.node_base_mass[v] < need) n.mass += need - b.node_base_mass[v], b.node_base_mass[v] = need;
+    } else if (n.mass < need) {
+        n.mass = need;
+    }
+    n.inv_mass = (b.info[v].flags & NF_FIXED) ? 0.0f : 1.0f / n.mass;
+}
+
+uint32_t FemFrame::detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint32_t>& moved, const std::vector<uint32_t>* members) {
     // the copy: the moved triangles' share of the node's mass, a third at least (a light copy on a small piece rang at
     // the step); the node keeps the rest - its members, loads, springs. A sheet over the triangles goes with them
     // (SoftBody::sheet_follow): the shares are of the node's own mass, its shells' thirds go with the shells
@@ -3727,8 +3897,11 @@ uint32_t FemFrame::detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint3
     const float own = sheet ? b.node_base_mass[v] : b.nodes[v].mass;
     float share = 0;
     for (uint32_t u : moved) share += tris[u].mass / 3.0f;
+    if (members)
+        for (uint32_t ei : *members) share += 0.5f * elems[ei].mass;
     const bool fixed = b.nodes[v].inv_mass <= 0;
-    share = fixed ? std::max(share, 1e-3f) : std::max(1e-3f, std::min(std::max(share, own / 3.0f), 0.7f * own));
+    // (no floor above the node's own: a refined shell's nodes weigh a gram or two, a gram's floor left one negative)
+    share = fixed ? std::max(share, 1e-3f) : std::max(1e-6f, std::min(std::max(share, own / 3.0f), 0.7f * own));
     const uint32_t c = clone_node(b, v);
     b.info[c].flags &= (uint16_t)~NF_FIXED;
     set_mass(b.nodes[c], share, false);
@@ -3741,6 +3914,12 @@ uint32_t FemFrame::detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint3
     q[fc] = q[fn];
     w[fc] = w[fn];
     xd[fc * 3] = xd[fn * 3], xd[fc * 3 + 1] = xd[fn * 3 + 1], xd[fc * 3 + 2] = xd[fn * 3 + 2];
+    if (members) // (the members' ends: on the copy, their rest frames in its frame the same - it has the node's turning)
+        for (uint32_t ei : *members) {
+            FrameElement& e = elems[ei];
+            if (e.a == fn) e.a = fc;
+            if (e.b == fn) e.b = fc;
+        }
     for (uint32_t u : moved) {
         FrameTri& x = tris[u];
         for (uint32_t& k : x.n)
@@ -3753,6 +3932,7 @@ uint32_t FemFrame::detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint3
         }
     }
     if (!b.shells.empty()) b.sheet_follow(v, c, moved);
+    mass_floor(b, fn), mass_floor(b, fc);
     node_inertia(fn, b), node_inertia(fc, b);
     debris_check = true;
     ready_ = false;
@@ -3782,6 +3962,289 @@ void FemFrame::bind_sheet(SoftBody& b) {
         const auto c = tri_of.find(k);
         t.coll = c != tri_of.end() ? c->second : -1;
     }
+}
+
+uint32_t FemFrame::split_tri(SoftBody& b, uint32_t ti, int e, uint32_t fm, float t) {
+    const FrameTri s = tris[ti];
+    const int e1 = (e + 1) % 3;
+    FrameTri A = s, B = s;
+    A.n[e1] = fm;
+    B.n[e] = fm;
+    // the rest shapes: the parent's in its own axes (the children's rest frame is the parent's), the new corner on the
+    // edge, each about its centroid again; the plastic rest rotations of the new corner between its ends'
+    auto lerp2 = [&](const float (&X)[3][2], int k) {
+        const float x = X[e][k] + (X[e1][k] - X[e][k]) * t;
+        return x;
+    };
+    const float xm[2] = {lerp2(s.X, 0), lerp2(s.X, 1)}, x0m[2] = {lerp2(s.X0, 0), lerp2(s.X0, 1)};
+    for (int k = 0; k < 2; k++) A.X[e1][k] = B.X[e][k] = xm[k], A.X0[e1][k] = B.X0[e][k] = x0m[k];
+    for (FrameTri* x : {&A, &B})
+        for (float (*X)[2] : {x->X, x->X0}) {
+            const float cx = (X[0][0] + X[1][0] + X[2][0]) / 3.0f, cy = (X[0][1] + X[1][1] + X[2][1]) / 3.0f;
+            for (int i = 0; i < 3; i++) X[i][0] -= cx, X[i][1] -= cy;
+        }
+    // (the new node's frame is the element's rest frame there - the ends' views of it between them -, so its rest frame
+    // in that node's: the identity for the triangle whose views made it, their turning against it for the other)
+    const quat Ea = normalize(q[s.n[e]] * s.r0[e]), Eb = normalize(q[s.n[e1]] * s.r0[e1]);
+    const quat rm = normalize(conj(q[fm]) * slerp(Ea, Eb, t));
+    const vec3 thm = s.th0[e] + (s.th0[e1] - s.th0[e]) * t;
+    A.r0[e1] = B.r0[e] = rm;
+    A.th0[e1] = B.th0[e] = thm;
+    A.area0 = s.area0 * t, B.area0 = s.area0 * (1 - t);
+    A.mass = s.mass * t, B.mass = s.mass * (1 - t);
+    A.level = B.level = (uint8_t)(s.level + 1);
+    const vec2 pm = s.px[e] + (s.px[e1] - s.px[e]) * t;
+    A.px[e1] = B.px[e] = pm;
+    // the corners' masses: the edge's ends each give the new node their share of the half they left
+    auto add_mass = [&](uint32_t fv, float dm) {
+        Node& n = b.nodes[node[fv]];
+        const bool fixed = n.inv_mass <= 0 && n.mass > 0;
+        n.mass = std::max(1e-4f, n.mass + dm);
+        n.inv_mass = fixed || (b.info[node[fv]].flags & NF_FIXED) ? 0.0f : 1.0f / n.mass;
+        if (node[fv] < b.node_base_mass.size()) b.node_base_mass[node[fv]] = std::max(0.0f, b.node_base_mass[node[fv]] + dm);
+    };
+    add_mass(s.n[e], -(1 - t) * s.mass / 3.0f);
+    add_mass(s.n[e1], -t * s.mass / 3.0f);
+    add_mass(fm, s.mass / 3.0f);
+    // the collision triangle: the parent's is A's, B a copy of it (its contacts inherited: topo_log)
+    B.coll = -1;
+    if (s.coll >= 0 && s.coll < (int)b.tris.size()) {
+        Triangle tb = b.tris[s.coll];
+        Triangle& ta = b.tris[s.coll];
+        ta.a = node[A.n[0]], ta.b = node[A.n[1]], ta.c = node[A.n[2]];
+        tb.a = node[B.n[0]], tb.b = node[B.n[1]], tb.c = node[B.n[2]];
+        B.coll = (int32_t)b.tris.size();
+        b.tris.push_back(tb);
+        if (b.topo_log.tris.size() < 100000) b.topo_log.tris.push_back({(uint32_t)B.coll, (uint32_t)s.coll});
+        else b.topo_log.overflow = true;
+    }
+    const uint32_t bi = (uint32_t)tris.size();
+    tris[ti] = A;
+    tris.push_back(B);
+    if (b.topo_log.mids.size() < 100000) b.topo_log.mids.push_back({bi, ti}); // (its mid point's pairs: the parent's)
+    else b.topo_log.overflow = true;
+    tri_codes(ti), tri_codes(bi);
+    return bi;
+}
+
+int FemFrame::refine_tri(SoftBody& b, uint32_t ti, int depth) {
+    if (depth > 8 || ti >= tris.size() || tris[ti].broken || tris.size() + 2 > tri_cap_) return 0;
+    auto len0 = [&](const FrameTri& t, int e) { return std::hypot(t.X0[(e + 1) % 3][0] - t.X0[e][0], t.X0[(e + 1) % 3][1] - t.X0[e][1]); };
+    auto longest = [&](const FrameTri& t) {
+        int e = 0;
+        for (int f = 1; f < 3; f++)
+            if (len0(t, f) > len0(t, e) * 1.0005f) e = f;
+        return e;
+    };
+    auto can = [&](const FrameTri& t) {
+        const ShellSection& s = shell_sections[t.section];
+        return t.level < s.max_level + level_bonus_ && 0.5f * len0(t, longest(t)) >= s.min_edge;
+    };
+    if (!can(tris[ti])) return 0;
+    const int e = longest(tris[ti]);
+    const uint32_t a = tris[ti].n[e], c = tris[ti].n[(e + 1) % 3];
+    // the neighbour across the edge (none: the shell's border; more: a seam of three, left whole)
+    int tj = -1, across = 0;
+    for (size_t u = 0; u < tris.size(); u++) {
+        if (u == ti || tris[u].broken) continue;
+        int hit = 0;
+        for (uint32_t x : tris[u].n) hit += x == a || x == c;
+        if (hit == 2) tj = (int)u, across++;
+    }
+    if (across > 1) return 0;
+    int fe = -1;
+    if (tj >= 0) {
+        const FrameTri& tn = tris[tj];
+        for (int f = 0; f < 3; f++)
+            if ((tn.n[f] == a && tn.n[(f + 1) % 3] == c) || (tn.n[f] == c && tn.n[(f + 1) % 3] == a)) fe = f;
+        if (fe < 0 || !can(tn)) return 0;
+        if (len0(tn, fe) < len0(tn, longest(tn)) * 0.999f) {
+            // (the neighbour is coarser: split it first, then a half of it has our edge as its longest)
+            const int k = refine_tri(b, (uint32_t)tj, depth + 1);
+            return k ? k + refine_tri(b, ti, depth + 1) : 0;
+        }
+    }
+    // the new node: on a pattern's line the edge crosses near its middle (its halves not too thin), else the middle
+    float t = 0.5f;
+    if (split_side_) { // (a cut: on its plane)
+        const float sa = (*split_side_)(b.nodes[node[a]].p), sc = (*split_side_)(b.nodes[node[c]].p);
+        if ((sa < 0) != (sc < 0)) t = std::clamp(sa / (sa - sc), 0.15f, 0.85f);
+    } else {
+        const FrameTri& x = tris[ti];
+        if (x.imp >= 0 && (size_t)x.imp < impacts.size()) {
+            const float tc = pattern_cross(impacts[x.imp].pat, x.px[e], x.px[(e + 1) % 3], 0.25f, 0.75f);
+            if (tc >= 0) t = tc;
+        }
+    }
+    const uint32_t va = node[a], vc = node[c];
+    const uint32_t m = clone_node(b, va);
+    {
+        Node& nm = b.nodes[m];
+        const Node &na = b.nodes[va], &nc = b.nodes[vc];
+        nm.p = na.p + (nc.p - na.p) * t;
+        nm.v = na.v + (nc.v - na.v) * t;
+        nm.mass = 0, nm.inv_mass = 0;
+        const uint16_t fixed = b.info[va].flags & b.info[vc].flags & NF_FIXED; // (on a clamped border only)
+        b.info[m].flags = (uint16_t)((b.info[va].flags & ~NF_FIXED) | fixed);
+    }
+    if (b.topo_log.nodes.size() < 100000) b.topo_log.nodes.push_back({m, vc}); // (between a, logged by clone_node, and c)
+    else b.topo_log.overflow = true;
+    const uint32_t fm = add_node(m);
+    for (int k = 0; k < 3; k++) xd[fm * 3 + k] = xd[a * 3 + k] + (xd[c * 3 + k] - xd[a * 3 + k]) * t;
+    w[fm] = w[a] + (w[c] - w[a]) * t;
+    {
+        const FrameTri& x = tris[ti];
+        q[fm] = slerp(normalize(q[a] * x.r0[e]), normalize(q[c] * x.r0[(e + 1) % 3]), t);
+    }
+    const int32_t host = (int32_t)ti, nhost = tj;
+    const uint32_t bi = split_tri(b, ti, e, fm, t);
+    uint32_t bj = 0;
+    if (tj >= 0) bj = split_tri(b, (uint32_t)tj, fe, fm, tris[tj].n[fe] == a ? t : 1 - t);
+    // the sheet over them halved the same way (Shell::host: each half on its element)
+    if (!b.shells.empty()) {
+        b.sheet_bisect(host, va, vc, m, t, (int32_t)ti, (int32_t)bi);
+        if (tj >= 0) {
+            const bool a_first = tris[tj].n[fe] == a; // (its half at a: the one that kept its index, else the new one)
+            b.sheet_bisect(nhost, va, vc, m, t, a_first ? tj : (int32_t)bj, a_first ? (int32_t)bj : tj);
+        }
+    }
+    for (uint32_t v : {a, c, fm, tris[ti].n[(e + 2) % 3]}) mass_floor(b, v);
+    if (tj >= 0)
+        for (uint32_t v : tris[tj].n) mass_floor(b, v);
+    for (uint32_t u : {ti, bi})
+        for (uint32_t v : tris[u].n) node_inertia(v, b);
+    if (tj >= 0)
+        for (uint32_t v : tris[tj].n) node_inertia(v, b);
+    if (tj >= 0)
+        for (uint32_t v : tris[bj].n) node_inertia(v, b);
+    tris_refined++;
+    ready_ = false;
+    b.topo_changed = true, b.topo_version++;
+    return 1;
+}
+
+void FemFrame::tri_codes(uint32_t ti) {
+    FrameTri& t = tris[ti];
+    t.line = 0;
+    t.es[0] = t.es[1] = t.es[2] = 64;
+    if (t.imp < 0 || (size_t)t.imp >= impacts.size()) return;
+    const ShellImpact& im = impacts[t.imp].pat;
+    const ShellSection& s = shell_sections[t.section];
+    const float zr = pattern_zone_radius(im);
+    for (int e = 0; e < 3; e++) {
+        const vec2 xa = t.px[e], xb = t.px[(e + 1) % 3], mid = (xa + xb) * 0.5f;
+        const float len = length(xb - xa);
+        if (len < 1e-6f || length(mid - im.c) > im.reach + len) continue;
+        // (how near a line it runs: its ends and its middle within half its length of one - the same one for both ends,
+        // else half as near; on the coarse shell an edge seldom lies on a line, the tears follow it in steps of the
+        // edges nearest it), the edges near a line weaker, those of the zone far from them stronger
+        const float reach = 0.5f * len + 1e-4f;
+        const PatternLine la = pattern_nearest(im, xa, reach), lb = pattern_nearest(im, xb, reach), lm = pattern_nearest(im, mid, reach);
+        float near = 0;
+        if (la.d < reach && lb.d < reach && lm.d < reach) near = std::clamp(1.0f - std::max(la.d, std::max(lb.d, lm.d)) / reach, 0.0f, 1.0f) * (la.id == lb.id ? 1.0f : 0.5f);
+        const float far = length(mid - im.c) < zr ? s.pattern_strong : 1.0f;
+        const float f = far + (s.pattern_weak - far) * std::min(1.0f, 1.5f * near);
+        if (near > 0.4f) t.line |= (uint8_t)(1u << e);
+        t.es[e] = (uint8_t)std::clamp((int)std::lround(f * 64.0f), 4, 255);
+        if (length(mid - im.c) < zr && pattern_cross(im, xa, xb, 0.02f, 0.98f) >= 0) t.line |= 8u;
+    }
+}
+
+void FemFrame::note_hit(uint32_t a, uint32_t b, uint32_t c, vec3 bary, float speed, float size, double time) {
+    if (!patterned_ || !(speed > hit_.speed) || speed < pattern_speed_) return;
+    hit_.n[0] = a, hit_.n[1] = b, hit_.n[2] = c;
+    hit_.bary = bary, hit_.speed = speed, hit_.size = size, hit_.time = time;
+}
+
+bool FemFrame::add_impact(SoftBody& b, uint32_t ti, vec3 p, float speed, float size, double time) {
+    if (ti >= tris.size() || tris[ti].broken || !b.allow_break || b.rigid) return false;
+    const ShellSection& s = shell_sections[tris[ti].section];
+    if (s.pattern == ShellPattern::None || speed < s.pattern_speed) return false;
+    for (const Impact& im : impacts) {
+        const float d = length(p - im.o);
+        if (d < std::max(im.pat.r, 0.1f)) return false;                       // (the same spot again)
+        if (d < 3.0f * im.pat.r && time - im.pat.time < 0.25) return false;   // (the same body going on through)
+    }
+    if (impacts.size() >= 12) return false;
+    auto pos = [&](uint32_t fn) { return b.nodes[node[fn]].p; };
+    const FrameTri& t0 = tris[ti];
+    const vec3 x0 = pos(t0.n[0]), x1 = pos(t0.n[1]), x2 = pos(t0.n[2]);
+    const vec3 n = normalize_or(cross(x1 - x0, x2 - x0), vec3(0, 1, 0));
+    Impact im;
+    im.o = p;
+    im.u = normalize_or((x1 - x0) - n * dot(x1 - x0, n), vec3(1, 0, 0));
+    im.v = cross(n, im.u);
+    uint32_t seed = 0x9e3779b9u * (uint32_t)(impacts.size() + 1);
+    for (float f : {p.x, p.y, p.z}) {
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        seed = (seed ^ u) * 0x85ebca6bu;
+    }
+    // (wood: the grain along the plate's first edge there)
+    im.pat = make_pattern(s.pattern, s.pattern_size, vec2(1, 0), vec2(0), speed, size, seed);
+    im.pat.time = time;
+    const int k = (int)impacts.size();
+    impacts.push_back(im);
+    const Impact& I = impacts.back();
+    const float zr = pattern_zone_radius(I.pat);
+    // its triangles: those round it on this plate (joined by their edges, within reach, turned less than 70 degrees
+    // from it - not round a corner onto another face, not the other wall of a closed section); a triangle in an older
+    // pattern only when inside this one's zone
+    std::vector<std::vector<uint32_t>> fan(node.size());
+    for (uint32_t u = 0; u < tris.size(); u++)
+        if (!tris[u].broken)
+            for (uint32_t v : tris[u].n) fan[v].push_back(u);
+    std::vector<uint8_t> seen(tris.size(), 0);
+    std::vector<uint32_t> queue{ti};
+    seen[ti] = 1;
+    for (size_t qi = 0; qi < queue.size(); qi++) {
+        FrameTri& t = tris[queue[qi]];
+        const vec3 y0 = pos(t.n[0]), y1 = pos(t.n[1]), y2 = pos(t.n[2]), cen = (y0 + y1 + y2) / 3.0f;
+        const float lmax = std::max(length(y1 - y0), std::max(length(y2 - y1), length(y0 - y2)));
+        if (length(cen - p) > I.pat.reach + lmax) continue;
+        if (std::fabs(dot(normalize_or(cross(y1 - y0, y2 - y0), vec3(0)), n)) < 0.34f) continue;
+        if (t.imp < 0 || length(cen - p) < zr) {
+            t.imp = (int8_t)k;
+            const vec3 ys[3] = {y0, y1, y2};
+            for (int i = 0; i < 3; i++) t.px[i] = vec2(dot(ys[i] - p, I.u), dot(ys[i] - p, I.v));
+            tri_codes(queue[qi]);
+        }
+        for (int i = 0; i < 3; i++) {
+            const uint32_t va = t.n[i], vb = t.n[(i + 1) % 3];
+            for (uint32_t u : fan[va])
+                if (!seen[u] && (tris[u].n[0] == vb || tris[u].n[1] == vb || tris[u].n[2] == vb)) seen[u] = 1, queue.push_back(u);
+        }
+    }
+    return true;
+}
+
+std::vector<uint32_t> FemFrame::refine_cut(SoftBody& b, const std::vector<uint32_t>& crossed, const std::function<float(vec3)>& side,
+                                           const std::function<bool(uint32_t)>& crosses, int levels) {
+    std::vector<uint32_t> now = crossed;
+    split_side_ = &side, level_bonus_ = levels;
+    for (int pass = 0; pass < levels + 2 && !now.empty(); pass++) {
+        const size_t nt = tris.size();
+        int made = 0;
+        for (uint32_t ti : now)
+            if (ti < tris.size() && !tris[ti].broken) made += refine_tri(b, ti);
+        if (!made) break;
+        // (the triangles crossing it now: the ones crossing it before or their halves - and the halves of their
+        // neighbours halved with them)
+        std::vector<uint32_t> next;
+        for (uint32_t ti : now)
+            if (ti < tris.size() && !tris[ti].broken && crosses(ti)) next.push_back(ti);
+        for (uint32_t ti = (uint32_t)nt; ti < tris.size(); ti++)
+            if (!tris[ti].broken && crosses(ti)) next.push_back(ti);
+        std::sort(next.begin(), next.end());
+        next.erase(std::unique(next.begin(), next.end()), next.end());
+        now.swap(next);
+    }
+    split_side_ = nullptr, level_bonus_ = 0;
+    // (and any other triangle crossing it: a neighbour halved there)
+    std::vector<uint32_t> out;
+    for (uint32_t ti = 0; ti < tris.size(); ti++)
+        if (!tris[ti].broken && crosses(ti)) out.push_back(ti);
+    return out;
 }
 
 int FemFrame::part_tris(SoftBody& b, const std::vector<uint32_t>& crossed, const std::function<float(vec3)>& side) {
@@ -3820,7 +4283,14 @@ int FemFrame::part_tris(SoftBody& b, const std::vector<uint32_t>& crossed, const
             else neg = true;
         }
         if (pos.empty() || !neg) continue;
-        copies.push_back(detach_tris(b, fn, pos));
+        // (the members at the corner on the positive side go with them: left on the node, they joined the two sides)
+        std::vector<uint32_t> pm;
+        for (uint32_t ei = 0; ei < (uint32_t)elems.size(); ei++) {
+            const FrameElement& e = elems[ei];
+            if (e.broken || (e.a != fn && e.b != fn) || e.a == e.b) continue;
+            if (side((b.nodes[node[e.a]].p + b.nodes[node[e.b]].p) * 0.5f) >= 0) pm.push_back(ei);
+        }
+        copies.push_back(detach_tris(b, fn, pos, &pm));
         copy_of.push_back((int)(std::find(corners.begin(), corners.end(), fn) - corners.begin()));
         n++;
     }
@@ -3866,8 +4336,11 @@ int FemFrame::tear_tri(SoftBody& b, uint32_t ti, vec3 pull) {
             score[k] = el > 1e-9 ? (float)std::fabs((ex * vx + ey * vy) / el) : 1.0f;
         }
     }
+    // (a pattern's weak edges - near its lines - first whatever the stretch, its strong ones - in the zone between them -
+    // last: the cracks run along the lines)
+    auto band = [&](int k) { return t0.es[k] < 56 ? 0 : t0.es[k] <= 72 ? 1 : 2; };
     int order[3] = {0, 1, 2};
-    std::sort(order, order + 3, [&](int x, int y) { return score[x] < score[y]; });
+    std::sort(order, order + 3, [&](int x, int y) { return band(x) != band(y) ? band(x) < band(y) : score[x] < score[y]; });
     // The edge parts all along, both its ends duplicated: an end inside the sheet (its fan still one round it with the
     // edge cut) takes the crack on along its edge straightest on from the torn one - shared by two triangles, not the
     // two parted ones' third corners - and that edge's far end is the crack's tip, shared by both sides. A node is
@@ -3886,13 +4359,27 @@ int FemFrame::tear_tri(SoftBody& b, uint32_t ti, vec3 pull) {
             for (uint32_t e : tris[u].n) {
                 if (e == v || e == from || e == skip1 || e == skip2) continue;
                 int users = 0;
-                for (uint32_t w2 : fan) users += tris[w2].n[0] == e || tris[w2].n[1] == e || tris[w2].n[2] == e;
+                float code = 64; // (its pattern code, the weaker side's: along a line the crack runs on along it)
+                for (uint32_t w2 : fan) {
+                    const FrameTri& x = tris[w2];
+                    if (x.n[0] != e && x.n[1] != e && x.n[2] != e) continue;
+                    users++;
+                    for (int g = 0; g < 3; g++)
+                        if ((x.n[g] == v && x.n[(g + 1) % 3] == e) || (x.n[g] == e && x.n[(g + 1) % 3] == v)) code = std::min(code, (float)x.es[g]);
+                }
                 if (users != 2) continue;
-                const float c = dot(normalize_or(pos(e) - p, vec3(0)), dir);
+                const float c = dot(normalize_or(pos(e) - p, vec3(0)), dir) + std::clamp(1.5f * (64.0f - code) / 64.0f, -0.5f, 0.6f);
                 if (c > best) best = c, next = e;
             }
         return next;
     };
+    // (a piece smaller than the section's min_piece is not cut off - the edge stays, another may part, or it waits -
+    // unless the triangle is far past its tear: then it goes as a shard rather than stretch on)
+    const ShellSection& sec = shell_sections[t0.section];
+    const float past = sec.elongation * (1.0f + 0.5f * t0.tears) * tear_band(t0.level) * (float)std::min(t0.es[0], std::min(t0.es[1], t0.es[2])) * (1.0f / 64.0f);
+    const bool shard_ok = t0.dmg > 2.0f * past;
+    bool waits = false;
+    int weak_held = 0;
     for (int k : order) {
         const uint32_t a = t0.n[k], c = t0.n[(k + 1) % 3], t3 = t0.n[(k + 2) % 3];
         // (the triangle across: none - the sheet's edge already, nothing to tear there; more - a seam of three, left)
@@ -3904,6 +4391,7 @@ int FemFrame::tear_tri(SoftBody& b, uint32_t ti, vec3 pull) {
             if (hit == 2) tj = (int)u, across++;
         }
         if (across != 1) continue;
+        weak_held += t0.es[k] < 56; // (a weak edge still joined: the tear had it to part)
         uint32_t j3 = kNone;
         for (uint32_t x : tris[tj].n)
             if (x != a && x != c) j3 = x;
@@ -3932,6 +4420,10 @@ int FemFrame::tear_tri(SoftBody& b, uint32_t ti, vec3 pull) {
             else cut_c.push_back(xc), ok = parted(c, cut_c);
         }
         if (!ok) continue; // (it would part at one end alone: another edge, or none)
+        if (!shard_ok && cuts_off_small(ti, (uint32_t)tj, a, c, xa, xc)) { // (a shard: another edge, or later)
+            waits = true;
+            continue;
+        }
         // the nodes' fans as they were (a node where the authored mesh joins triangles by a corner alone - a panel's
         // corner on another's - stays so: only the groups the crack splits part)
         std::vector<uint32_t> fan0[4];
@@ -3945,6 +4437,7 @@ int FemFrame::tear_tri(SoftBody& b, uint32_t ti, vec3 pull) {
         if (xa != kNone) split_refine(b, xa, fan0[2], g0[2], {});
         if (xc != kNone) split_refine(b, xc, fan0[3], g0[3], {});
         FrameTri& t = tris[ti];
+        if (weak_held) tears_by_line++, tears_on_line += t.es[k] < 56;
         t.tears++;
         tris_torn++;
         b.stats.broken_beams++;
@@ -3953,12 +4446,51 @@ int FemFrame::tear_tri(SoftBody& b, uint32_t ti, vec3 pull) {
         b.topo_changed = true, b.topo_version++;
         return 1;
     }
-    tris[ti].tears = 3; // (free all round, or no edge of it parts whole)
+    if (!waits) tris[ti].tears = 3; // (free all round, or no edge of it parts whole)
+    else tris[ti].wait = 64;        // (it tries again a little later: the stretch grows, or its neighbours tear)
     return 0;
 }
 
 // The triangles round frame node fn, grouped by their edges across it: two of them are joined where they share an edge
 // fn-x with x not in `cut`. The fan, each one's group; the groups' count.
+bool FemFrame::cuts_off_small(uint32_t ti, uint32_t tj, uint32_t a, uint32_t c, uint32_t xa, uint32_t xc) const {
+    const float limit = shell_sections[tris[ti].section].min_piece;
+    if (!(limit > 0)) return false;
+    constexpr uint32_t kNone = ~0u;
+    auto is_cut = [&](uint32_t p, uint32_t q) {
+        auto same = [&](uint32_t x, uint32_t y) { return (p == x && q == y) || (p == y && q == x); };
+        return same(a, c) || (xa != kNone && same(a, xa)) || (xc != kNone && same(c, xc));
+    };
+    std::vector<std::vector<uint32_t>> fan(node.size());
+    for (uint32_t u = 0; u < tris.size(); u++)
+        if (!tris[u].broken)
+            for (uint32_t v : tris[u].n) fan[v].push_back(u);
+    // (the side of `from` with the cut: big enough, or joined to `to` round the cut - nothing cut off)
+    auto big = [&](uint32_t from, uint32_t to) {
+        std::vector<uint32_t> seen{from}, stack{from};
+        double area = tris[from].area0;
+        while (!stack.empty()) {
+            const FrameTri& t = tris[stack.back()];
+            stack.pop_back();
+            for (int e = 0; e < 3; e++) {
+                const uint32_t p = t.n[e], q = t.n[(e + 1) % 3];
+                if (is_cut(p, q)) continue;
+                for (uint32_t u : fan[p]) {
+                    const FrameTri& x = tris[u];
+                    if (x.n[0] != q && x.n[1] != q && x.n[2] != q) continue;
+                    if (std::find(seen.begin(), seen.end(), u) != seen.end()) continue;
+                    if (u == to) return true;
+                    area += x.area0;
+                    if (area >= limit) return true;
+                    seen.push_back(u), stack.push_back(u);
+                }
+            }
+        }
+        return area >= limit;
+    };
+    return !big(ti, tj) || !big(tj, ti);
+}
+
 int FemFrame::fan_groups(uint32_t fn, const std::vector<uint32_t>& cut, std::vector<uint32_t>& fan, std::vector<int>& group) const {
     fan.clear();
     for (size_t u = 0; u < tris.size(); u++)
@@ -4054,6 +4586,19 @@ int FemFrame::cut(SoftBody& b, uint32_t ei, float t) {
     if (t * L < 0.06f || t < 0.12f) return tear(b, ei, 0);
     if ((1 - t) * L < 0.06f || t > 0.88f) return tear(b, ei, 1);
     return split(b, ei, t) >= 0 ? tear(b, ei, 1) : 0;
+}
+
+void FemFrame::cap_loose(SoftBody& b, float cap) const {
+    if (loose_tris.empty()) return;
+    const vec3 vm = b.average_velocity();
+    for (const LooseTri& t : loose_tris)
+        for (uint32_t v : t.n) {
+            if (v >= b.nodes.size()) continue;
+            Node& x = b.nodes[v];
+            const vec3 d = x.v - vm;
+            const float l2 = length2(d);
+            if (l2 > cap * cap) x.v = vm + d * (cap / std::sqrt(l2));
+        }
 }
 
 void FemFrame::finish_cuts(SoftBody& b, int tears) {

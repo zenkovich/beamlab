@@ -181,6 +181,49 @@ vec3 SoftBody::center_of_mass() const {
     return m > 0 ? c / m : c;
 }
 
+void SoftBody::largest_parts(float& first, float& second) const {
+    first = second = 0;
+    std::vector<uint32_t> up(nodes.size());
+    for (uint32_t i = 0; i < up.size(); i++) up[i] = i;
+    auto find = [&](uint32_t x) {
+        while (up[x] != x) x = up[x] = up[up[x]];
+        return x;
+    };
+    auto join = [&](uint32_t a, uint32_t c) {
+        if (a < up.size() && c < up.size()) up[find(a)] = find(c);
+    };
+    for (const Beam& bm : beams)
+        if (!(bm.flags & BF_BROKEN)) join(bm.a, bm.b);
+    for (const FrameElement& e : fem.elems)
+        if (!e.broken) join(fem.node[e.a], fem.node[e.b]);
+    for (const FrameTri& t : fem.tris)
+        if (!t.broken) join(fem.node[t.n[0]], fem.node[t.n[1]]), join(fem.node[t.n[1]], fem.node[t.n[2]]);
+    for (const FrameMount& m : fem.mounts)
+        if (!m.broken) {
+            join(m.a, m.b);
+            for (int k = 0; k < m.nb; k++) join(m.a, m.bn[k]);
+        }
+    for (const Shell& sh : shells) join(sh.n[0], sh.n[1]), join(sh.n[1], sh.n[2]);
+    for (const Joint& j : joints)
+        if (!j.broken && j.parent_frame < frames.size()) join(frames[j.parent_frame].node, j.child_node);
+    for (const Weld& w : welds)
+        if (!w.broken) {
+            if (w.t > 0) join(w.anchor, w.anchor2);
+            for (uint32_t k = 0; k < w.count; k++) join(w.anchor, weld_nodes[w.first + k]);
+        }
+    for (const SlideNode& sn : slides)
+        if (!sn.broken)
+            for (uint32_t r : sn.rail) join(sn.node, r);
+    std::vector<float> pm(up.size(), 0.0f);
+    float total = 0;
+    for (uint32_t i = 0; i < up.size(); i++) pm[find(i)] += nodes[i].mass, total += nodes[i].mass;
+    if (!(total > 0)) return;
+    for (float m : pm)
+        if (m > first) second = first, first = m;
+        else if (m > second) second = m;
+    first /= total, second /= total;
+}
+
 vec3 SoftBody::average_velocity() const {
     vec3 c(0);
     float m = 0;

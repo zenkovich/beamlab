@@ -864,6 +864,34 @@ void World::collide_static(SoftBody& b, size_t n0, size_t n1, const std::vector<
 
 // A FEM plate's mid point (SoftBody::tri_mids): its triangle's three body nodes; false if it is torn out, a corner is
 // not `flag`'s or none can move
+// The size of the plug body x's blow punches out of body y's plates (FemFrame::note_hit): x's least half extent, at
+// most 25 cm (a ball its radius; a car's corner, not the car), and the two bodies' collision radii (the hole it goes
+// through: smaller, it tore the hole wider again on its way)
+static inline float plug(const SoftBody& x, const SoftBody& y) {
+    const vec3 e = x.aabb.mx - x.aabb.mn;
+    return 0.85f * (std::clamp(0.5f * std::min(e.x, std::min(e.y, e.z)), 0.02f, 0.25f) + x.collision_radius + y.collision_radius); // (the
+    // punch's ring grows a fifth with the speed: about the contact's at a crash's)
+}
+
+// A body's mean velocity this substep (cached: the contacts' serial pass asks for it at a fast contact on a frame's
+// plates - the blow lays a pattern by the bodies' speeds, not by a light node's shaking)
+static vec3 body_velocity(SoftBody& b, double time) {
+    if (b.vcm_time != time) {
+        vec3 p(0);
+        float m = 0;
+        for (const Node& n : b.nodes)
+            if (n.inv_mass > 0) p += n.v * n.mass, m += n.mass;
+        b.vcm = m > 0 ? p / m : vec3(0);
+        b.vcm_time = time;
+    }
+    return b.vcm;
+}
+// (the speed of a blow on body y's plates: its contact's approach speed, at most the two bodies' own)
+static inline float blow_speed(SoftBody& x, SoftBody* y, vec3 nrm, float vn, double time) {
+    if (vn < y->fem.pattern_speed()) return 0;
+    return std::min(vn, std::fabs(dot(body_velocity(x, time) - body_velocity(*y, time), nrm)));
+}
+
 static inline bool tri_mid(const SoftBody& b, size_t k, uint32_t* n, uint16_t flag) {
     const FrameTri& t = b.fem.tris[k];
     if (t.broken) return false;
@@ -1052,19 +1080,22 @@ void World::static_mids_apply(SoftBody& b, const std::vector<StaticMid>& hits, f
         const GroundModel& gm = gms[c.surface < gms.size() ? c.surface : 0];
         vec3 f = primitive_collision(Fm, v, m, c.normal, dt, gm, depth, fr * fric_body, b.contact_push_max, b.contact_slop, b.bounce);
         if (c.max_force > 0 && length(f) > c.max_force) f *= c.max_force / length(f);
-        // (its corners' normal motion held in the frame's implicit step as a pressed node's, FemFrame::contact_n: a plate
-        // on a beam under its middle, pushed off by its mid point and back by its members, shook at 0.3 m/s)
-        const bool press = dot(f, c.normal) > 0;
+        // (its middle's normal motion held in the frame's implicit step, FemFrame::tri_press: a plate on a beam under its
+        // middle, pushed off by its mid point and back by its members, shook at 0.3 m/s)
         for (int j = 0; j < 3; j++) {
             F[n[j]] += f * kW;
-            if (const int sl = b.fem.slot(n[j]); sl >= 0) {
-                if (sl < (int)b.fem.contact_f.size()) b.fem.contact_f[sl] += f * kW;
-                if (press && sl < (int)b.fem.contact_n.size() && length2(b.fem.contact_n[sl]) == 0) b.fem.contact_n[sl] = c.normal;
-            }
+            if (const int sl = b.fem.slot(n[j]); sl >= 0 && sl < (int)b.fem.contact_f.size()) b.fem.contact_f[sl] += f * kW;
+        }
+        if (dot(f, c.normal) > 0) {
+            if (b.fem.tri_press.size() != b.fem.tris.size()) b.fem.tri_press.assign(b.fem.tris.size(), FemFrame::TriPress());
+            b.fem.tri_press[h.k] = {c.normal, 200.0f * m, dot(Fm + f, c.normal) / m};
         }
         contacts++;
         b.mid_contacts++;
         b.mid_touch[h.k] |= 1;
+        // (a fast blow on a plate lays its fracture pattern there: a pole's, a wall's)
+        if (b.fem.patterned() && -dot(v, c.normal) >= b.fem.pattern_speed()) // (the body's own speed: not its light node's shaking)
+            b.fem.note_hit(n[0], n[1], n[2], vec3(kW), std::min(-dot(v, c.normal), std::fabs(dot(body_velocity(b, m_time), c.normal))), 0.0f, m_time);
     }
 }
 
@@ -2374,7 +2405,7 @@ void World::refresh_fast_pairs(Island& isl) {
 void World::inherit_pairs(Island& isl, int k) {
     SoftBody& X = *isl.bodies[k];
     const SoftBody::TopoLog& L = X.topo_log;
-    if (L.tris.empty() && L.nodes.empty()) return;
+    if (L.tris.empty() && L.nodes.empty() && L.mids.empty() && L.mid_remap.empty()) return;
     PROFILE_ACCUM("Pair inheritance");
     // children per source (sorted), expanded transitively (a child split again in the same substep)
     static thread_local std::vector<std::pair<uint32_t, uint32_t>> tsrc, nsrc;
@@ -2466,7 +2497,35 @@ void World::inherit_pairs(Island& isl, int k) {
     for (const Island::CT& p : isl.ct)
         if (p.bt == k && p.tri >= tmin && p.tri <= tmax && tm[p.tri]) children(tsrc, p.tri, [&](uint32_t c) { ct_new.push_back({p.bc, p.bt, p.cap, c}); });
     isl.ct.insert(isl.ct.end(), ct_new.begin(), ct_new.end());
-    isl.pair_count = (int)(isl.nt.size() + isl.nc.size() + isl.ct.size());
+    // the plates' mid points (Island::MT): a halved triangle element's new half takes its parent's pairs, a split
+    // collision triangle's children theirs
+    if (!isl.mt.empty() && (!L.mids.empty() || !tsrc.empty())) {
+        static thread_local std::vector<std::pair<uint32_t, uint32_t>> msrc;
+        static thread_local std::vector<Island::MT> mt_new;
+        msrc.clear(), mt_new.clear();
+        for (auto& [child, from] : L.mids) msrc.push_back({from, child});
+        std::sort(msrc.begin(), msrc.end());
+        for (const Island::MT& p : isl.mt) {
+            if (p.bm == k && !msrc.empty()) children(msrc, p.mid, [&](uint32_t c) { mt_new.push_back({p.bm, p.bt, c, p.tri}); });
+            if (p.bt == k && p.tri >= tmin && p.tri <= tmax && tm[p.tri]) children(tsrc, p.tri, [&](uint32_t c) { mt_new.push_back({p.bm, p.bt, p.mid, c}); });
+        }
+        isl.mt.insert(isl.mt.end(), mt_new.begin(), mt_new.end());
+    }
+    // ... then renumbered as the body compacted them (gone: the pair too)
+    if (!L.mid_remap.empty()) {
+        size_t w = 0;
+        for (size_t i = 0; i < isl.mt.size(); i++) {
+            Island::MT p = isl.mt[i];
+            if (p.bm == k) {
+                const int32_t m = p.mid < L.mid_remap.size() ? L.mid_remap[p.mid] : -1;
+                if (m < 0) continue;
+                p.mid = (uint32_t)m;
+            }
+            isl.mt[w++] = p;
+        }
+        isl.mt.resize(w);
+    }
+    isl.pair_count = (int)(isl.nt.size() + isl.nc.size() + isl.ct.size() + isl.mt.size());
 }
 
 // Contacts of the candidate pairs: the narrow phase (closest points of the current positions: independent per pair,
@@ -2512,7 +2571,7 @@ void World::pair_detect(Island& isl, int c) {
                     const Node& b = bt.nodes[t.b];
                     const Node& cc = bt.nodes[t.c];
                     vec3 bary;
-                    const float r = bn.collision_radius;
+                    const float r = bt.faces_only && !t.two_sided ? bt.face_skin : bn.collision_radius;
                     if (!t.two_sided) {
                         // a hull triangle: over its face the node is pushed out along the face's normal, from as deep
                         // as the hull's depth behind it; off the face, outside, the ordinary contact with its edges
@@ -2525,7 +2584,8 @@ void World::pair_detect(Island& isl, int c) {
                             out.push_back({(uint32_t)i, 0.0f, bary, fn, r - s});
                             continue;
                         }
-                        if (s < 0) continue; // (behind, not over this face: another face's)
+                        if (s < 0 || bt.faces_only) continue; // (behind, not over this face: another face's; a blade's off its
+                        // faces: nothing - its edge's contact swept the nodes its cut left beside it along ahead of it)
                     } else {
                         // (off the triangle's box by more than its reach: most of the candidates)
                         const vec3 lo = vmin(a.p, vmin(b.p, cc.p)) - vec3(r), hi = vmax(a.p, vmax(b.p, cc.p)) + vec3(r);
@@ -2690,7 +2750,7 @@ void World::collide_pairs(Island& isl, bool detected) {
                 Node* B[3] = {&bt.nodes[t.a], &bt.nodes[t.b], &bt.nodes[t.c]};
                 vec3* FB[3] = {&bt.force[t.a], &bt.force[t.b], &bt.force[t.c]};
                 float wb[3] = {h.bary.x, h.bary.y, h.bary.z};
-                float fric = (bn.info[pr.node].flags & NF_TYRE) ? bn.info[pr.node].friction : 0.8f;
+                float fric = (bn.info[pr.node].flags & NF_TYRE) ? bn.info[pr.node].friction : 0.8f * std::min(bn.contact_friction, bt.contact_friction);
                 const vec3* SA[1] = {snap(bn, pr.node)};
                 const vec3* SB[3] = {snap(bt, t.a), snap(bt, t.b), snap(bt, t.c)};
                 if (!t.two_sided && h.pen > bn.collision_radius) { // (behind a hull's face)
@@ -2699,12 +2759,15 @@ void World::collide_pairs(Island& isl, bool detected) {
                 }
                 if (contact_force<1, 3>(A, FA, wa, B, FB, wb, ma, mb, h.nrm, h.pen, dt, gm, fric, SA[0] ? SA : nullptr, SB[0] ? SB : nullptr)) {
                     contacts++, bn.touch(bt), bt.touch(bn);
-                    // a fast contact on a sheet with a fracture pattern: where it lays one (the approach speed)
-                    if (bt.shell_mat.pattern != ShellPattern::None || bn.shell_mat.pattern != ShellPattern::None) {
+                    // a fast contact on a sheet with a fracture pattern, or on a frame's plates: where it lays one (the
+                    // approach speed; the body's size - a car's, its node's plates take a plug of a fifth of it)
+                    if (bt.shell_mat.pattern != ShellPattern::None || bn.shell_mat.pattern != ShellPattern::None || bt.fem.patterned() || bn.fem.patterned()) {
                         const float vn = std::fabs(dot(A[0]->v - (B[0]->v * wb[0] + B[1]->v * wb[1] + B[2]->v * wb[2]), h.nrm));
                         auto radius = [](const SoftBody& x) { return 0.5f * maxc(x.aabb.mx - x.aabb.mn); };
                         bt.pattern_contact(t.a, t.b, t.c, h.bary, vn, radius(bn), m_time);
                         bn.pattern_contact(pr.node, pr.node, pr.node, vec3(1, 0, 0), vn, radius(bt), m_time);
+                        if (bt.fem.patterned()) bt.fem.note_hit(t.a, t.b, t.c, h.bary, blow_speed(bn, &bt, h.nrm, vn, m_time), plug(bn, bt), m_time);
+                        if (bn.fem.patterned()) bn.fem.note_hit(pr.node, pr.node, pr.node, vec3(1, 0, 0), blow_speed(bt, &bn, h.nrm, vn, m_time), plug(bt, bn), m_time);
                     }
                 }
             } else if (c < cnt + cnc) {
@@ -2721,7 +2784,8 @@ void World::collide_pairs(Island& isl, bool detected) {
                 float wb[2] = {1 - h.s, h.s};
                 const vec3* SA[1] = {snap(bn, pr.node)};
                 const vec3* SB[2] = {snap(bc, cap.a), snap(bc, cap.b)};
-                if (contact_force<1, 2>(A, FA, wa, B, FB, wb, ma, mb, h.nrm, h.pen, dt, gm, 0.8f, SA[0] ? SA : nullptr, SB[0] ? SB : nullptr))
+                if (contact_force<1, 2>(A, FA, wa, B, FB, wb, ma, mb, h.nrm, h.pen, dt, gm, 0.8f * std::min(bn.contact_friction, bc.contact_friction), SA[0] ? SA : nullptr,
+                                        SB[0] ? SB : nullptr))
                     contacts++, bn.touch(bc), bc.touch(bn);
             } else {
                 const Island::CT& pr = isl.ct[h.pair];
@@ -2738,12 +2802,14 @@ void World::collide_pairs(Island& isl, bool detected) {
                 float wb[3] = {h.bary.x, h.bary.y, h.bary.z};
                 const vec3* SA[2] = {snap(bc, cap.a), snap(bc, cap.b)};
                 const vec3* SB[3] = {snap(bt, tri.a), snap(bt, tri.b), snap(bt, tri.c)};
-                if (contact_force<2, 3>(A, FA, wa, B, FB, wb, ma, mb, h.nrm, h.pen, dt, gm, 0.8f, SA[0] ? SA : nullptr, SB[0] ? SB : nullptr)) {
+                if (contact_force<2, 3>(A, FA, wa, B, FB, wb, ma, mb, h.nrm, h.pen, dt, gm, 0.8f * std::min(bc.contact_friction, bt.contact_friction), SA[0] ? SA : nullptr,
+                                        SB[0] ? SB : nullptr)) {
                     contacts++, bc.touch(bt), bt.touch(bc);
-                    if (bt.shell_mat.pattern != ShellPattern::None) {
+                    if (bt.shell_mat.pattern != ShellPattern::None || bt.fem.patterned()) {
                         const vec3 va = A[0]->v * wa[0] + A[1]->v * wa[1];
                         const float vn = std::fabs(dot(va - (B[0]->v * wb[0] + B[1]->v * wb[1] + B[2]->v * wb[2]), h.nrm));
                         bt.pattern_contact(tri.a, tri.b, tri.c, h.bary, vn, 0.5f * maxc(bc.aabb.mx - bc.aabb.mn), m_time);
+                        if (bt.fem.patterned()) bt.fem.note_hit(tri.a, tri.b, tri.c, h.bary, blow_speed(bc, &bt, h.nrm, vn, m_time), plug(bc, bt), m_time);
                     }
                 }
             }
@@ -2782,7 +2848,8 @@ void World::mid_detect(Island& isl, int ch) {
             if (!tri_mid(bm, pr.mid, n, NF_CONTACTER)) continue;
             const vec3 p = tri_mid_p(bm, n);
             const Node &a = bt.nodes[t.a], &b = bt.nodes[t.b], &c = bt.nodes[t.c];
-            const float r = bm.collision_radius;
+            const bool faces = bt.faces_only && !t.two_sided; // (a blade's face: over it alone, within its skin - see faces_only)
+            const float r = faces ? bt.face_skin : bm.collision_radius;
             // (off the triangle's box by more than its reach)
             const vec3 lo = vmin(a.p, vmin(b.p, c.p)) - vec3(r), hi = vmax(a.p, vmax(b.p, c.p)) + vec3(r);
             if (p.x < lo.x || p.y < lo.y || p.z < lo.z || p.x > hi.x || p.y > hi.y || p.z > hi.z) continue;
@@ -2793,6 +2860,9 @@ void World::mid_detect(Island& isl, int ch) {
             if (dist2 >= r * r) continue;
             const vec3 fn = normalize_or(cross(b.p - a.p, c.p - a.p), vec3(0, 1, 0));
             if (!t.two_sided && dot(p - a.p, fn) < 0) continue; // (behind a hull's face: its nodes' business)
+            // (a blade's edge: not pressed into the plates beside its cut - pushed along their normals, the sheet's halves
+            // were dragged down with it and flew apart)
+            if (faces && std::min(bary.x, std::min(bary.y, bary.z)) < 1e-4f) continue;
             const float dist = std::sqrt(dist2);
             vec3 nrm = dist > 1e-5f ? d / dist : fn;
             // (on the triangle's edge or corner: an edge pressed into the plate's face, along the plate's normal - the
@@ -2857,11 +2927,16 @@ void World::collide_mid_pairs(Island& isl, bool detected) {
             const float wb[3] = {h.bary.x, h.bary.y, h.bary.z};
             const vec3* SA[3] = {snap(bm, n[0]), snap(bm, n[1]), snap(bm, n[2])};
             const vec3* SB[3] = {snap(bt, t.a), snap(bt, t.b), snap(bt, t.c)};
-            if (contact_force<3, 3>(A, FA, wa, B, FB, wb, ma, mb, h.nrm, h.pen, dt, gm, 0.8f, SA[0] ? SA : nullptr, SB[0] ? SB : nullptr)) {
+            if (contact_force<3, 3>(A, FA, wa, B, FB, wb, ma, mb, h.nrm, h.pen, dt, gm, 0.8f * std::min(bm.contact_friction, bt.contact_friction), SA[0] ? SA : nullptr,
+                                    SB[0] ? SB : nullptr)) {
                 contacts++, bm.touch(bt), bt.touch(bm);
                 bm.mid_contacts++;
                 if (bm.mid_touch.size() != bm.fem.tris.size()) bm.mid_touch.assign(bm.fem.tris.size(), 0);
                 bm.mid_touch[pr.mid] |= 2;
+                if (bm.fem.patterned()) { // (a fast blow on the plate: its fracture pattern)
+                    const vec3 va = (A[0]->v + A[1]->v + A[2]->v) * kW, vb = B[0]->v * wb[0] + B[1]->v * wb[1] + B[2]->v * wb[2];
+                    bm.fem.note_hit(n[0], n[1], n[2], vec3(kW), blow_speed(bt, &bm, h.nrm, std::fabs(dot(va - vb, h.nrm)), m_time), plug(bt, bm), m_time);
+                }
             }
         }
     isl.contacts += contacts;
@@ -3561,6 +3636,7 @@ void World::simulate_island(Island& isl, int substeps) {
                     if (changed) b.topo_changed = true, b.topo_version++, b.shk.version++;
                 }
                 b.integrate_frames(dt / (float)isl.subs[k]);
+                b.fem.cap_loose(b);
                 if (!b.rigid && (!b.shell_events.empty() || b.shell_hit.speed > 0 || b.pattern_passes > 0)) {
                     lap(4);
                     PROFILE_ACCUM("Sheet events");
@@ -3834,7 +3910,7 @@ int World::destroy_at(vec3 p, float radius, float impulse) {
     return broken;
 }
 
-int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip) {
+int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip, float kerf) {
     vec3 m = cross(d0, d1);
     if (length2(m) < 1e-14f) return 0; // (the ray did not move: nothing swept)
     m = normalize(m);
@@ -3860,8 +3936,11 @@ int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip
         }
         if (!pos || !neg) continue;
         const int before = cut;
+        // (a node on the plane, within a centimetre of it, belongs to neither side: a beam to it is cut, its members on the
+        // two sides part there - one shaking across the plane was on the far side as the sector passed it, and held on)
+        auto on_plane = [&](vec3 p) { return std::fabs(side(p)) < 0.01f && in_wedge(p - m * side(p)); };
         for (Beam& bm : b.beams) {
-            if ((bm.flags & BF_BROKEN) || !crosses(b.nodes[bm.a].p, b.nodes[bm.b].p)) continue;
+            if ((bm.flags & BF_BROKEN) || !(crosses(b.nodes[bm.a].p, b.nodes[bm.b].p) || on_plane(b.nodes[bm.a].p) || on_plane(b.nodes[bm.b].p))) continue;
             bm.flags |= BF_BROKEN;
             b.stats.broken_beams++;
             cut++;
@@ -3878,14 +3957,28 @@ int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip
             for (uint32_t i = wd.first; i < wd.first + wd.count && !wd.broken; i++)
                 if (crosses(ap, b.nodes[b.weld_nodes[i]].p)) wd.broken = true, b.stats.broken_welds++, cut++;
         }
+        for (CollisionVolume& cv : b.volumes) { // (a collision volume the cut runs through: the lump it stands for in two, off -
+            // whole, a seat's stopped the axe's blade in the car)
+            if (cv.broken || !cv.placed) continue;
+            bool through = false;
+            for (size_t i = 0; i < cv.wverts.size() && !through; i++)
+                for (size_t j = i + 1; j < cv.wverts.size() && !through; j++) through = crosses(cv.wverts[i], cv.wverts[j]);
+            if (through) cv.broken = true, cv.placed = false, cut++;
+        }
         if (!b.fem.empty() && !b.rigid) {
             // frame members: cut where they cross the swept plane (the ones hit first, then the cuts: a split adds members)
             std::vector<std::pair<uint32_t, float>> hits;
+            std::vector<uint32_t> along;
             for (size_t ei = 0; ei < b.fem.elems.size(); ei++) {
                 const FrameElement& e = b.fem.elems[ei];
                 if (e.broken) continue;
                 const vec3 pa = b.nodes[b.fem.node[e.a]].p, pc = b.nodes[b.fem.node[e.b]].p;
                 const float sa = side(pa), sc = side(pc);
+                if (kerf > 0 && std::fabs(sa) < kerf && std::fabs(sc) < kerf && (e.torn & 3) != 3) { // (along the plane, in the blade's way)
+                    const vec3 qa = pa - m * sa, qc = pc - m * sc;
+                    if (in_wedge(qa) || in_wedge(qc) || in_wedge((qa + qc) * 0.5f)) along.push_back((uint32_t)ei);
+                    continue;
+                }
                 if ((sa < 0) == (sc < 0)) continue;
                 const float t = sa / (sa - sc);
                 static const bool ldbg = getenv("BL_LASERDBG") != nullptr;
@@ -3899,16 +3992,82 @@ int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip
             }
             int tears = 0;
             for (const auto& [ei, t] : hits) tears += b.fem.cut(b, ei, t);
+            for (uint32_t ei : along)
+                for (int end = 0; end < 2; end++)
+                    if (ei < b.fem.elems.size() && !b.fem.elems[ei].broken && !(b.fem.elems[ei].torn & (1 << end))) tears += b.fem.tear(b, ei, end);
             // triangle elements across the cut: the shell parts along its edges nearest the cut (FemFrame::part_tris: the
             // nodes there duplicated, nothing removed)
-            std::vector<uint32_t> crossed;
-            for (size_t ti = 0; ti < b.fem.tris.size(); ti++) {
+            // (a triangle crossing it - or with a corner on its plane, within a centimetre: the corner joins the two sides'
+            // triangles, none of which crosses)
+            auto tri_crosses = [&](uint32_t ti) {
                 const FrameTri& t = b.fem.tris[ti];
-                if (t.broken) continue;
                 const vec3 pa = b.nodes[b.fem.node[t.n[0]]].p, pb = b.nodes[b.fem.node[t.n[1]]].p, pc = b.nodes[b.fem.node[t.n[2]]].p;
-                if (crosses(pa, pb) || crosses(pb, pc) || crosses(pc, pa)) crossed.push_back((uint32_t)ti);
+                if (crosses(pa, pb) || crosses(pb, pc) || crosses(pc, pa)) return true;
+                for (const vec3& q : {pa, pb, pc})
+                    if (std::fabs(side(q)) < 0.01f && in_wedge(q - m * side(q))) return true;
+                return false;
+            };
+            std::vector<uint32_t> crossed;
+            for (uint32_t ti = 0; ti < (uint32_t)b.fem.tris.size(); ti++)
+                if (!b.fem.tris[ti].broken && tri_crosses(ti)) crossed.push_back(ti);
+            // (refined there first, their new nodes on the cut's plane: it parts along a fine, straight line)
+            if (!crossed.empty()) {
+                const std::function<float(vec3)> side_fn = side;
+                // (two levels past the sections' depth; one under a sheet - halved with the plates, the sheet's finest
+                // level is the body's step: at the third, the Shell Car's whole skin stepped four times a substep, its
+                // physics 5.7 -> 10.3 ms a frame after the axe; at the second twice, as after any bisection)
+                crossed = b.fem.refine_cut(b, crossed, side_fn, tri_crosses, b.shells.empty() ? 2 : 1);
             }
             if (!crossed.empty()) tears += b.fem.part_tris(b, crossed, side);
+            // the members meeting at a frame node on the plane from its two sides: those on its positive side torn off it
+            for (uint32_t fn = 0; fn < (uint32_t)b.fem.node.size(); fn++) {
+                const vec3 p = b.nodes[b.fem.node[fn]].p;
+                if (!on_plane(p)) continue;
+                std::vector<std::pair<uint32_t, int>> pos;
+                bool neg = false;
+                for (uint32_t ei = 0; ei < (uint32_t)b.fem.elems.size(); ei++) {
+                    const FrameElement& e = b.fem.elems[ei];
+                    if (e.broken || (e.a != fn && e.b != fn) || e.a == e.b) continue;
+                    const float sm = side((b.nodes[b.fem.node[e.a]].p + b.nodes[b.fem.node[e.b]].p) * 0.5f);
+                    if (sm >= 0) pos.push_back({ei, e.a == fn ? 0 : 1});
+                    else neg = true;
+                }
+                if (neg)
+                    for (const auto& [ei, end] : pos) tears += b.fem.tear(b, ei, end) ? 1 : 0;
+            }
+            // the mounts reaching across the cut (a part held on the other side): let go
+            for (FrameMount& mt : b.fem.mounts) {
+                if (mt.broken) continue;
+                bool across = crosses(b.nodes[mt.a].p, b.nodes[mt.b].p);
+                for (int k = 0; k < mt.nb && !across; k++) across = crosses(b.nodes[mt.a].p, b.nodes[mt.bn[k]].p);
+                if (across) mt.broken = true, b.fem.mounts_broken++, b.stats.broken_beams++, tears++;
+            }
+            // the kerf (a blade's): the frame nodes the cut left on its plane (its new ones there and their copies) stand
+            // off it on their own side - their elements' - by 2 mm, so that each face of the blade's wedge (its edge 2 mm
+            // thick) meets its own half's: on the plane, inside the edge, the two faces pushed them back and forth in turn,
+            // a sheet's cut edge flew apart at 150 m/s
+            if (kerf > 0 && tears > 0) {
+                const float off = std::min(kerf, 0.002f);
+                std::vector<float> lean(b.fem.node.size(), 0.0f);
+                for (const FrameTri& t : b.fem.tris) {
+                    if (t.broken) continue;
+                    const float sc = side((b.nodes[b.fem.node[t.n[0]]].p + b.nodes[b.fem.node[t.n[1]]].p + b.nodes[b.fem.node[t.n[2]]].p) * (1.0f / 3.0f));
+                    for (int q = 0; q < 3; q++) lean[t.n[q]] += sc;
+                }
+                for (const FrameElement& e : b.fem.elems) {
+                    if (e.broken) continue;
+                    const float sm = side((b.nodes[b.fem.node[e.a]].p + b.nodes[b.fem.node[e.b]].p) * 0.5f);
+                    lean[e.a] += sm, lean[e.b] += sm;
+                }
+                for (uint32_t fn = 0; fn < (uint32_t)b.fem.node.size(); fn++) {
+                    Node& x = b.nodes[b.fem.node[fn]];
+                    const float s = side(x.p);
+                    if (std::fabs(s) >= off || lean[fn] == 0 || x.inv_mass <= 0 || !in_wedge(x.p - m * s)) continue;
+                    const vec3 d = m * ((lean[fn] > 0 ? off : -off) - s);
+                    x.p += d;
+                    if (b.fem.xd.size() >= 3 * (size_t)fn + 3) b.fem.xd[3 * fn] += d.x, b.fem.xd[3 * fn + 1] += d.y, b.fem.xd[3 * fn + 2] += d.z;
+                }
+            }
             b.fem.finish_cuts(b, tears);
             cut += tears;
             if (getenv("BL_FRAMEDBG")) printf("laser: %s: %zu members crossed, %d torn\n", b.name.c_str(), hits.size(), tears);
@@ -3924,6 +4083,43 @@ int World::laser_cut(vec3 o, vec3 d0, vec3 d1, float range, const SoftBody* skip
             cut++;
         }
         if (!b.shells.empty()) cut += b.cut_shells(o, d0, d1, range);
+        // the welds near the cut again, the frame and the sheet cut: a weld whose sheet's nodes went with one side and its
+        // anchor with the other (a node on the cut split, the weld kept the other side's copy, both where they were) holds
+        // the halves together - the Frame Car stayed whole on its panels' welds. Each end's side: its elements' (the
+        // anchor's members and triangles, the sheet node's shells), not its place on the plane.
+        if (cut != before && !b.welds.empty() && !b.fem.empty() && b.node_shells.size() == b.nodes.size()) {
+            std::vector<float> lean(b.fem.node.size(), 0.0f);
+            for (const FrameTri& t : b.fem.tris) {
+                if (t.broken) continue;
+                const float sc = side((b.nodes[b.fem.node[t.n[0]]].p + b.nodes[b.fem.node[t.n[1]]].p + b.nodes[b.fem.node[t.n[2]]].p) * (1.0f / 3.0f));
+                for (int q = 0; q < 3; q++) lean[t.n[q]] += sc;
+            }
+            for (const FrameElement& e : b.fem.elems)
+                if (!e.broken) {
+                    const float sm = side((b.nodes[b.fem.node[e.a]].p + b.nodes[b.fem.node[e.b]].p) * 0.5f);
+                    lean[e.a] += sm, lean[e.b] += sm;
+                }
+            auto frame_lean = [&](uint32_t n) {
+                const int sl = b.fem.slot(n);
+                return sl >= 0 && sl < (int)lean.size() ? lean[sl] : side(b.nodes[n].p);
+            };
+            auto sheet_lean = [&](uint32_t n) {
+                float l = 0;
+                for (uint32_t si : b.node_shells[n]) {
+                    const Shell& sh = b.shells[si];
+                    l += side((b.nodes[sh.n[0]].p + b.nodes[sh.n[1]].p + b.nodes[sh.n[2]].p) * (1.0f / 3.0f));
+                }
+                return l;
+            };
+            for (Weld& wd : b.welds) {
+                if (wd.broken) continue;
+                const vec3 ap = b.nodes[wd.anchor].p * (1 - wd.t) + b.nodes[wd.anchor2].p * wd.t;
+                if (std::fabs(side(ap)) > 0.3f || !in_wedge(ap - m * side(ap))) continue; // (a weld reaches a grid's step)
+                const float la = frame_lean(wd.anchor) + (wd.t > 0 ? frame_lean(wd.anchor2) : 0.0f);
+                for (uint32_t i = wd.first; i < wd.first + wd.count && !wd.broken; i++)
+                    if (la * sheet_lean(b.weld_nodes[i]) < 0) wd.broken = true, b.stats.broken_welds++, cut++;
+            }
+        }
         if (cut != before) b.wake();
     }
     return cut;

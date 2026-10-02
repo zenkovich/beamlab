@@ -55,6 +55,7 @@
 #pragma once
 
 #include "core/math.h"
+#include "phys/shell_pattern.h"
 
 #include <algorithm>
 #include <array>
@@ -123,6 +124,27 @@ struct ShellSection {
     float drill = 0.05f;            // the corners' turning about the normal against the element's in-plane turning: a
                                     // spring of this share of G t A per corner (weak: only so the rotation is not free)
     vec3 color = vec3(-1.0f);       // (display only) its plates' colour; negative: the body's paint
+    // Refinement (FemFrame::refine_tri): a triangle yielding on its way to a tear is bisected through its longest edge -
+    // the neighbour across it at the same new node, the shell stays conforming - so the zone that tears gets detail
+    // first and parts along finer edges, in smaller pieces (the sheets' refinement: Shell)
+    int max_level = 1;              // bisections of an authored triangle (0: none; a truck's set_fem_shell may set it: each
+                                    // level costs the frame's step - the Shell Car after its head-on 0.4 ms more at 1)
+    float refine_at = 0.75f;        // ... once its plastic stretch passes this share of the stretch it tears at
+    float min_edge = 0.05f;         // no edge shorter than this (m: a lamp's small triangles stay whole - halved, their
+                                    // gram nodes were flung)
+    // Fracture pattern (shell_pattern.h): a contact this fast lays the material's lines round its point - a metal's ring
+    // and radial tears, a brittle plate's web, wood's split along the grain; its triangles tear along them (the edges on
+    // a line weaker, the others in the zone stronger), their bisections put the new nodes on them
+    ShellPattern pattern = ShellPattern::None;
+    float pattern_speed = 10.0f;    // m/s along the normal (a 2.5 m drop's 7 m/s not: a slab's on a cube, refined at once
+                                    // along the lines, walked it off on the light nodes)
+    float pattern_size = 0.12f;     // zone radius at 10 m/s (m)
+    float pattern_weak = 0.45f;     // the stretch an edge on a line parts at, as a share of the elongation's
+    float pattern_strong = 1.25f;   // ... the other edges in the zone (on the coarse shell no more: the tears went round it)
+    // No tear may cut off a piece smaller than this (m2; the sheets' min_piece), but far past its tear (twice): a sheet
+    // tearing in flaps, not shards. Off (0) by default: held back, a car's crushed triangles stretched on and tore more
+    // in the end - on the curb 150-200 tears instead of 40, the light pieces clamped four times as often
+    float min_piece = 0.0f;
     float mass_per_m2() const { return rho * t; }
     float D() const { return E * t * t * t / (12.0f * (1.0f - nu * nu)); } // bending stiffness (N m)
 };
@@ -146,6 +168,16 @@ struct FrameTri {
                                     // after an impact does not wear through)
     float util = 0;                 // stress against the yield (membrane or bending, the larger), for display
     uint8_t tears = 0;              // edges it has torn free (FemFrame::tear_tri: a crack along one; three: a piece)
+    uint8_t level = 0;              // bisections since the authored triangle (FemFrame::refine_tri)
+    bool whole = false;             // its bisection could not be made (a seam, the budget): not tried again
+    uint8_t wait = 0;               // steps before it may try to tear again (it would have cut off a shard: min_piece)
+    bool held = false;              // it cannot tear and an edge of it is joined: it does not let go of its corners
+    uint8_t line = 0;               // bit e: its edge e (n[e] -> n[e + 1]) follows a fracture pattern's line; bit 3: a
+                                    // line crosses it (where it yields it is bisected first: the new nodes on the line)
+    uint8_t es[3] = {64, 64, 64};   // the stretch edge e parts at, x / 64 of the section's (the pattern: on a line
+                                    // weaker, between the lines in the zone stronger)
+    int8_t imp = -1;                // the impact whose pattern it lies in (FemFrame::impacts), -1: none
+    vec2 px[3] = {vec2(0), vec2(0), vec2(0)}; // its corners in that impact's plane (m: the lines stay on the material)
 };
 
 // How a member's end is joined to its node. The member's local axes: x along it, y in the vertical plane through it
@@ -272,12 +304,39 @@ public:
     // normal) so the members' response cannot drive the node back into the ground (light nodes chattered)
     std::vector<vec3> contact_n;
     std::vector<vec3> contact_f;    // those contacts' forces (in b.force too): not carried over the short steps
+    // The plates pressed at their middles on the static world this step (World::static_mids_apply), per triangle: the
+    // implicit step holds the middle's normal velocity change to what the contact asked for (its normal acceleration a,
+    // for the body's step), kappa c c^T on the corners, c the middle (a third of each) along n - one constraint on the
+    // three. (Each corner held to its own pull, the stiff membrane's taken explicitly, a sheet hanging over a support's
+    // edge shook up to 150 m/s in a dozen steps and flew apart; each to the middle's, a plate on a beam under its middle
+    // rang on.) kap 0: none.
+    struct TriPress {
+        vec3 n{0};
+        float kap = 0, a = 0;
+    };
+    std::vector<TriPress> tri_press;
     std::vector<FrameSection> sections;
     std::vector<FrameElement> elems;
     std::vector<FrameMount> mounts;
     std::vector<ShellSection> shell_sections;
     std::vector<FrameTri> tris;
     int tris_torn = 0;              // triangles torn out so far
+    int tris_refined = 0;           // bisections so far (FemFrame::refine_tri; a pair across an edge counts one)
+    int tears_by_line = 0;          // tears of triangles with an edge near a pattern's line still joined ...
+    int tears_on_line = 0;          // ... that parted such an edge
+    // The fracture patterns laid on its triangles (ShellSection::pattern), each in the plane of the plate where it was
+    // hit: o the point, u, v its axes (the triangles' FrameTri::px: their corners there when it was laid)
+    struct Impact {
+        ShellImpact pat;
+        vec3 o, u, v;
+    };
+    std::vector<Impact> impacts;
+    bool patterned() const { return patterned_; }
+    float pattern_speed() const { return pattern_speed_; } // (the slowest blow one of its sections' patterns takes)
+    // A contact on a plate (body nodes a, b, c - one node three times: at that node -, its barycentric point) at
+    // `speed` along the normal by a body of radius `size` (0: unknown): the substep's fastest lays a pattern on the
+    // events (World, the contacts' serial pass)
+    void note_hit(uint32_t a, uint32_t b, uint32_t c, vec3 bary, float speed, float size, double time);
     int broken = 0;                 // tears so far (ends torn off their joints)
     int splits = 0;                 // members split so far
     int solve_failures = 0;         // steps whose factorization failed (the members' forces then act explicitly)
@@ -435,28 +494,53 @@ public:
     // others kept in their order): each shell on the element of its corners (Shell::host; the element's collision
     // triangle is then the shell's, kept by the sheet: coll -1), the other elements' collision triangles found again
     void bind_sheet(SoftBody& b);
+    // Longest-edge bisection of triangle ti (FemFrame::refine_tri's doc at ShellSection::max_level): the neighbour across
+    // the edge split at the same new node (a coarser one first), the sheet over them too (SoftBody::sheet_bisect).
+    // Returns the bisections made (0: none could be).
+    int refine_tri(SoftBody& b, uint32_t ti, int depth = 0);
+    // The triangles a cut crosses (the laser's, the axe's plane: side(p) its signed distance) refined first, `levels`
+    // past their sections' depth: each bisection's node where the plane crosses the halved edge, so the cut parts along
+    // edges on the plane - a straight, fine cut, not a staircase of the coarse shell's edges. `crosses` tells whether a
+    // triangle (its index) still crosses the cut's sector. Returns the triangles crossing it after.
+    std::vector<uint32_t> refine_cut(SoftBody& b, const std::vector<uint32_t>& crossed, const std::function<float(vec3)>& side,
+                                     const std::function<bool(uint32_t)>& crosses, int levels = 2);
+    // A pattern round body point p on triangle ti (the section's kind) at `speed`: false if none was laid (none for
+    // the section, too slow, the same spot again, twelve already)
+    bool add_impact(SoftBody& b, uint32_t ti, vec3 p, float speed, float size, double time);
     // A member cut at t along it (0 at a): torn off the joint when that is close, else split there and torn. Then
     // finish_cuts once (the solver's pattern again, the body told of its new nodes). Returns the tears.
     int cut(SoftBody& b, uint32_t elem, float t);
     void finish_cuts(SoftBody& b, int tears);
     // Topology (after the integration): the splits and tears compute_forces queued. True if nodes were added.
-    bool pending() const { return !events_.empty(); }
+    bool pending() const { return !events_.empty() || hit_.speed > 0; }
     bool process_events(SoftBody& b);
     // Debris: after tears, a piece of the frame that hangs on nothing else of the body (only frame members, lighter than
     // max_mass) leaves it as a body of its own, made rigid (the world's call, between frames: it costs its contacts only
     // and does not shiver at the frame's step on its light nodes); in the body its nodes are switched off and the frame
     // compacted. The large parts (a car torn in two) stay frames. Returns the new bodies.
     bool debris_check = false;      // set by a tear
-    int detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>& out, float max_mass);
+    int detach_debris(SoftBody& b, std::vector<std::unique_ptr<SoftBody>>& out, float max_mass, bool loose_only = false);
+    float loose_mass_ = 0;          // (the world's debris mass at its last call: the substep's tears let their fragments
+                                    // loose at once with it - left in the frame till the frame's end, a torn-off triangle
+                                    // of a refined shell was a component of three gram nodes, its velocity clamped)
     // A fragment of at most kLooseTris triangle elements torn off the shell, held by nothing else (detach_debris): out
     // of the frame, the body's springs hold its shape; its triangles still drawn (body nodes, their shell section)
     static constexpr int kLooseTris = 4;
+    static constexpr int kRefinePerStep = 16; // (bisections of the triangles in one substep's events: the rest wait)
+    static constexpr int kRefineEvery = 8;      // (the bisections in a batch every so many of its steps: each batch is
+                                                // the solver's pattern again, a third of a millisecond)
+    uint32_t steps_ = 0, refine_step_ = 0;      // (its force evaluations so far, at the last batch of bisections)
     struct LooseTri {
         uint32_t n[3];
         uint16_t section;
+        float area0 = 0;            // (its authored area: what of the shell it is)
     };
     std::vector<LooseTri> loose_tris;
     int loose_count = 0;            // (fragments let loose so far)
+    // The loose fragments' nodes no faster than `cap` against the body's mean velocity (each substep: a shard of a few
+    // grams squeezed between two cars' plates, pushed out by both in turn, ran away to 400 m/s and was reset)
+    static constexpr float kLooseCap = 50.0f;
+    void cap_loose(SoftBody& b, float cap = kLooseCap) const;
     // drops the broken members and the frame nodes left without members (renumbering the frame nodes)
     void compact(SoftBody& b);
     // A member split at t (0..1 from a): the new frame node, on the member's bent shape (-1: too short). A member's end
@@ -486,11 +570,34 @@ public:
     bool tri_state(uint32_t ti, float d[18], vec3 axes[3]) const;
 
 private:
-    // (node fn duplicated: the triangles listed take the copy with their share of its mass; the copy's frame node)
-    uint32_t detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint32_t>& moved);
+    // (node fn duplicated: the triangles listed - and the members, given - take the copy with their share of its mass;
+    // the copy's frame node)
+    uint32_t detach_tris(SoftBody& b, uint32_t fn, const std::vector<uint32_t>& moved, const std::vector<uint32_t>* members = nullptr);
+    // (a node's mass after its elements were torn round it, halved or moved: at least half their share of it and a gram -
+    // the shares the copies took left a node of a refined, torn shell with none, flung by any force)
+    void mass_floor(SoftBody& b, uint32_t fn);
+    // (triangle ti halved through frame node fm at fraction t of its edge e from n[e]: it keeps the half at n[e], the
+    // returned new one has the other; their rest state, pattern and collision triangle from it, the mass on the nodes moved)
+    uint32_t split_tri(SoftBody& b, uint32_t ti, int e, uint32_t fm, float t);
+    // (its edges' strength codes and line bits from its impact's lines)
+    void tri_codes(uint32_t ti);
+    bool patterned_ = false;        // (a section has a pattern)
+    const std::function<float(vec3)>* split_side_ = nullptr; // (refine_cut: the plane the bisections put their nodes on)
+    int level_bonus_ = 0;           // (refine_cut: the levels past the sections' depth)
+    float pattern_speed_ = 0;       // (the slowest contact one of them lays its pattern at)
+    struct Hit {
+        uint32_t n[3] = {0, 0, 0};
+        vec3 bary;
+        float speed = 0, size = 0;
+        double time = 0;
+    } hit_;                         // (the substep's fastest contact on a plate: note_hit)
+    size_t tri_cap_ = 0;            // (the refinement's budget: at most this many triangles - three times the authored)
     // (the triangles round a frame node grouped by their edges across it, `cut` the other ends of edges taken as parted;
     // the groups that were one before and are several now parted, the largest of each keeping the node: the copies)
     int fan_groups(uint32_t fn, const std::vector<uint32_t>& cut, std::vector<uint32_t>& fan, std::vector<int>& group) const;
+    // (would parting edge a-c of triangle ti from tj - on along a-xa and c-xc, kNone: not - cut off a piece of less than
+    // the section's min_piece?)
+    bool cuts_off_small(uint32_t ti, uint32_t tj, uint32_t a, uint32_t c, uint32_t xa, uint32_t xc) const;
     int split_refine(SoftBody& b, uint32_t fn, const std::vector<uint32_t>& fan0, const std::vector<int>& g0, const std::vector<uint32_t>& cut);
     std::vector<int32_t> slot_;
     std::vector<char> welded_;      // (compute_forces: the frame nodes some member is welded to, for the joints' damping)
@@ -510,7 +617,8 @@ private:
     bool ready_ = false;
     struct Event {
         uint32_t elem;
-        uint8_t kind;   // 0 split at t, 1 tear end a, 2 tear end b, 3 split at t and tear there, 4 a triangle torn out
+        uint8_t kind;   // 0 split at t, 1 tear end a, 2 tear end b, 3 split at t and tear there, 4 a triangle torn out,
+                        // 5 a triangle bisected, 6 a triangle off its corners
         float t;
     };
     std::vector<Event> events_;

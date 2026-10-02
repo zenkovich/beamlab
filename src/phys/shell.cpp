@@ -187,6 +187,7 @@ struct ShellOps {
         else b.topo_log.overflow = true;
     }
     bool can_refine(const Shell& s) {
+        if (b.on_plate(s)) return false; // (a sheet on triangle elements is refined with them: sheet_bisect)
         const float lmax = std::max(s.L0[0], std::max(s.L0[1], s.L0[2]));
         const ShellMaterial& m = b.shell_material(s);
         return s.level < m.max_level && lmax * 0.70710678f >= m.min_edge && b.shells.size() + 4 <= b.shell_cap;
@@ -986,6 +987,59 @@ void SoftBody::sheet_follow(uint32_t v, uint32_t c, const std::vector<uint32_t>&
     for (uint32_t x : own)
         if (node_shells[x].size() >= 2) ops.split_node(x, vec3(1, 0, 0), -1, -1, true, true);
     // the light nodes along the new free edges within the step's budget
+    std::vector<uint32_t> vs;
+    for (uint32_t si = 0; si < touched.size() && si < shells.size(); si++)
+        if (touched[si])
+            for (int k = 0; k < 3; k++) vs.push_back(shells[si].n[k]);
+    std::sort(vs.begin(), vs.end());
+    vs.erase(std::unique(vs.begin(), vs.end()), vs.end());
+    enforce_node_budget(&vs);
+    contacter_count = -1;
+    shell_acc_stale = true;
+}
+
+void SoftBody::sheet_bisect(int32_t host, uint32_t a, uint32_t c, uint32_t m, float t, int32_t ha, int32_t hc) {
+    if (shells.empty() || a >= node_shells.size() || m >= nodes.size()) return;
+    if (node_shells.size() <= m) node_shells.resize(m + 1);
+    std::vector<uint8_t> touched(shells.size(), 0);
+    ShellOps ops{*this, touched, (uint32_t)shells.size() * 2654435761u + topo_version};
+    const std::vector<uint32_t> fan = node_shells[a];
+    bool any = false;
+    for (uint32_t si : fan) {
+        if (shells[si].host != host) continue;
+        const int e = edge_of(shells[si], a, c);
+        if (e < 0) continue;
+        const int j = shells[si].nb[e];
+        const uint32_t ni = ops.bisect(si, e, m, shells[si].n[e] == a ? t : 1 - t); // (si keeps the half at its n[e])
+        const bool si_at_a = corner_of(shells[si], a) >= 0;
+        shells[si].host = si_at_a ? ha : hc;
+        shells[ni].host = si_at_a ? hc : ha;
+        // the shell across the edge: unlinked until it is halved too, then its halves linked to these
+        const int ea = edge_of(shells[si], si_at_a ? a : c, m), eb = edge_of(shells[ni], si_at_a ? c : a, m);
+        if (ea >= 0) shells[si].nb[ea] = -1;
+        if (eb >= 0) shells[ni].nb[eb] = -1;
+        if (j >= 0)
+            for (int f = 0; f < 3; f++)
+                if (shells[j].nb[f] == (int)si) shells[j].nb[f] = -1, ops.dirty((uint32_t)j);
+        for (uint32_t x : {si, ni})
+            for (int g = 0; g < 3; g++) {
+                const uint32_t p0 = shells[x].n[g], p1 = shells[x].n[nx(g)];
+                if (p0 != m && p1 != m) continue;
+                const uint32_t y = p0 == m ? p1 : p0;
+                if (y != a && y != c) continue;
+                for (uint32_t z : node_shells[m]) {
+                    if (z == si || z == ni) continue;
+                    const int gz = edge_of(shells[z], m, y);
+                    if (gz < 0 || shells[z].nb[gz] >= 0) continue;
+                    shells[x].nb[g] = (int32_t)z, shells[z].nb[gz] = (int32_t)x;
+                    ops.dirty(z), ops.dirty(x);
+                    break;
+                }
+            }
+        any = true;
+    }
+    if (!node_base_mass.empty()) ops.set_node_mass(a), ops.set_node_mass(c), ops.set_node_mass(m);
+    if (!any) return;
     std::vector<uint32_t> vs;
     for (uint32_t si = 0; si < touched.size() && si < shells.size(); si++)
         if (touched[si])

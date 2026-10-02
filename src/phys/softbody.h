@@ -566,6 +566,8 @@ public:
     std::vector<Capsule> capsules;
     std::vector<CollisionVolume> volumes; // (see CollisionVolume)
     bool volume_pass = false;             // (a cutting tool - the giant axe: through the volumes, it cuts)
+    float contact_friction = 1.0f;        // its friction against other bodies, a factor on theirs (0.8): the giant axe's
+                                          // blade 0.15
     // a volume on these anchors round the hull of these points (in the body's space as built); its index, -1: too few
     // anchors or points not spanning a volume
     int add_volume(const std::string& name, const std::vector<uint32_t>& anchors, const std::vector<vec3>& points, float break_rms);
@@ -663,6 +665,11 @@ public:
     bool is_static_like = false;        // anchored scenery (trees, bridges) -> sleeps aggressively
     int collision_group = 0;            // bodies with the same non-zero group don't collide
     float hull_depth = 0.3f;            // how deep behind a hull triangle (Triangle::two_sided false) a node is still pushed out (m)
+    bool faces_only = false;            // its hull triangles touch nodes over their faces only, not off them by their edges (a
+                                        // blade's wedge: the edges' contact at its 2 mm edge swept the nodes its cut left
+                                        // beside it along ahead of it, at its speed), within face_skin of them (not the
+                                        // node's radius: a cut's node 2 mm off the blade was thrown out to a centimetre)
+    float face_skin = 0.002f;
     // (BeamLab) the FEM plates' mid points: each of the frame's triangle elements (FemFrame::tris) has one at its
     // centroid, collided beside its corners - against the static world, the other bodies' triangles and the collision
     // volumes - its force onto its corners, a third each; no node of its own. Between its nodes a plate let a curb's
@@ -766,6 +773,10 @@ public:
     int shell_level = 0;                // finest shell level in the body
     bool topo_changed = false;          // set by process_shell_events (the island rebuilds its contact pairs)
     bool pieces_check = false;          // cracked this frame: loose pieces may have to become bodies (detach_pieces)
+    // (the body's mean velocity, its moving nodes' momentum over their mass, at World time vcm_time: a fast blow's
+    // speed on a frame's plates - World::body_velocity)
+    vec3 vcm{0, 0, 0};
+    double vcm_time = -1;
     size_t shell_cap = 0;               // refinement budget (number of shells)
     // Steps of its own per substep needed by the finest shells: the stable step shrinks with the triangle size.
     int dt_shift() const { return rigid ? 0 : std::max(shell_min_shift, (shell_level + 1) / 2); }
@@ -797,10 +808,14 @@ public:
     struct TopoLog {
         std::vector<std::pair<uint32_t, uint32_t>> tris;  // (new or shrunk collision triangle, the triangle it came from)
         std::vector<std::pair<uint32_t, uint32_t>> nodes; // (new node, a node it lies between / was split from)
+        std::vector<std::pair<uint32_t, uint32_t>> mids;  // (new triangle element, the one it was halved from: its mid point)
+        std::vector<int32_t> mid_remap;                   // (the triangle elements compacted after: old index -> new, -1 gone)
         bool overflow = false;                            // too much to inherit: search again
         void clear() {
             tris.clear();
             nodes.clear();
+            mids.clear();
+            mid_remap.clear();
             overflow = false;
         }
     } topo_log;
@@ -879,6 +894,9 @@ public:
     float total_mass() const;
     vec3 center_of_mass() const;
     vec3 average_velocity() const;
+    // Its two largest parts held together by anything (beams, members, triangle elements, mounts, sheets, joints, welds,
+    // slide nodes' rails): their shares of its mass (0..1; a car cut in two: two halves)
+    void largest_parts(float& first, float& second) const;
     void compute_aabb();
     void translate(vec3 d);
     void set_velocity(vec3 v);
@@ -983,6 +1001,10 @@ public:
     // are cut, and the sheet's own nodes on such an edge (a refinement's midpoints) get a copy for each side. The masses
     // of v and c: their own (node_base_mass) and their shells' thirds.
     void sheet_follow(uint32_t v, uint32_t c, const std::vector<uint32_t>& moved);
+    // ... and their bisection (FemFrame::refine_tri: element `host`'s edge (a, c) halved at node m, t from a, the half at
+    // a now element ha, the one at c hc): its shells there halved the same way, each on its half, linked to the halves
+    // across the edge once those are split too. A shell on an element is refined only so (no refinement of its own).
+    void sheet_bisect(int32_t host, uint32_t a, uint32_t c, uint32_t m, float t, int32_t ha, int32_t hc);
     // Pieces of a cracked sheet that hang together with nothing else become bodies of their own (islands, sleep and
     // bounds of their own): every anchored piece stays (a free sheet keeps its biggest one). Only for bodies made of
     // shells alone. Returns the number of new bodies appended to `out`.
