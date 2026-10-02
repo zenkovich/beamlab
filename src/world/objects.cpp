@@ -1002,29 +1002,41 @@ std::unique_ptr<DynamicObject> build_fem_box(World& w, const FemBoxDesc& d, cons
 }
 
 // ====================================================================================== axe
-std::unique_ptr<DynamicObject> build_axe(World& w, const AxeDesc& d, const std::string& name, uint32_t* edge_node) {
+std::unique_ptr<DynamicObject> build_axe(World& w, const AxeDesc& d, const std::string& name, uint32_t* edge_node, uint32_t* edge_node2) {
     auto body = std::make_unique<SoftBody>();
     body->name = name;
     auto sv = std::make_unique<SurfaceVisual>();
     sv->mat = d.mat ? d.mat : SharedAssets::get().metal;
     // (hanging straight down from the pivot, then turned by the release angle about the axis)
-    const float c = std::cos(d.angle), sn = std::sin(d.angle);
-    auto place = [&](vec3 l) { return d.pivot + vec3(l.x * c + l.y * sn, -l.x * sn + l.y * c, l.z); };
+    const float c = std::cos(d.angle), sn = std::sin(d.angle), cy = std::cos(d.yaw), sy = std::sin(d.yaw);
+    auto place = [&](vec3 l) {
+        const vec3 q(l.x * c + l.y * sn, -l.x * sn + l.y * c, l.z);
+        return d.pivot + vec3(q.x * cy + q.z * sy, q.y, -q.x * sy + q.z * cy);
+    };
     const float h = d.handle * 0.5f;
     struct Box {
         int nx, ny, nz;
         uint32_t first;
         uint32_t id(int x, int y, int z) const { return first + (uint32_t)((z * ny + y) * nx + x); }
     };
-    // a box of nodes (lo..hi in the axe's own frame), its beams to all neighbours, its six faces
-    auto box = [&](int nx, int ny, int nz, vec3 lo, vec3 hi, float mass) {
+    // a box of nodes (lo..hi in the axe's own frame), its beams to all neighbours, its six faces; `taper`: its
+    // thickness (z) at hi.x against lo.x's, over the last `bevel` of it (a wedge's edge)
+    // (a wedge's nodes collide through its faces alone: as contacters, 4 cm round, its edge's pushed the plates beside
+    // its cut away; it has no face at its edge - the two sides meet there, a 2 mm strip of a face caught the cut's
+    // nodes beside it and swept them along ahead)
+    auto box = [&](int nx, int ny, int nz, vec3 lo, vec3 hi, float mass, float taper = 1.0f, float bevel = 0) {
         Box b{nx, ny, nz, (uint32_t)body->nodes.size()};
         const float nm = mass / (float)(nx * ny * nz);
         for (int z = 0; z < nz; z++)
             for (int y = 0; y < ny; y++)
                 for (int x = 0; x < nx; x++) {
                     const vec3 t((float)x / (nx - 1), (float)y / (ny - 1), (float)z / (nz - 1));
-                    body->add_node(place(lo + (hi - lo) * t), nm, NF_GROUND | NF_CONTACTER);
+                    vec3 l = lo + (hi - lo) * t;
+                    if (taper != 1.0f) {
+                        const float u = bevel > 0 ? std::clamp(1.0f - (hi.x - l.x) / bevel, 0.0f, 1.0f) : t.x; // (0 behind the bevel, 1 at the edge)
+                        l.z = 0.5f * (lo.z + hi.z) + (l.z - 0.5f * (lo.z + hi.z)) * (1.0f + (taper - 1.0f) * u);
+                    }
+                    body->add_node(place(l), nm, taper != 1.0f ? NF_GROUND : NF_GROUND | NF_CONTACTER);
                 }
         const float kk = clamp_k(5e8f, nm);
         for (int z = 0; z < nz; z++)
@@ -1040,6 +1052,7 @@ std::unique_ptr<DynamicObject> build_axe(World& w, const AxeDesc& d, const std::
         const int dims[3] = {nx, ny, nz};
         for (int axis = 0; axis < 3; axis++)
             for (int side = 0; side < 2; side++) {
+                if (taper != 1.0f && axis == 0 && side == 1) continue;
                 const int u_ax = (axis + 1) % 3, v_ax = (axis + 2) % 3, fixed = side ? dims[axis] - 1 : 0;
                 for (int v = 0; v < dims[v_ax] - 1; v++)
                     for (int u = 0; u < dims[u_ax] - 1; u++) {
@@ -1056,7 +1069,7 @@ std::unique_ptr<DynamicObject> build_axe(World& w, const AxeDesc& d, const std::
                         const int* t = side ? o : r;
                         for (int k = 0; k < 6; k += 3) {
                             add_face_surface(*sv, q[t[k]], q[t[k + 1]], q[t[k + 2]], uv[t[k]], uv[t[k + 1]], uv[t[k + 2]]);
-                            body->add_triangle(q[t[k]], q[t[k + 1]], q[t[k + 2]]);
+                            body->add_triangle(q[t[k]], q[t[k + 1]], q[t[k + 2]], false);
                         }
                     }
             }
@@ -1064,7 +1077,10 @@ std::unique_ptr<DynamicObject> build_axe(World& w, const AxeDesc& d, const std::
     };
     const float top = -(d.length - d.blade_h); // (the blade's top, the handle's foot)
     const Box hb = box(2, 7, 2, vec3(-h, top, -h), vec3(h, -0.35f, h), 0.25f * d.mass);
-    const Box bb = box(5, 3, 2, vec3(-0.5f * d.blade_w, -d.length, -0.5f * d.thick), vec3(0.5f * d.blade_w, top, 0.5f * d.thick), 0.75f * d.mass);
+    // (a wedge to its edge, the +x side: it leads. Flat, 12 cm thick at the edge, it met what it had cut inside a car
+    // face on and pushed it along, stuck in its floor)
+    const Box bb = box(5, 3, 2, vec3(-0.5f * d.blade_w, -d.length, -0.5f * d.thick), vec3(0.5f * d.blade_w, top, 0.5f * d.thick), 0.75f * d.mass,
+                       d.thick > 0 ? std::min(1.0f, d.edge / d.thick) : 1.0f, d.bevel);
     // the handle's foot into the blade's top; its head on the pivot (two fixed nodes on the axis: it swings about it)
     const float kj = clamp_k(5e8f, 0.25f * d.mass / 28.0f);
     for (int z = 0; z < 2; z++)
@@ -1077,7 +1093,12 @@ std::unique_ptr<DynamicObject> build_axe(World& w, const AxeDesc& d, const std::
             for (int x = 0; x < 2; x++) body->add_beam(p, hb.id(x, 6, hz), kj, 0.02f * kj * kDefaultDt, 1e12f, 1e12f);
     }
     if (edge_node) *edge_node = bb.id(4, 1, 0); // (released towards -x it swings towards +x: the blade's +x side leads)
+    if (edge_node2) *edge_node2 = bb.id(4, 1, 1); // (the edge's other side)
     body->collision_radius = 0.04f;
+    body->contact_friction = d.friction;
+    // (a solid: its faces push out what is in front of them, or just behind - inside its 2 mm edge, two-sided, its two
+    // faces pushed a cut's nodes back and forth in turn, and a sheet's cut edge flew apart)
+    body->hull_depth = 0.001f, body->faces_only = true, body->face_skin = 0.002f; // (behind no deeper than half its edge)
     body->finalize();
     body->stabilize(kDefaultDt);
     auto obj = std::make_unique<DynamicObject>();

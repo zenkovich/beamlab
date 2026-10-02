@@ -1821,16 +1821,135 @@ void frame_car_grab(Game& g, float lift, float strength) {
     b.wake();
 }
 
+// The giant axe (build_axe): each frame the sector its edge swept about the pivot (a plane across what it swings
+// through: the swing's own) cuts what it crosses (World::laser_cut), out to its edge's reach - a little ahead of the
+// blade, to where the edge will be in a frame and a half, so the edge meets what it cut. The rest is the collisions:
+// its wedge of a blade, 12 cm at the back, pushes the cut faces apart and is slowed by them, as the halves' falling
+// is by it.
+struct AxeSwing {
+    DynamicObject* obj = nullptr;
+    uint32_t edge = 0, edge2 = 0;       // (its edge's middle, the two sides of the blade)
+    vec3 pivot{0};
+    vec3 axis{0, 0, 1}, ahead{1, 0, 0}; // (its swing's axis - the cut's normal -, the way it swings through the bottom)
+    vec3 dir{0};                        // (the edge's direction from the pivot last frame: the sector it swept is cut)
+    float reach = 0;                    // (the pivot to the edge's lower end)
+    float thick = 0;                    // (the blade's at its back)
+    float blade_h = 0;                  // (its leading face's length, along the handle)
+    float r0 = 0;                       // (the edge's distance from the pivot as it was let go: its stretch since)
+    float angle = 0, most = -180;       // (its edge's angle from straight down, towards `ahead`, degrees; the most so far)
+    int cuts = 0;                       // (the links cut so far)
+    bool caught = false;                // (a ratchet at its pivot holds it at the top of its swing through: swinging back,
+                                        // its blunt back hit the halves it had cut and threw them off)
+    void make(Game& g, const AxeDesc& d, const std::string& name) {
+        pivot = d.pivot;
+        reach = std::sqrt(0.25f * d.blade_w * d.blade_w + d.length * d.length), thick = d.thick, blade_h = d.blade_h;
+        axis = vec3(std::sin(d.yaw), 0, std::cos(d.yaw)), ahead = vec3(std::cos(d.yaw), 0, -std::sin(d.yaw));
+        obj = g.add_object(build_axe(g.world, d, name, &edge, &edge2));
+    }
+    // this frame's cut (the links cut)
+    int step(Game& g, float dt) {
+        if (!obj || !obj->body) return 0;
+        const SoftBody& ab = *obj->body;
+        const vec3 e = ab.nodes[edge].p - pivot, v = ab.nodes[edge].v;
+        const float r = length(e);
+        angle = std::atan2(dot(e, ahead), -e.y) * 57.2958f, most = std::max(most, angle);
+        if (caught) return 0;
+        if (most > 20.0f && angle < most - 0.5f) { // (through and at the top of its swing: held there)
+            caught = true;
+            for (Node& x : obj->body->nodes) x.v = vec3(0), x.inv_mass = 0;
+            return 0;
+        }
+        // (cutting as long as it moves at all: stopped below 2 m/s, it stuck in the car for good)
+        if (r < 1e-3f || length(v) < 0.05f) return 0;
+        // (the edge's way this frame and 5 cm: what it meets it cuts there, in its collisions - half a metre ahead the
+        // car was cut before the blade came, and it went through as a laser)
+        const float vl = length(v), lead = vl * std::max(dt, 1.0f / 60.0f) + 0.05f;
+        // (in its swing's plane, across the pivot's axis: the cut's plane is that one - from two directions nearly the
+        // same and a little out of it, a slow swing's plane tilted a metre off at the car)
+        auto flat = [this](vec3 x) { return normalize_or(x - axis * dot(x, axis), vec3(0, -1, 0)); };
+        const vec3 d0 = flat(e), d1 = flat(e + v * (lead / vl));
+        const vec3 from = length2(dir) > 0 && dot(dir, d0) < 0.99999f ? dir : d0;
+        if (r0 <= 0) r0 = r;
+        // (through the blade's edge where it is now, swayed off its swing's plane a few millimetres: the kerf its cut
+        // leaves about the plane - 2 mm either side - on its middle, not one side's under its face)
+        const vec3 o = pivot + axis * dot((ab.nodes[edge].p + ab.nodes[edge2].p) * 0.5f - pivot, axis);
+        const int n = g.world.laser_cut(o, from, d1, reach * r / r0 + 0.02f, &ab, 0.5f * thick); // (to its edge, as far
+        // as it stretches: what lies under it it does not reach)
+        if (getenv("BL_AXEDBG"))
+            printf("axe: edge (%.2f %.2f %.2f) v %.1f from (%.3f %.3f %.3f) to (%.3f %.3f %.3f), %d cut\n", ab.nodes[edge].p.x, ab.nodes[edge].p.y, ab.nodes[edge].p.z, vl,
+                   from.x, from.y, from.z, d1.x, d1.y, d1.z, n);
+        dir = d1;
+        cuts += n;
+        if (n > 0) work(g, n, vl);
+        return n;
+    }
+    // The blow: what the blade meets - the nodes round its edge in what it cuts - is struck on to a third of the edge's
+    // speed along its way (an inelastic blow on the material it has to cut through: none faster after it, a light sheet's
+    // nodes struck again each frame flew off), the momentum that takes off its turn, and each link cut takes kCutWork
+    // of its energy besides (the material's tearing). (Cut for nothing, it went through a car as a laser at the free
+    // swing's speed, the car unmoved.)
+    static constexpr float kCutWork = 100.0f;  // J a link
+    static constexpr float kCarry = 0.33f;     // (of the edge's speed: what it strikes on)
+    static constexpr float kPushReach = 0.35f; // m round its edge: the nodes the blow takes
+    void work(Game& g, int n, float vl) {
+        SoftBody& ab = *obj->body;
+        const vec3 ee = ab.nodes[edge].p - pivot, er = ee - axis * dot(ee, axis), ve = ab.nodes[edge].v;
+        const float arm = length(er), ves = length(ve);
+        if (arm < 0.1f || ves < 0.05f) return;
+        const vec3 way = ve / ves;
+        // (its moment of inertia about the pivot's axis, its turn's rate)
+        double I = 0, Lw = 0, ke = 0;
+        for (const Node& x : ab.nodes)
+            if (x.inv_mass > 0) {
+                const vec3 r = x.p - pivot, rp = r - axis * dot(r, axis);
+                I += x.mass * length2(rp), Lw += x.mass * dot(cross(r, x.v), axis), ke += 0.5 * x.mass * length2(x.v);
+            }
+        if (!(I > 0) || !(ke > 1.0)) return;
+        // (the nodes round its edge - the leading face's line from its corner up the blade - in what it cut, struck on)
+        const vec3 u = er / arm, c0 = pivot + u * (reach - blade_h), c1 = pivot + u * reach;
+        double J = 0;
+        for (const auto& bp : g.world.bodies()) {
+            SoftBody& b = *bp;
+            if (&b == &ab) continue;
+            AABB box = b.aabb;
+            box.expand(kPushReach);
+            if (!box.contains(ab.nodes[edge].p)) continue;
+            bool struck = false;
+            for (Node& x : b.nodes) {
+                if (x.inv_mass <= 0) continue;
+                const float t = std::clamp(dot(x.p - c0, c1 - c0) / std::max(1e-6f, length2(c1 - c0)), 0.0f, 1.0f);
+                if (length2(x.p - (c0 + (c1 - c0) * t)) >= kPushReach * kPushReach) continue;
+                const float dv = kCarry * vl - dot(x.v, way);
+                if (dv > 0) x.v += way * dv, J += (double)x.mass * dv, struck = true;
+            }
+            if (struck) b.wake();
+        }
+        // (its turn slowed by the blow's angular impulse and by the cut's work, no more than a third a frame)
+        const double w0 = Lw / I, w1 = w0 - J * arm / I * (w0 >= 0 ? 1.0 : -1.0);
+        double f = std::fabs(w0) > 1e-6 ? std::max(0.0, w1 / w0) : 1.0;
+        f *= std::sqrt(std::max(0.0, 1.0 - std::min((double)n * kCutWork, 0.3 * ke) / std::max(1e-9, ke * f * f)));
+        f = std::max(f, 0.67);
+        for (Node& x : ab.nodes)
+            if (x.inv_mass > 0) x.v *= (float)f;
+        pushed += (float)J;
+    }
+    float pushed = 0; // (the momentum it gave what it cut, N s)
+    std::string status() const {
+        float v = 0, low = 1e9f;
+        if (obj && obj->body) {
+            v = length(obj->body->nodes[edge].v);
+            for (const Node& x : obj->body->nodes) low = std::min(low, x.p.y);
+        }
+        return format("axe at %.0f deg (most %.0f%s), edge %.1f m/s, %d cut, %.0f N s given, lowest %.3f", angle, most, caught ? ", caught" : "", v, cuts, pushed, low);
+    }
+};
+
 // what the stress tests put into the scene besides the player's car (a second car, the slab, the axe): cleared by
 // the next test
 struct FrameCarExtras {
     Vehicle* other = nullptr;
     DynamicObject* slab = nullptr;
-    DynamicObject* axe = nullptr;
-    uint32_t axe_edge = 0;
-    vec3 axe_pivot{0};
-    vec3 axe_dir{0};  // (the edge's direction from the pivot last frame: the sector it swept is cut)
-    float axe_reach = 0; // (the pivot to the edge's lower end)
+    AxeSwing axe;
     // two cars: how far one car's frame got into the other - its frame nodes inside the other's collision hull (the
     // generalized winding number of the hull's triangles about the node), the deepest from the hull's surface
     vec3 axis{0};
@@ -1886,7 +2005,7 @@ bool frame_car_measure(Game& g, vec3 pos, float& top, vec3& com) {
 void frame_car_clear(Game& g) {
     if (s_fc.other) g.remove_vehicle(s_fc.other);
     if (s_fc.slab) g.remove_object(s_fc.slab);
-    if (s_fc.axe) g.remove_object(s_fc.axe);
+    if (s_fc.axe.obj) g.remove_object(s_fc.axe.obj);
     s_fc = FrameCarExtras();
 }
 
@@ -1980,24 +2099,11 @@ static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt)
                 gg.scene_status = format("frame nodes inside the other car: %d, %.0f cm deep (most %d, %.0f cm); centres %.2f m apart", s_fc.inside, s_fc.depth * 100.0f,
                                          s_fc.inside_max, s_fc.depth_max * 100.0f, length(car->body->center_of_mass() - s_fc.other->body->center_of_mass()));
             }
-        if (!s_fc.axe || !s_fc.axe->body) return;
-        const SoftBody& ab = *s_fc.axe->body;
-        const vec3 e = ab.nodes[s_fc.axe_edge].p - s_fc.axe_pivot, v = ab.nodes[s_fc.axe_edge].v;
-        const float r = length(e);
-        if (r < 1e-3f || length(v) < 2.0f) return;
-        // (half a metre ahead at least: the blade's edge is a flat face 12 cm wide, it pushed the car along with it
-        // from the door's skin before the cut reached the frame's tubes inside)
-        const float vl = length(v), lead = std::max(vl * 1.5f * std::max(dt, 1.0f / 60.0f), 0.5f);
-        const vec3 d0 = e / r, d1 = normalize(e + v * (lead / vl));
-        const vec3 from = length2(s_fc.axe_dir) > 0 && dot(s_fc.axe_dir, d0) < 0.99999f ? s_fc.axe_dir : d0;
-        const int n = gg.world.laser_cut(s_fc.axe_pivot, from, d1, s_fc.axe_reach + 0.02f, &ab);
-        if (getenv("BL_AXEDBG")) {
-            const Vehicle* car = gg.player_vehicle();
-            printf("axe: edge (%.2f %.2f %.2f) v %.1f from (%.3f %.3f %.3f) to (%.3f %.3f %.3f), %d cut; car box (%.2f %.2f %.2f)-(%.2f %.2f %.2f)\n", ab.nodes[s_fc.axe_edge].p.x,
-                   ab.nodes[s_fc.axe_edge].p.y, ab.nodes[s_fc.axe_edge].p.z, length(v), from.x, from.y, from.z, d1.x, d1.y, d1.z, n, car ? car->body->aabb.mn.x : 0,
-                   car ? car->body->aabb.mn.y : 0, car ? car->body->aabb.mn.z : 0, car ? car->body->aabb.mx.x : 0, car ? car->body->aabb.mx.y : 0, car ? car->body->aabb.mx.z : 0);
-        }
-        s_fc.axe_dir = d1;
+        if (!s_fc.axe.obj) return;
+        // (the brake lines cut: held by their brakes the halves leaned on each other at the cut, level)
+        if (s_fc.axe.step(gg, dt) > 0)
+            if (Vehicle* car = gg.player_vehicle()) car->cut_brakes();
+        gg.scene_status = s_fc.axe.status();
     };
     g.scene_actions.push_back({"Drop from 5 m", [](Game& gg) { frame_car_clear(gg), frame_car_stunt(gg, vec3(0, 0, 20), 0, 5.0f, quat(), vec3(0), vec3(0)); }});
     g.scene_actions.push_back({"Drop from 10 m", [](Game& gg) { frame_car_clear(gg), frame_car_stunt(gg, vec3(0, 0, 20), 0, 10.0f, quat(), vec3(0), vec3(0)); }});
@@ -2035,11 +2141,9 @@ static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt)
                                    frame_car_clear(gg);
                                    frame_car_stunt(gg, vec3(-25, 0, 120), 0, 0.0f, quat(), vec3(0), vec3(0));
                                    AxeDesc d;
-                                   d.pivot = vec3(-25, 8.35f, 120);
-                                   s_fc.axe_pivot = d.pivot;
-                                   s_fc.axe_reach = std::sqrt(0.25f * d.blade_w * d.blade_w + d.length * d.length);
-                                   s_fc.axe = gg.add_object(build_axe(gg.world, d, "axe", &s_fc.axe_edge));
-                                   if (s_fc.axe) s_fc.axe->body->volume_pass = true; // (a cutter: through the cars' volumes)
+                                   d.pivot = vec3(-25, 8.33f, 120); // (its edge's corners 8 cm over the ground, 5 cm swinging:
+                                   // lower, it pressed the shards lying under it through the ground)
+                                   s_fc.axe.make(gg, d, "axe");
                                }});
     g.scene_actions.push_back({"Drop on the roof from 1.5 m", [](Game& gg) {
                                    // (turned over about its centre of mass its top goes to 2 com - top: lifted to 1.5 m)
@@ -2177,21 +2281,34 @@ MaterialPtr fem_plate_visual(vec3 color) {
     return vis;
 }
 
+AxeSwing s_fs_axe; // (the giant axe through the sheet)
+
 void fem_shells_clear(Game& g) {
     std::vector<DynamicObject*> gone;
     for (auto& o : g.objects)
         if (o->name.rfind("fem ", 0) == 0 || o->name.rfind("weight", 0) == 0) gone.push_back(o.get());
     for (DynamicObject* o : gone) g.remove_object(o);
+    s_fs_axe = AxeSwing();
 }
 
-void add_fem_sheet(Game& g, float y, vec3 v = vec3(0)) {
+SoftBody* fem_object(Game& g, const char* name) {
+    for (auto& o : g.objects)
+        if (o->name == name && o->body) return o->body;
+    return nullptr;
+}
+
+void add_fem_sheet(Game& g, float y, vec3 v = vec3(0), vec3 at = vec3(0), const char* name = "fem sheet") {
     FemPlateDesc d;
-    d.origin = vec3(-1, y, -1), d.du = vec3(2.0f / 16, 0, 0), d.dv = vec3(0, 0, 2.0f / 16), d.nu = d.nv = 16;
+    d.origin = at + vec3(-1, y, -1), d.du = vec3(2.0f / 16, 0, 0), d.dv = vec3(0, 0, 2.0f / 16), d.nu = d.nv = 16;
     d.thickness = 0.003f;
     d.visual = fem_plate_visual(vec3(0.62f, 0.64f, 0.67f));
     d.velocity = v;
-    g.add_object(build_fem_plate(g.world, d, "fem sheet"));
+    g.add_object(build_fem_plate(g.world, d, name));
 }
+
+// the axe's bench: the same sheet on two blocks with a slot 30 cm wide between them along z, the axe's way (across
+// the sheet's supports its halves fell into the gap under the blade and it carried them off)
+const vec3 kAxeBench(0, 0, 7.0f);
 
 const vec3 kCantRoot(6.0f, 1.2f, -0.25f);
 // the cantilever, with a box of `load` kg welded under its tip: a steel box 0.125 x 0.5 x 0.25 m (5 mm) on the last
@@ -2254,15 +2371,31 @@ void scene_fem_shells(Game& g) {
     g.finish_terrain();
     // the sheet's two supports, the cantilever's block, a wall to throw the cube at
     for (float x : {-0.85f, 0.85f}) g.add_static_box(vec3(x, 0.4f, 0), vec3(0.12f, 0.4f, 1.3f), quat(), SURF_CONCRETE, A.concrete);
+    for (float x : {-0.6f, 0.6f}) g.add_static_box(kAxeBench + vec3(x, 0.4f, 0), vec3(0.45f, 0.4f, 1.3f), quat(), SURF_CONCRETE, A.concrete);
     g.add_static_box(vec3(kCantRoot.x - 0.5f, 0.9f, 0), vec3(0.5f, 0.9f, 0.6f), quat(), SURF_CONCRETE, A.concrete);
     g.add_static_box(vec3(-12.0f, 1.0f, 0), vec3(0.3f, 1.0f, 3.0f), quat(), SURF_CONCRETE, A.concrete);
     g.labels.push_back({vec3(0, 1.9f, 0), "SHEET 2 x 2 m, 3 mm"});
+    g.labels.push_back({kAxeBench + vec3(0, 1.9f, 0), "AXE BENCH"});
     g.labels.push_back({vec3(6.7f, 2.2f, 0), "CANTILEVER 1.5 m, 8 mm"});
     g.labels.push_back({vec3(-6, 1.9f, 0), "CUBE 1 m, 2 mm"});
     g.no_player_vehicle = true;
     g.set_spawn(vec3(0, 0, -9), 0);
+    s_fs_axe = AxeSwing();
     auto all = [](Game& gg) { add_fem_sheet(gg, 0.82f), add_fem_cantilever(gg), add_fem_cube(gg, kCubeAt); };
     all(g);
+    // the axe's cut, each frame; the sheet's parts (the two largest' shares of its mass) and its fastest node
+    g.scene_update = [](Game& gg, float dt) {
+        if (!s_fs_axe.obj) return;
+        s_fs_axe.step(gg, dt);
+        gg.scene_status = s_fs_axe.status();
+        if (const SoftBody* sh = fem_object(gg, "fem bench sheet")) {
+            float p0, p1, fast = 0;
+            sh->largest_parts(p0, p1);
+            for (const Node& n : sh->nodes) fast = std::max(fast, length(n.v));
+            gg.scene_status += format(" | sheet: parts %.0f%% %.0f%%, %zu triangles, %d torn, %d bisections, fastest %.1f m/s", 100.0f * p0, 100.0f * p1,
+                                      sh->fem.tris.size(), sh->fem.tris_torn, sh->fem.tris_refined, fast);
+        }
+    };
     auto test = [&](const char* label, std::function<void(Game&)> f) {
         g.scene_actions.push_back({label, [all, f](Game& gg) {
                                        fem_shells_clear(gg);
@@ -2282,6 +2415,15 @@ void scene_fem_shells(Game& g) {
         gg.shoot(vec3(0.0f, 0.82f + 0.25f + 2.0f, 0.0f), vec3(0, -1, 0));
     });
     test("Drop a 500 kg block on the sheet from 1 m", [](Game& gg) { add_weight(gg, vec3(0, 0.82f + 1.2f, 0), vec3(0.5f, 0.4f, 0.5f), 500.0f); });
+    // (the cars' axe: 5 t, 8.2 m from its pivot, swinging along z through the bench's slot, through the triangles a
+    // little off their grid's middle line: they bisect along the cut)
+    test("The giant axe (it swings down and cuts a sheet on the bench in two)", [](Game& gg) {
+        add_fem_sheet(gg, 0.82f, vec3(0), kAxeBench, "fem bench sheet");
+        AxeDesc d;
+        d.pivot = kAxeBench + vec3(0.04f, 8.33f, 0);
+        d.yaw = 0.5f * kPi;
+        s_fs_axe.make(gg, d, "fem axe");
+    });
     test("Weld 100 kg under the cantilever's tip", [](Game& gg) { remove_named(gg, "fem cantilever"), add_fem_cantilever(gg, 100.0f); });
     test("Weld 250 kg under the cantilever's tip", [](Game& gg) { remove_named(gg, "fem cantilever"), add_fem_cantilever(gg, 250.0f); });
     test("Drop 1 t on the cantilever's tip from 0.5 m", [](Game& gg) { add_weight(gg, vec3(7.25f, 1.2f + 0.8f, 0), vec3(0.4f, 0.5f, 0.45f), 1000.0f); });
@@ -2845,8 +2987,8 @@ const std::vector<SceneInfo>& scene_registry() {
          [](Game& g) { scene_frame_car_test(g, "Drop from 10", vec3(8, 4.5f, 12), vec3(0, 1.8f, 20), "The Frame Car dropped on its wheels from 10 m."); }},
         {"fc_slab", "Frame Car: Slab", "Test cars/Frame Car", "A 5 t concrete slab dropped on it from 2.5 m",
          [](Game& g) { scene_frame_car_test(g, "Drop a 5 t concrete slab", vec3(6, 3.6f, 14.5f), vec3(0, 1.2f, 20), "A 5 t concrete slab falls on the roof from 2.5 m."); }},
-        {"fc_axe", "Frame Car: Giant axe", "Test cars/Frame Car", "A 2 t pendulum axe swings down and cuts it in two",
-         [](Game& g) { scene_frame_car_test(g, "The giant axe", vec3(-15.5f, 5.0f, 110.5f), vec3(-25, 3.0f, 120), "A 2 t axe on a pendulum swings down and cuts the car in two."); }},
+        {"fc_axe", "Frame Car: Giant axe", "Test cars/Frame Car", "A 5 t pendulum axe swings down and cuts it in two",
+         [](Game& g) { scene_frame_car_test(g, "The giant axe", vec3(-15.5f, 5.0f, 110.5f), vec3(-25, 3.0f, 120), "A 5 t axe on a pendulum swings down and cuts the car in two."); }},
         {"fc_roll", "Frame Car: Barrel roll", "Test cars/Frame Car", "Thrown up and spun at 50 km/h: it rolls over",
          [](Game& g) { scene_frame_car_test(g, "Barrel roll", vec3(9, 4, 18), vec3(0, 1, 32), "Thrown up and spun at 50 km/h: the Frame Car rolls over."); }},
         {"buggy", "Buggy", "Test cars/Buggy", "A desert racer on a welded tube cage (FEM) with aluminium panels: whoops, a jump, drops, rolls, crashes",
@@ -2889,8 +3031,8 @@ const std::vector<SceneInfo>& scene_registry() {
          [](Game& g) { scene_frame_car_test(g, "Lay it on its side", vec3(0, 2.2f, 13), vec3(0, 0.8f, 20), "The Shell Car laid on its side from 0.3 m.", scene_shell_car); }},
         {"sc_slab", "Shell Car: Slab", "Test cars/Shell Car", "A 5 t concrete slab dropped on it from 2.5 m",
          [](Game& g) { scene_frame_car_test(g, "Drop a 5 t concrete slab", vec3(6.5f, 3.8f, 14), vec3(0, 1.2f, 20), "A 5 t concrete slab falls on the roof from 2.5 m.", scene_shell_car); }},
-        {"sc_axe", "Shell Car: Giant axe", "Test cars/Shell Car", "A 2 t pendulum axe swings down and cuts it in two",
-         [](Game& g) { scene_frame_car_test(g, "The giant axe", vec3(-15.5f, 5.0f, 110.0f), vec3(-25, 3.0f, 120), "A 2 t axe on a pendulum swings down and cuts the car in two.", scene_shell_car); }},
+        {"sc_axe", "Shell Car: Giant axe", "Test cars/Shell Car", "A 5 t pendulum axe swings down and cuts it in two",
+         [](Game& g) { scene_frame_car_test(g, "The giant axe", vec3(-15.5f, 5.0f, 110.0f), vec3(-25, 3.0f, 120), "A 5 t axe on a pendulum swings down and cuts the car in two.", scene_shell_car); }},
         {"sc_roll", "Shell Car: Barrel roll", "Test cars/Shell Car", "Thrown up and spun at 50 km/h: it rolls over",
          [](Game& g) { scene_frame_car_test(g, "Barrel roll", vec3(9.5f, 4, 18), vec3(0, 1, 32), "Thrown up and spun at 50 km/h: the Shell Car rolls over.", scene_shell_car); }},
         {"sc_curb", "Shell Car: Curb", "Test cars/Shell Car", "Sideways into a curb at 40 km/h",

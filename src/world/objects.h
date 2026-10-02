@@ -249,12 +249,20 @@ struct AxeDesc {
     vec3 pivot;
     float length = 8.2f;                                // pivot to the blade's edge
     float blade_w = 1.8f, blade_h = 1.5f, thick = 0.12f; // the blade: across the swing, along the handle, thickness (z)
+    float edge = 0.002f;                                // (its edge: `thick` behind the bevel, this at the edge - inside the
+                                                        // kerf World::laser_cut leaves its cut's nodes)
+    float bevel = 0.45f;                                // (the edge's bevel, along the swing: an axe's, 7.5 degrees a side - a
+                                                        // wedge over the whole 1.8 m, 2 degrees, slid through a car as a laser)
+    float friction = 0.15f;                             // (against other bodies: SoftBody::contact_friction, of theirs 0.8)
     float handle = 0.24f;                               // the handle's section
-    float mass = 2000.0f;
+    float mass = 5000.0f; // (2 t lost its swing in a car's cut, pinched between the halves, and stuck in it)
     float angle = 1.3f;
+    float yaw = 0;                                      // (turned about the vertical through the pivot: 0 swings it in
+                                                        // the x-y plane, about z, towards +x)
     MaterialPtr mat;
 };
-std::unique_ptr<DynamicObject> build_axe(phys::World& w, const AxeDesc& d, const std::string& name, uint32_t* edge_node = nullptr);
+std::unique_ptr<DynamicObject> build_axe(phys::World& w, const AxeDesc& d, const std::string& name, uint32_t* edge_node = nullptr,
+                                          uint32_t* edge_node2 = nullptr);
 
 struct SoftSphereDesc {
     vec3 center;
