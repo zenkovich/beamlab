@@ -58,7 +58,8 @@ struct FrameVisual {
     GpuMesh mesh, plate_mesh;
     std::vector<Vertex> verts, plate_verts;
     std::vector<uint32_t> idx, plate_idx;
-    size_t built = ~size_t(0), plate_built = ~size_t(0);
+    size_t built = ~size_t(0);
+    uint64_t plate_built = ~uint64_t(0); // (the plates' layout the index lists were built for: FrameVisual::update)
     bool rebuilt = false, plate_rebuilt = false;
     std::vector<vec3> node_normal;   // (scratch: the plates' smooth normals per frame node)
     mutable std::unordered_map<const Material*, std::unique_ptr<Material>> ghosts; // see-through copies of the materials

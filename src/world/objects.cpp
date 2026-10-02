@@ -654,10 +654,14 @@ void FrameVisual::update(const phys::SoftBody& b) {
     // after the frame's triangles its loose ones (FemFrame::loose_tris: fragments torn off, on body nodes, flat)
     const size_t nt = f.tris.size(), nl = f.loose_tris.size();
     if (nt == 0 && nl == 0) return;
-    size_t live = nl;
-    for (const phys::FrameTri& t : f.tris) live += !t.broken;
-    if (plate_built != (nt + nl) * 1000003 + live) {
-        plate_built = (nt + nl) * 1000003 + live;
+    // (the index lists follow the layout: each slot's section, or gone - a count of them alone missed a fragment let
+    // loose, its triangles moved from tris to loose_tris and the rest renumbered: slots drawn in another section's
+    // material, a bumper's in the body's colour)
+    uint64_t layout = 1469598103934665603ull ^ (nt * 1000003 + nl);
+    for (const phys::FrameTri& t : f.tris) layout = (layout ^ (t.broken ? 0xffffu : t.section)) * 1099511628211ull;
+    for (const phys::FemFrame::LooseTri& t : f.loose_tris) layout = (layout ^ t.section) * 1099511628211ull;
+    if (plate_built != layout) {
+        plate_built = layout;
         plate_verts.assign((nt + nl) * 6, Vertex{});
         plate_idx.clear();
         plate_ranges.assign(f.shell_sections.size(), {0, 0});
