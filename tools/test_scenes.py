@@ -16,8 +16,9 @@ them without sticking, nothing tears; tipped over or dropped they come to rest w
 the pile of 15 with three thrown in within a 30 FPS frame; the editor's drum from a circle lands and rests;
 buggy: the Frame Car's tests on the desert racer, through the whoops and over the jump, the offroad hills;
 FEM shells: the sheet, the cantilever and the hollow cube of triangle elements under their loads yield where they should
-and come to rest; shell car: stands, steers, accelerates, drives round and over the rough field, laid on its side keeps its
-parts and its rear toe, through the crash tests stable, the axe cuts it;
+and come to rest, nothing flies apart or through the ground; the giant axe cuts a sheet on the bench in two and goes
+through; shell car: stands, steers, accelerates, drives round and over the rough field, laid on its side keeps its
+parts and its rear toe, through the crash tests stable, the axe cuts it in two and goes through (the Frame Car's too);
 rally: the autopilot finishes in the usual time; all scenes: no numerical instability.
 """
 import os, re, subprocess, sys, csv, tempfile
@@ -378,18 +379,46 @@ fem_cases = [
      abs(o["fem cube"]["c"][2]) < 0.15 and o["fem cube"]["c"][1] > 0.45),
     ("cube at the wall", "it crumples at the front", lambda o: o["fem cube"]["dented"] > 20 and o["fem cube"]["fast"] < 0.1),
 ]
+def fem_peaks(out):
+    """Every frame's BL_FEMDBG line: {object: (its fastest node over the run, its lowest)} - an explosion's trace"""
+    peaks = {}
+    for m in re.finditer(r"^fem f\d+ (.+?)\s+tris.*? fastest ([\d.]+) centre \([-\d. ]+\) lowest ([-\d.]+)", out, re.M):
+        k, f, l = m.group(1).strip(), float(m.group(2)), float(m.group(3))
+        pf, pl = peaks.get(k, (0.0, 1e9))
+        peaks[k] = (max(pf, f), min(pl, l))
+    return peaks
+# (and through every frame none of them faster than what hits it - the ball's 14 m/s, the cube's 14 - by much, none
+# through the ground: under the 40 kg ball from 10 m and the 500 kg block the sheet flew apart at 80 m/s, hundreds of
+# nodes reset, some 200 m under the pad)
 for action, what, ok in fem_cases:
     out = run(["--scene", "fem_shells", "--size", "640x360", "--frames", "600", "--hidden", "--novsync", "--action", action,
-               "--screenshot", os.path.join(TMP, "fs.png")], {"BL_FEMDBG": "599"})
+               "--screenshot", os.path.join(TMP, "fs.png")], {"BL_FEMDBG": "1"})
     o = {k: v for k, v in fem_objs(out).items()}
-    good = len(o) == 3 and all(x["torn"] == 0 and x["failed"] == 0 for x in o.values()) and unstable(out) == 0
+    pk = fem_peaks(out)
+    good = len(o) == 3 and all(x["torn"] == 0 and x["failed"] == 0 for x in o.values()) and unstable(out) == 0 and \
+        all(f < 25 and l > -0.05 for f, l in pk.values())
     try:
         good = good and ok(o)
     except KeyError:
         good = False
     check("fem shells: %s: %s" % (action.lower(), what), good,
-          "; ".join("%s %d dented, %d torn, fastest %.2f m/s, lowest %.2f m" % (k[4:], x["dented"], x["torn"], x["fast"], x["low"]) for k, x in o.items()) +
-          ", %d warnings" % unstable(out))
+          "; ".join("%s %d dented, %d torn, fastest %.2f m/s (most %.1f), lowest %.2f m" % (k[4:], x["dented"], x["torn"], x["fast"], pk.get(k, (0, 0))[0], x["low"])
+                    for k, x in o.items()) + ", %d warnings" % unstable(out))
+# the giant axe (5 t, a wedge 12 cm at its back) through a sheet on the bench's two blocks: it cuts it in two - the
+# triangles bisected along the cut - and goes through to the top of its swing, held there; the halves pushed apart on the
+# blocks, nothing faster than the blade, none through the ground
+def axe_status(out):
+    m = re.findall(r"axe at ([-\d]+) deg \(most ([-\d]+)(, caught)?\)", out)
+    return (int(m[-1][1]), bool(m[-1][2])) if m else (-180, False)
+out = run(["--scene", "fem_shells", "--size", "640x360", "--frames", "480", "--hidden", "--novsync", "--action", "The giant axe",
+           "--screenshot", os.path.join(TMP, "fs_axe.png")], {"BL_FEMDBG": "1", "BL_STATUS_EVERY": "60"})
+sp = re.findall(r"sheet: parts (\d+)% (\d+)%, (\d+) triangles, (\d+) torn, (\d+) bisections", out)
+pk, (most, caught), o = fem_peaks(out).get("fem bench sheet", (1e9, -1e9)), axe_status(out), fem_objs(out).get("fem bench sheet")
+check("fem shells: the giant axe cuts the sheet in two, through", bool(sp) and min(int(sp[-1][0]), int(sp[-1][1])) >= 40 and int(sp[-1][4]) >= 50 and
+      most >= 70 and caught and pk[0] < 15 and pk[1] > -0.05 and o is not None and o["fast"] < 0.2 and o["failed"] == 0 and unstable(out) == 0,
+      "parts %s%% %s%%, %s bisections; the axe to %d deg%s; the sheet's fastest %.1f m/s, lowest %.3f m, %.2f m/s at the end, %d warnings" %
+      (sp[-1][0] if sp else "?", sp[-1][1] if sp else "?", sp[-1][4] if sp else "?", most, " (held)" if caught else "", pk[0], pk[1], o["fast"] if o else -1,
+       unstable(out)))
 
 # ---- shell car (a saloon on the BMW E36's lines, all FEM: a body-in-white of members and triangles, its parts FEM
 # triangles on mounts): it stands, steers the right way, accelerates, drives round and over the rough field with nothing
@@ -447,8 +476,10 @@ check("shell car: laid on its side, nothing comes off, the rear wheels keep thei
 # the crash tests: stable, no solve failing, the suspension neither bent nor torn (it is stiff: maraging steel); the
 # collision volumes take their part: the engines meet head-on, the slab rests on the cabin's
 def volume_hits(out):
-    m = re.findall(r"volumes: engine (\d+) \([\d.]+ kN\)(?: off)? cabin (\d+) \([\d.]+ kN\)(?: off)? trunk (\d+)", out)
-    return tuple(int(x) for x in m[-1]) if m else (0, 0, 0)
+    """The last status line's volumes: (the engine's contacts, the seats' - the cabin's -, the trunk's halves')"""
+    m = re.findall(r"\| volumes:([^|\n]*)", out)
+    v = {k: int(n) for k, n in re.findall(r"(\w+) (\d+) \([\d.]+ kN\)", m[-1])} if m else {}
+    return v.get("engine", 0), sum(n for k, n in v.items() if k.startswith("seat")), sum(n for k, n in v.items() if k.startswith("trunk"))
 for action, frames in (("Head-on into another", 300), ("into its side", 300), ("Drop from 5", 300), ("Launch at the wall", 400), ("Launch at the pole", 400),
                        ("slab", 400), ("Barrel roll", 400), ("Drop on the roof", 300), ("Trip over the curb", 400)):
     out = run(["--scene", "shell_car", "--size", "640x360", "--frames", str(frames), "--hidden", "--novsync", "--drive", "0,0", "--action", action,
@@ -457,17 +488,31 @@ for action, frames in (("Head-on into another", 300), ("into its side", 300), ("
     vh = volume_hits(out)
     check("shell car: %s, stable, the suspension holds" % action.lower(), bool(sl) and sl[0] == 0 and sl[2] < 200 and unstable(out) == 0 and sok and
           (action[:4] != "Head" or (sl[4] > 0 and vh[0] > 0)) and (action != "slab" or vh[1] > 0),
-          shell_text(sl) + ", %s, volumes %d/%d/%d contacts, %d warnings" % (stext, vh[0], vh[1], vh[2], unstable(out)))
+          shell_text(sl) + ", %s, volumes: engine %d, seats %d, trunk %d contacts, %d warnings" % (stext, vh[0], vh[1], vh[2], unstable(out)))
 # steel balls (one node and a capsule each: phys CollisionVolume's partners, no beams) shot at it: they dent it, rest on
 # the ground at their radius, nothing unstable
 out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--drive", "0,0", "--camera", "orbit:120,12,7",
            "--shoot", "0,40,0.5", "--screenshot", os.path.join(TMP, "sc9.png")])
 sl = shell_line(out)
 check("shell car: steel balls shot at it dent it, stable", bool(sl) and sl[0] == 0 and sl[3] > 0 and unstable(out) == 0, shell_text(sl))
-out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "400", "--hidden", "--novsync", "--drive", "0,0", "--action", "The giant axe",
-           "--screenshot", os.path.join(TMP, "sc6.png")])
-sl = shell_line(out)
-check("shell car: the axe cuts it in two", bool(sl) and sl[0] == 0 and sl[2] > 20 and unstable(out) == 0, shell_text(sl))
+# the giant axe (5 t on its pendulum, a wedge 12 cm at its back, colliding with what it cuts): the car in two halves, the
+# axe through it to the top of its swing (it stuck in the car, pinched between the halves), no node faster than the
+# blade by much, none through the ground (the cinecam's node, cut loose, fell for good)
+def parts_of(out):
+    m = re.findall(r"\| parts (\d+)% (\d+)%", out)
+    return (int(m[-1][0]), int(m[-1][1])) if m else (0, 0)
+out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "420", "--hidden", "--novsync", "--drive", "0,0", "--action", "The giant axe",
+           "--screenshot", os.path.join(TMP, "sc6.png")], {"BL_FEMDBG": "1", "BL_STATUS_EVERY": "60"})
+sl, pt, (most, caught), pk = shell_line(out), parts_of(out), axe_status(out), fem_peaks(out).get("Shell Car", (1e9, -1e9))
+check("shell car: the axe cuts it in two and goes through", bool(sl) and sl[0] == 0 and min(pt) >= 40 and most >= 70 and caught and pk[0] < 20 and pk[1] > -0.05
+      and unstable(out) == 0, shell_text(sl) + "; parts %d%% %d%%, the axe to %d deg%s, fastest %.1f m/s, lowest %.3f m" % (pt + (most, " (held)" if caught else "") + pk))
+out = run(["--scene", "frame_car", "--size", "640x360", "--frames", "420", "--hidden", "--novsync", "--drive", "0,0", "--action", "The giant axe",
+           "--screenshot", os.path.join(TMP, "fc_axe2.png")], {"BL_STATUS_EVERY": "60"})
+pt, (most, caught) = parts_of(out), axe_status(out)
+# (its frame and its panels are cut and it sags in two; its doors' check straps, swung across the cut after the blade,
+# keep its parts' count joined: not asserted)
+check("frame car: the axe goes through, stable", most >= 70 and caught and unstable(out) == 0,
+      "parts %d%% %d%%, the axe to %d deg%s, %d warnings" % (pt + (most, " (held)" if caught else "", unstable(out))))
 
 # ---- steel barrels (a closed sheet: its volume in the BL_SHELLDBG block, 100% = 0.2232 m3): dropped on its bottom, side and
 # rim, rolled down the ramp, thrown at another and stacked it dents but keeps its shape (a few percent); the 40 kg ball
