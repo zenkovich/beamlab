@@ -569,7 +569,10 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     body's on it), leaves the frame: the body's springs along its edges and across the shared ones (a fifth of the
     explicit limit of its lightest node, a tenth of critical damping, not deforming) hold its shape, its nodes stay the
     body's - its contacts, its collision group and the collision volumes as before - and its triangles are still drawn
-    (`FemFrame::loose_tris`, `loose` on the status line). Each had been a component of its own, a few nodes of 15-50 g
+    (`FemFrame::loose_tris`, `loose` on the status line; the plates' index lists, grouped by section, are built again
+    whenever a slot's section changes - built again only when the count of live triangles changed, they missed a
+    fragment let loose, the triangles after it renumbered: up to 420 of the Shell Car's 990 drawn in another section's
+    colour, the black bumper with red polygons). Each had been a component of its own, a few nodes of 15-50 g
     at a steel plate's stiffness: a crashed Shell Car carries 20-25 of them (physics 12.7 -> 12.0 ms a frame after the
     head-on, the velocity clamps 70-130 -> 25). Made rigid bodies of their own they pushed two crashed cars apart:
     wedged between them, passing through their own car and pushed out of the other on their nodes' masses (the rigid
@@ -679,17 +682,36 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     past the plastic moment sigma_y t^2 / 4 likewise (the corners' rest rotations follow); the damage is the rest
     shape's largest principal plastic stretch against the authored shape (a state, not a path: a panel shaken on its
     yield surface did not tear), past the material's elongation the triangle tears - nothing is removed: a crack opens
-    along its edge most across its plastic stretch's largest principal direction, the edge's end nodes duplicated
-    (`FemFrame::tear_tri`: at each end the triangles on the torn element's side of the crack take the copy, a third of
-    the node's mass at least; a node inside the sheet has the crack go on along its edge straightest on from the torn
-    one; the members, mounts, welds and springs keep the node; the collision triangles follow), each further tear of
-    the same triangle half the elongation later, three and it is a piece. After the tears of a step the frame's pattern
+    along its edge most across its plastic stretch's largest principal direction, the edge parting whole - both its
+    nodes duplicated (`FemFrame::tear_tri`): an end inside the sheet, where the edge cut alone leaves its fan one
+    round it, takes the crack on along its edge straightest on from the torn one, and that edge's far end is the
+    crack's tip, shared by both sides; an edge that cannot part at both ends does not tear (another of the triangle's
+    does). A node is split only by its fan's groups - the triangles joined round it by their edges -, each group the
+    crack splits off a copy of its own (a third of the node's mass at least; the largest keeps the node, its members,
+    mounts, welds and springs; the collision triangles follow; `split_refine`): no triangle is left on the rest by a
+    corner alone (one copy for the torn triangle's side at each end, the old way, left its other groups on the node -
+    torn triangles swung there, a hole beside: 2-8 such nodes in each Shell Car crash, none now; the triangles a crash
+    tears 133 -> 42 under the ball on the FEM sheet). The authored mesh's own corner joints (a panel's corner on
+    another's, 15 on the Shell Car, held by the node's rotation) stay until a crack splits them; the status line counts
+    the nodes left so beyond those (`left on a corner`, `FemFrame::vertex_hinges`, BL_HINGEDBG=1 lists them). A sheet
+    laid over the triangles (the Shell Car's skin: `Vehicle::make_sheet_body` makes their collision triangles shells,
+    `FemFrame::bind_sheet` puts each on its element, `Shell::host`, its halves after a refinement too) parts with them
+    (`SoftBody::sheet_follow`): the shells on the triangles that take a copy take it too, the links between shells on
+    elements no longer joined along their edge are cut, the sheet's own nodes on such an edge (a refinement's
+    midpoints) get a copy for each side, the masses are the node's own and its shells' thirds; such a shell does not
+    crack on its own, nor does the laser cut it apart from its element. Before, the sheet stayed on the old node,
+    drawn out across the crack and holding the torn piece, and cracked on its own over whole plates (white crack
+    edges on an intact fender, 26-36 cracks of its own in the Shell Car's head-on and the axe, now none); and the
+    elements' collision triangles pointed at others' since the sheet had rebuilt the list. Each
+    further tear of the same triangle half the elongation later, three and it is a piece. After the tears of a step the frame's pattern
     is analysed again (its ordering on bit rows, the factor's update list walking each target column's rows, the
     stages' cut with a bound for the deferred groups' estimate: ~0.3 ms a body), the bodies' events beside each other
     (both cars' in a crash's substeps were one after the other). The laser and the axe part the shell along
     its edges nearest the cut (`FemFrame::part_tris`: the triangles round the cut sorted by the side their middles are
-    on, every corner with triangles on both sides duplicated), the destroy tool tears radially. Splits, compaction and
-    debris handle the triangles like members (a small fragment torn off: loose, see Splits and tears). A triangle's mass
+    on, every corner with triangles on both sides duplicated; then the corners and their neighbours split by the groups
+    the cut split, as the tears), the destroy tool tears radially. Splits, compaction and
+    debris handle the triangles like members (a small fragment torn off: loose, see Splits and tears; the sheet on its
+    triangles goes with it, it no longer holds it on). A triangle's mass
     rho t A goes a third to each corner, its rotary inertia to the nodes. A limit: the contacts with other bodies are
     explicit, a thin shell's node pushed as a free node of a few hundred grams against its members' forces, so a heavy
     body resting on a thin shell keeps it trembling a little (a 1 t slab on the 2 mm cube: its nodes at a few tenths of
@@ -700,7 +722,10 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     (14.9 mm: 13.9 / 15.2) and along to 0.6%, a clamped square plate's middle within 2% of Timoshenko's table, a free
     plate spun about three axes keeps its energy (0.9%), a strip at half its first yield springs back, at 0.9 of its
     collapse load keeps a set, at 1.3 folds, pulled at twice its yield tears (no triangle removed, the nodes along the
-    crack duplicated, the strip in pieces), a plate cut across by the laser parts into two; a 1 m box of 2 mm steel dropped 1 m
+    crack duplicated, the strip in pieces, its small piece loose and in shape), a plate cut across by the laser parts into
+    two, a plate held at its root and torn at a corner keeps every triangle (the corner's off loose) - neither leaves a
+    triangle on a corner alone -, and under a sheet the sheet stays on its elements (no shell's corner off its
+    element's, no link across a tear, no edge drawn out past 2.5 times its length, the mass kept); a 1 m box of 2 mm steel dropped 1 m
     rests, silent in 4 s. The cost: a closed shell's factor grows as about n^1.75 (the Shell Car's 343 nodes: 10.7k
     block updates; `BL_FACTORDBG=1` prints a frame's factor pattern and its stages, `BL_FACTORDUMP=<file>` writes the
     largest component's pattern as JSON, `BL_FEMPROF=1` prints each component's assembly, factor and substitution
@@ -994,7 +1019,10 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     a third of critical; past its strength it lets go (a crash tears panels off along their seams). A laser's (or the axe's) cut breaks the welds whose sheet it crosses.
   - **Sheet and frame in one body.** A sheet's renumbering (`reorder_shells`) and its pieces (`detach_pieces`)
     carry the body's FEM frame along (`FemFrame::renumber`, `FemFrame::split_off`: a piece takes its members with
-    their state); before, a drum with frame rings came apart into 120 pieces off a 1 m drop.
+    their state); before, a drum with frame rings came apart into 120 pieces off a 1 m drop. The renumbering takes
+    the nodes' own masses along (`node_base_mass`: a sheet on a frame's nodes kept the old order's, and its next
+    refinement or crack moved mass between nodes); a sheet over triangle elements makes no pieces, it parts with its
+    elements (see Triangle elements).
   - **Refinement quota** (`WorldSettings::refine_per_frame`, 200): bisections per sheet per frame from the kernel's
     overloads; the rest queue again next substep, so an impact's burst is spread over a few frames. The pattern
     lines are refined without the quota (behind the cracks they would run off the pattern).
