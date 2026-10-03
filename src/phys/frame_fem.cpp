@@ -1842,6 +1842,9 @@ void FemFrame::compute_forces(SoftBody& b) {
 int FemFrame::begin_forces(SoftBody& b) {
     if (!ready_) finalize(b);
     steps_++;
+    static const int etan = getenv("BL_REPASS") ? atoi(getenv("BL_REPASS")) : -1; // (diagnostics: 0 never again, 1 always as before)
+    repass_credit_ = std::min(kRepassBurst, repass_credit_ + kRepassRefill);
+    elastic_step_ = etan == 0 || (etan != 1 && repass_credit_ < 1.0f);
     if (tan_.size() != elems.size()) tan_.assign(elems.size(), Tangent());
     // a node that is not where its double position rounds to was moved by something else (a reset, a repair)
     xd.resize(node.size() * 3);
@@ -2043,6 +2046,7 @@ void FemFrame::eval_forces(SoftBody& b, int chunk) {
         t.yield = (uint8_t)((flow_a > kFlow ? 1 : 0) | (flow_b > kFlow ? 2 : 0) | (flow_ax > 0.1f * kFlow ? 4 : 0) | (flow_t > kFlow ? 8 : 0));
         t.unload = 0;
         if (t.elastic_hold > 0) t.elastic_hold--, t.unload = t.yield;
+        if (elastic_step_) t.unload = t.yield; // (the passes' budget spent: see kRepassBurst)
         t.ma = Ma, t.mb = Mb, t.N = N, t.T = T;
         member_world_k(b, (uint32_t)ei);
     }
@@ -2567,6 +2571,7 @@ void FemFrame::apply_reacts(SoftBody& b, float step) {
 void FemFrame::solve_end(SoftBody& b) {
     apply_reacts(b, sv_.step);
     for (const CompStats& cs : comp_stats_) solve_failures += cs.failures, clamps += cs.clamps, passes_ += cs.passes;
+    for (const CompStats& cs : comp_stats_) repasses += cs.repasses, repass_credit_ -= (float)cs.repasses;
     prof_flush();
     for (vec3& t : torque) t = vec3(0); // (torques from outside, e.g. the tests, add up until the next step)
     for (vec3& c : contact_n) c = vec3(0);
@@ -2658,7 +2663,7 @@ void FemFrame::solve_impl(SoftBody& b, int comp, int stage) {
     };
     const size_t d0 = (size_t)k0 * 36, d1 = (size_t)k1 * 36, o0 = (size_t)col_ptr_[k0] * 36, o1 = (size_t)col_ptr_[k1] * 36, r0 = (size_t)k0 * 6, r1 = (size_t)k1 * 6;
     bool any_yield = false;
-    for (uint32_t ei : celems) any_yield |= tan_[ei].on && tan_[ei].yield;
+    for (uint32_t ei : celems) any_yield |= tan_[ei].on && (tan_[ei].yield & ~tan_[ei].unload); // (one the step may unload)
     const double h2 = (double)theta * h * h, hd = (double)dissipation * h * h;
     // a member into the system (D, O, R: the diagonal and off-diagonal blocks and the right side): the matrix takes
     // (theta h^2 + beta h) K + theta h^2 Kg, the right side -(theta_d h^2 + beta h) K v (theta_d: numerical dissipation;
@@ -2965,6 +2970,7 @@ void FemFrame::solve_impl(SoftBody& b, int comp, int stage) {
         if (u) changed.push_back({(uint32_t)ei, t.unload}), t.unload |= u, t.elastic_hold = 16, again = true;
     }
     tlap(3);
+    if (again && k1 - k0 >= 60) st.repasses++; // (a large component's: the cost the budget is for)
     if (again && plan) { // (the pass again in the team's stages: solve_repass, solve_factor, solve_defer, solve_finish)
         comp_pass_[comp] = (uint8_t)(pass + 1);
         comp_repass_[comp] = 1;
@@ -3962,6 +3968,7 @@ void FemFrame::bind_sheet(SoftBody& b) {
         const auto c = tri_of.find(k);
         t.coll = c != tri_of.end() ? c->second : -1;
     }
+    b.sheet_on_plates = !b.shells.empty() && std::all_of(b.shells.begin(), b.shells.end(), [](const Shell& s) { return s.host >= 0; });
 }
 
 uint32_t FemFrame::split_tri(SoftBody& b, uint32_t ti, int e, uint32_t fm, float t) {

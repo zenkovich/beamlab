@@ -3763,6 +3763,7 @@ void World::simulate_island(Island& isl, int substeps) {
                     v2 = std::max(v2, p.max_v2);
                     b.static_contacts += p.contacts;
                 }
+                if (b.sheet_on_plates && b.static_contacts + b.body_contacts + b.mid_contacts + b.sphere_touches > 0) b.plates_quiet = 0; // (touched: see dt_shift)
                 b.aabb.mn = mn;
                 b.aabb.mx = mx;
                 float ms = std::sqrt(v2);
@@ -3826,6 +3827,12 @@ void World::simulate_island(Island& isl, int substeps) {
             }
         }
         if (b->post_frame) b->post_frame(*b, frame_time);
+        if (b->sheet_on_plates) { // (its short steps while it is crushed: SoftBody::dt_shift)
+            const int topo = b->fem.tris_torn + b->fem.tris_refined + b->fem.splits + b->fem.broken + b->fem.mounts_broken;
+            const bool touched = b->static_contacts + b->body_contacts + b->mid_contacts + b->sphere_touches > 0 || topo != b->plates_topo;
+            b->plates_topo = topo;
+            b->plates_quiet = touched ? 0.0f : b->plates_quiet + frame_time;
+        }
         b->guard_quiet = b->body_contacts > 0 || b->sphere_touches > 0 ? 0 : b->guard_quiet + 1;
         if (b->energy_guard && !b->rigid && b->guard_quiet > 15 && b->grab_node < 0 && b->wind_area.empty()) b->guard_energy(settings.gravity);
         b->resting = false, b->rigid_speed = 1e9f; // (set by the rest damping: on the ground or another, slow as a whole)

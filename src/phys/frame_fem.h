@@ -530,6 +530,18 @@ public:
     static constexpr int kRefineEvery = 8;      // (the bisections in a batch every so many of its steps: each batch is
                                                 // the solver's pattern again, a third of a millisecond)
     uint32_t steps_ = 0, refine_step_ = 0;      // (its force evaluations so far, at the last batch of bisections)
+    // The passes again (a yielding hinge or bar the step unloads: its elastic tangent, the component factored again,
+    // solve) on a budget: kRepassBurst of them at once, one more every 1 / kRepassRefill steps. With none left the
+    // yielding members take the elastic tangent from the start (as one that has just unloaded does for 16 steps: it only
+    // stiffens the change of the flow's rate) and the step is solved once. A crash's first frame asked for forty of them
+    // in its 33 steps - a car's whole factorization each, 6 ms of its 17; a frame at rest or driven asks for none.
+    // (Never again at all - BL_REPASS=0 - took the last millisecond off that frame and changed more of what a crashed
+    // Frame Car's parts do; the unloading itself not answered in its step - the elastic tangent a step late - flung a
+    // crashed car's nodes: 33 000 clamps.)
+    static constexpr float kRepassBurst = 8.0f, kRepassRefill = 0.25f;
+    float repass_credit_ = kRepassBurst;
+    bool elastic_step_ = false;                 // (this step: no pass again)
+    int repasses = 0;                           // (statistics: the passes again so far)
     struct LooseTri {
         uint32_t n[3];
         uint16_t section;
@@ -753,7 +765,7 @@ private:
     void apply_reacts(SoftBody& b, float step);
     std::vector<std::vector<Changed>> comp_changed_;
     struct CompStats {
-        int failures = 0, clamps = 0;
+        int failures = 0, clamps = 0, repasses = 0;
         long long passes = 0;
         double t[6] = {};   // (BL_FEMPROF: ms in assembly, factor, substitution, unloading check, the rest, held steps)
         long long held = 0; // (BL_FEMPROF: held steps)

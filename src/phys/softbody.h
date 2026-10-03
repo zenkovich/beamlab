@@ -14,6 +14,7 @@
 #include "phys/shell_pattern.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>
@@ -22,6 +23,7 @@
 namespace bl::phys {
 
 constexpr float kDefaultDt = 0.0005f; // 2000 Hz like RoR
+inline const bool g_plates_shift = getenv("BL_PLATES_SHIFT") != nullptr; // (diagnostics: a sheet on plates sub-cycled as before)
 constexpr int kFrameEvery = 1;        // the FEM frames' implicit step every this many substeps: 2000 Hz (WorldSettings::frame_every)
 
 enum NodeFlag : uint16_t {
@@ -826,7 +828,22 @@ public:
     double vcm_time = -1;
     size_t shell_cap = 0;               // refinement budget (number of shells)
     // Steps of its own per substep needed by the finest shells: the stable step shrinks with the triangle size.
-    int dt_shift() const { return rigid ? 0 : std::max(shell_min_shift, (shell_level + 1) / 2); }
+    // (A sheet lying wholly on a frame's triangle elements - sheet_on_plates, FemFrame::bind_sheet - with their one
+    // bisection takes the short steps only while it is being crushed: once nothing has touched it and nothing of it has
+    // torn or been bisected for kPlatesQuiet seconds (plates_quiet: World, every substep and frame) it steps as it did
+    // before the bisection - the elements carry the halves' stiffness in the implicit step, the sheet's own springs are
+    // the ones its step allows - and takes them up again at the next touch. Kept for good, they cost a crashed car a
+    // quarter of its step as it drove on; dropped under a load they did matter: a slab on the Shell Car tore 717
+    // triangles of it instead of 25.)
+    static constexpr float kPlatesQuiet = 0.5f;
+    int dt_shift() const {
+        if (rigid) return 0;
+        if (sheet_on_plates && shell_level <= 1 && plates_quiet > kPlatesQuiet && !g_plates_shift) return shell_min_shift;
+        return std::max(shell_min_shift, (shell_level + 1) / 2);
+    }
+    bool sheet_on_plates = false;
+    float plates_quiet = 0;             // seconds since it was last touched or its frame's topology changed
+    int plates_topo = 0;                // (the frame's tears, bisections and splits at the last frame's end)
     // A sheet whose hinges must be stiffer than the substep lets them (thin metal that holds its shape: a drum): its
     // short steps are at least 2^this per substep and every triangle is evaluated at least that often (0..2)
     int shell_min_shift = 0;
