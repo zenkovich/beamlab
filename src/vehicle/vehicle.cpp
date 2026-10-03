@@ -161,6 +161,8 @@ std::unique_ptr<Vehicle> Vehicle::create(const VehicleEntry& e, World& world, ve
     log_info("vehicle '%s': %d nodes, %d beams, %d shocks, %d wheels, %d coll tris, %.0f kg, %d warnings", v->name.c_str(), N,
              (int)v->body->beams.size(), (int)v->body->shocks.size(), (int)v->body->wheels.size(), (int)v->body->tris.size(), v->m_mass,
              (int)v->m_warnings.size());
+    if (getenv("BL_VEHICLE_WARNINGS")) // (tools: the warnings themselves)
+        for (const std::string& w : v->m_warnings) log_info("  warning: %s", w.c_str());
     return v;
 }
 
@@ -389,6 +391,10 @@ void Vehicle::draw(Renderer& r, InstanceCollector&, const DebugView& dbg) {
     // they are - what is inside the body)
     const float xray = dbg.xray ? std::clamp(dbg.xray_alpha, 0.02f, 1.0f) : 1.0f;
     if (m_visual && !dbg.hide_meshes) m_visual->draw(r, ghost);
+    // (a cab material `sheet/.../hidden`: the sheet body and the FEM plates are there and not drawn - its flexbodies,
+    // skinned to their nodes, are its look)
+    const bool skin_hidden = m_def.cab_material.size() > 7 && m_def.cab_material.compare(m_def.cab_material.size() - 7, 7, "/hidden") == 0;
+    if (m_frame) m_frame->plates_hidden = skin_hidden;
     if (m_frame && !dbg.hide_meshes && ghost > 0.001f) {
         m_frame->upload();
         m_frame->draw(r, ghost, xray * ghost); // (the editor's preview: see-through as its meshes)
@@ -397,7 +403,7 @@ void Vehicle::draw(Renderer& r, InstanceCollector&, const DebugView& dbg) {
         m_sheet->upload(m_sheet_first);
         m_sheet_first = false;
         static const bool no_panels = getenv("BL_NOPANELS") != nullptr; // (the frame alone: pictures of its tubes)
-        if (!dbg.hide_meshes && ghost > 0.001f && !no_panels) m_sheet->draw(r, xray);
+        if (!dbg.hide_meshes && ghost > 0.001f && !no_panels && !skin_hidden) m_sheet->draw(r, xray);
     }
 }
 

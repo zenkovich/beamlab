@@ -46,10 +46,15 @@ private:
         uint32_t ref, nx, ny;
         vec3 c;  // position coords
         vec3 n;  // normal coords
+        float lx = 0, ly = 0; // (its two edges' lengths as built: Flex::stretch)
     };
     struct Flex {
         uint32_t first, count;
         std::vector<Locator> loc;
+        // (above 1: a locator's edges taken no longer than this times their length as built, no shorter than 1 over it -
+        // a mesh over FEM parts that tear: a vertex whose node went off with a shard stays by its other nodes, the mesh
+        // was pulled out in spikes after it. 0: as RoR, the edges as they are)
+        float stretch = 0;
     };
     struct Batch {
         const Material* mat;
@@ -146,6 +151,15 @@ private:
     std::vector<std::unique_ptr<RigidMesh>> m_rmeshes;
     std::unordered_map<std::string, int> m_rmesh_index;
     std::vector<uint32_t> m_indices;
+    // A mesh over FEM parts that tear (Flex::stretch): each of its vertices' node, and the indices as drawn - a triangle
+    // whose vertices' nodes are no longer of one part (SoftBody::part_labels: a shard torn off, a panel in two) is left
+    // out (degenerate), the mesh tears where its part did; made again when the body's parts change
+    // (and one stretched to three times its size as built and 0.25 m: a panel hanging on by a corner)
+    std::vector<uint32_t> m_vert_node, m_draw_indices;
+    std::vector<vec3> m_vert_rest;
+    uint64_t m_tear_key = ~0ull;
+    int m_tear_again = 0;
+    bool m_idx_dirty = false;
     GpuMesh m_gpu;
     AABB m_bounds;
     bool m_gpu_ready = false;

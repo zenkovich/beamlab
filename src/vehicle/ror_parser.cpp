@@ -1384,6 +1384,8 @@ void Parser::parse_wheel() {
         w.braking = std::clamp(ival(5), 0, 4), w.propulsion = std::clamp(ival(6), 0, 2);
         w.arm = ref(7), w.mass = f(8), w.spring = f(9), w.damp = f(10);
         if (ntok_ > 11) w.grip = f(11);
+        // [, side (l / r), a rim mesh (as meshwheels': drawn on the wheel instead of the plain rim's discs)]
+        if (ntok_ > 13) w.side = tok_[12][0] == 'r' ? 'r' : 'l', w.rim_mesh = std::string(tok_[13]);
         w.rays = 0;
         w.nd = nd_, w.bd = bd_, w.line = line_no_;
         w.first_node = (int)doc_.nodes.size();
@@ -1967,6 +1969,15 @@ bool parse_truck_text(const std::string& text, const std::string& path, Document
     doc = Document();
     doc.path = path;
     doc.dir = path_dir(path);
+    // (BeamLab) `;resources: <folder>`: its meshes, materials and textures in another folder (beside its own: a model
+    // of the project's own wearing a downloaded mod's meshes)
+    if (const size_t at = text.find(";resources:"); at != std::string::npos && (at == 0 || text[at - 1] == '\n')) {
+        size_t a = at + 11, e = text.find('\n', a);
+        if (e == std::string::npos) e = text.size();
+        while (a < e && (text[a] == ' ' || text[a] == '\t')) a++;
+        while (e > a && (text[e - 1] == ' ' || text[e - 1] == '\r' || text[e - 1] == '\t')) e--;
+        if (e > a) doc.dir = path_join(doc.dir, text.substr(a, e - a));
+    }
     Parser p(doc);
     p.run(text);
     p.finish(config);

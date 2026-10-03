@@ -122,6 +122,8 @@ const OgreMesh* VehicleVisual::mesh(const std::string& file) {
         m_warn->push_back("mesh not found: " + file);
     }
     const OgreMesh* r = m.get();
+    if (r && getenv("BL_MESH_BOUNDS")) // (tools: each mesh's own bounds as loaded)
+        printf("mesh %s: (%.4f %.4f %.4f) - (%.4f %.4f %.4f)\n", file.c_str(), r->bounds.mn.x, r->bounds.mn.y, r->bounds.mn.z, r->bounds.mx.x, r->bounds.mx.y, r->bounds.mx.z);
     m_meshes[file] = std::move(m);
     return r;
 }
@@ -200,6 +202,8 @@ void VehicleVisual::build(const ror::Document& d, const SoftBody& b, std::vector
         size_t total = 0;
         for (const auto& sm : om->submeshes) total += sm.vertices.size();
         Flex fx;
+        // (a body whose skin is hidden under its flexbodies - FEM parts that tear: the locators' edges kept near their length)
+        if (d.cab_material.size() > 7 && d.cab_material.compare(d.cab_material.size() - 7, 7, "/hidden") == 0) fx.stretch = 1.25f;
         fx.first = alloc((uint32_t)total);
         fx.count = (uint32_t)total;
         fx.loc.resize(total);
@@ -286,9 +290,15 @@ void VehicleVisual::build(const ror::Document& d, const SoftBody& b, std::vector
                 mat3 Minv = inverse(mat3(X, Y, Z));
                 L.c = Minv * (wp[i] - o);
                 L.n = Minv * wn[i];
+                L.lx = length(X), L.ly = length(Y);
                 fx.loc[i] = L;
             }
         });
+        if (fx.stretch > 1) {
+            if (m_vert_node.size() < m_verts.size()) m_vert_node.resize(m_verts.size(), UINT32_MAX);
+            m_vert_rest.resize(m_verts.size());
+            for (size_t i = 0; i < total; i++) m_vert_node[fx.first + i] = fx.loc[i].ref, m_vert_rest[fx.first + i] = wp[i];
+        }
         m_flex.push_back(std::move(fx));
     }
 
@@ -379,7 +389,18 @@ void VehicleVisual::build(const ror::Document& d, const SoftBody& b, std::vector
                     const uint32_t a0 = t.tyre + i * kProfile + k, a1 = a0 + kProfile;
                     ti.insert(ti.end(), {a0, a1, a0 + 1, a1, a1 + 1, a0 + 1}); // (facing out: the shader turns a back face's normal round)
                 }
-            for (int side = 0; side < 2; side++) {
+            // (a rim mesh of its own - `ringwheels`' last fields, as meshwheels' - instead of the plain discs)
+            const OgreMesh* rim_om = wd.rim_mesh.empty() ? nullptr : mesh(wd.rim_mesh);
+            if (rim_om) {
+                Rigid r;
+                r.kind = Rigid::RIM;
+                r.wheel = wi;
+                r.side = wd.side;
+                r.mesh = rigid_mesh(rim_om, wd.rim_mesh, "");
+                r.part = part_code(PART_WHEEL, w.tag);
+                m_rigid.push_back(std::move(r));
+            }
+            for (int side = 0; side < 2 && !rim_om; side++) {
                 const uint32_t c0 = t.rim + side * (S + 2);
                 for (int i = 0; i < S; i++) {
                     auto& list = (i * 10 / S) % 2 ? dark : light; // (five spokes)
@@ -605,6 +626,11 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
             const Locator& l = L[i];
             vec3 o = nd[l.ref].p;
             vec3 X = nd[l.nx].p - o, Y = nd[l.ny].p - o;
+            if (f.stretch > 1) {
+                const float x2 = length2(X), y2 = length2(Y), hi = f.stretch * f.stretch, lo = 1.0f / hi;
+                if (x2 > hi * l.lx * l.lx || x2 < lo * l.lx * l.lx) X *= clampf(std::sqrt(x2), l.lx / f.stretch, l.lx * f.stretch) / std::sqrt(std::max(x2, 1e-12f));
+                if (y2 > hi * l.ly * l.ly || y2 < lo * l.ly * l.ly) Y *= clampf(std::sqrt(y2), l.ly / f.stretch, l.ly * f.stretch) / std::sqrt(std::max(y2, 1e-12f));
+            }
             vec3 Z = cross(X, Y);
             float zl = length(Z);
             Z = zl > 1e-9f ? Z / zl : vec3(0, 1, 0);
@@ -618,6 +644,14 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
         if (r.kind == Rigid::RIM) {
             const Wheel& w = b.wheels[r.wheel];
             vec3 a0 = nd[w.axle0].p, a1 = nd[w.axle1].p;
+            if (w.ring) { // (a ring tyre's wheel: its own pose)
+                vec3 a = -w.axis();
+                if (r.side != 'r') a = -a;
+                const vec3 o = normalize_or(cross(a, w.rot.rotate(vec3(0, 1, 0))), vec3(0, 1, 0));
+                pl.pos = w.pos, pl.orient = mat3(a, o, cross(a, o));
+                r.model = mat4::from_mat3(pl.orient, pl.pos);
+                continue;
+            }
             pl.pos = (a0 + a1) * 0.5f;
             vec3 a = normalize_or(a0 - a1, vec3(0, 0, 1));
             if (r.side != 'r') a = -a;
@@ -699,6 +733,33 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
                 rv[4].normal = normalize(radial * 0.6f + axis * 0.8f);
                 rv[5].normal = axis;
             }
+        }
+    }
+    // the meshes over FEM parts torn where their parts are: once the body's parts change (and a few updates on - the
+    // labels are made again a few substeps after a tear)
+    if (!m_vert_node.empty()) {
+        const uint64_t key = ((uint64_t)b.fem.tris_torn << 40) ^ ((uint64_t)b.fem.loose_count << 24) ^ ((uint64_t)b.fem.mounts_broken << 12) ^ (uint64_t)b.fem.broken;
+        if (key != m_tear_key) m_tear_key = key, m_tear_again = 12;
+        if (m_tear_again <= 0 && key != 0) m_tear_again = 8; // (a damaged body: looked at again every 8th update)
+        if (m_tear_again > 0 && (m_tear_again-- % 4) == 0) {
+            int np = 0;
+            const std::vector<uint32_t>& part = const_cast<SoftBody&>(b).part_labels(&np);
+            m_vert_node.resize(m_verts.size(), UINT32_MAX);
+            m_draw_indices = m_indices;
+            auto label = [&](uint32_t v) { return m_vert_node[v] < part.size() ? (int)part[m_vert_node[v]] : -1; };
+            m_vert_rest.resize(m_verts.size());
+            for (size_t t = 0; t + 2 < m_draw_indices.size(); t += 3) {
+                const uint32_t v[3] = {m_draw_indices[t], m_draw_indices[t + 1], m_draw_indices[t + 2]};
+                const int l0 = label(v[0]), l1 = label(v[1]), l2 = label(v[2]);
+                if (l0 < 0 || l1 < 0 || l2 < 0) continue;
+                bool drop = np > 1 && (l0 != l1 || l1 != l2);
+                for (int e = 0; e < 3 && !drop; e++) {
+                    const float now2 = length2(m_verts[v[e]].pos - m_verts[v[(e + 1) % 3]].pos), was = length(m_vert_rest[v[e]] - m_vert_rest[v[(e + 1) % 3]]);
+                    drop = now2 > 9.0f * was * was && now2 > (was + 0.25f) * (was + 0.25f);
+                }
+                if (drop) m_draw_indices[t + 1] = m_draw_indices[t + 2] = m_draw_indices[t];
+            }
+            m_idx_dirty = true;
         }
     }
     m_dirty = true;
@@ -810,6 +871,7 @@ void VehicleVisual::draw(Renderer& r, float alpha) {
         m_dirty = false;
         m_uploaded = true;
     } else if (m_dirty) {
+        if (m_idx_dirty) m_gpu.update_indices(m_draw_indices.data(), (int)m_draw_indices.size()), m_idx_dirty = false;
         m_gpu.update_vertices(m_verts.data(), (int)m_verts.size(), m_bounds);
         m_dirty = false;
         m_uploaded = true;

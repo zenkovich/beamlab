@@ -2242,6 +2242,9 @@ static void scene_fem_pad(Game& g, const char* vid, const char* name, bool dirt)
 void scene_frame_car(Game& g) { scene_fem_pad(g, "frame_car/frame_car", "Frame Car", false); }
 void scene_buggy(Game& g) { scene_fem_pad(g, "buggy/buggy", "Buggy", true); }
 void scene_shell_car(Game& g) { scene_fem_pad(g, "shell_car/shell_car", "Shell Car", true); } // (the dirt lane and the rough field: its offroad tests)
+// (the Shell Car with the BMW E36 Lightweight's - the M3's - meshes on it, flexbodies skinned to its parts' nodes:
+// tools/make_shell_car.py SC_M3=1)
+void scene_shell_car_m3(Game& g) { scene_fem_pad(g, "shell_car/shell_car_m3", "Shell Car M3", true); }
 
 
 
@@ -3014,6 +3017,8 @@ const std::vector<SceneInfo>& scene_registry() {
          [](Game& g) { scene_frame_car_test(g, "jump", vec3(95, 4.0f, 160), vec3(80, 2.2f, 172), "Over the 2.2 m tabletop at 90 km/h.", scene_buggy); }},
         {"shell_car", "Shell Car", "Test cars/Shell Car", "A saloon on the BMW E36's lines, all FEM: a body-in-white of members and sheets, parts on hinges, bolts, buffers",
          scene_shell_car},
+        {"shell_car_m3", "Shell Car M3", "Test cars/Shell Car", "The Shell Car under the BMW M3's (the E36 Lightweight's) graphical model: its meshes skinned to the FEM parts' nodes",
+         scene_shell_car_m3},
         {"sc_headon", "Shell Car: Head-on", "Test cars/Shell Car", "Two Shell Cars head-on at 50 km/h each",
          [](Game& g) { scene_frame_car_test(g, "Head-on into another", vec3(5.2f, 2.0f, 56.5f), vec3(0, 0.6f, 62.5f), "Two Shell Cars meet head-on at 50 km/h each.", scene_shell_car); }},
         {"sc_side", "Shell Car: Side impact", "Test cars/Shell Car", "Another Shell Car into its side at 50 km/h",

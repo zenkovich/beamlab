@@ -768,7 +768,7 @@ const Material* see_through(std::unordered_map<const Material*, std::unique_ptr<
 
 void FrameVisual::draw(Renderer& r, float alpha, float plate_alpha) const {
     if (mesh.valid() && mat && !verts.empty()) r.draw_mesh(&mesh, see_through(ghosts, mat.get(), alpha), mat4());
-    if (!plate_mesh.valid() || plate_idx.empty()) return;
+    if (!plate_mesh.valid() || plate_idx.empty() || plates_hidden) return;
     const float pa = plate_alpha < 0 ? alpha : plate_alpha;
     auto see = [&](const Material* m) { return see_through(ghosts, m, pa); };
     const Material* base = see((plate_mat ? plate_mat : frame_plate_material()).get());

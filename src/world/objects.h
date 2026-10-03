@@ -53,6 +53,7 @@ struct SurfaceVisual {
 struct FrameVisual {
     MaterialPtr mat;
     MaterialPtr plate_mat;
+    bool plates_hidden = false;                         // (a vehicle whose look is its flexbodies: the plates not drawn)
     std::vector<MaterialPtr> section_mats;              // per shell section (none / null: plate_mat): a section's own colour
     std::vector<std::pair<int, int>> plate_ranges;      // per shell section: its plates' indices (first, count)
     GpuMesh mesh, plate_mesh;
