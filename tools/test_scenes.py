@@ -443,8 +443,9 @@ if os.path.exists(os.path.join(ROOT, "assets", "vehicles", "bmw_e36", "E36_CHASS
     sl = shell_line(out)
     check("shell car m3: its meshes load, into the wall stable", bool(wm) and wm[0] == "0" and bool(sl) and sl[0] == 0 and unstable(out) == 0,
           "%s warnings, %s" % (wm[0] if wm else "?", shell_text(sl)))
-# the FEM cars under the mods' meshes (tools/make_skin_car.py; each when its mod is there): it loads with its meshes,
-# stands still with nothing yielded, gets to 50 km/h within 8 s on the lane, and into the wall at 80 km/h it is stable
+# the FEM cars under the mods' meshes (tools/make_part_car.py; each when its mod is there): it loads with its meshes,
+# stands still with nothing yielded, gets to 50 km/h within 8 s on the lane, and into the wall at 80 km/h it crumples,
+# some of its parts' mounts let go, and it is stable
 FEM_CARS = {"viper": "dodge_viper", "trophy_truck": "trophy_truck_v2", "audi_quattro": "audi_quattro", "ford_f250": "ford_f250_2014", "mercedes_clk": "mercedes_clk"}
 for car, folder in FEM_CARS.items():
     if not os.path.isdir(os.path.join(ROOT, "assets", "vehicles", folder)):
@@ -464,7 +465,7 @@ for car, folder in FEM_CARS.items():
                "--screenshot", os.path.join(TMP, "fem2.png")])
     sl, sp = shell_line(out), speeds_at(out)
     last = sp[max(sp)] if sp else (99,)
-    check("fem %s: into the wall at 80 km/h, crumples, stable" % car, bool(sl) and sl[0] == 0 and sl[3] > 20 and abs(last[0]) < 15 and unstable(out) == 0,
+    check("fem %s: into the wall at 80 km/h, crumples, sheds parts, stable" % car, bool(sl) and sl[0] == 0 and sl[3] > 20 and sl[4] > 0 and abs(last[0]) < 15 and unstable(out) == 0,
           "%s, %.1f km/h at the end" % (shell_text(sl), last[0]))
 out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--drive", "0,0", "--screenshot", os.path.join(TMP, "sc0.png")])
 sl = shell_line(out)
