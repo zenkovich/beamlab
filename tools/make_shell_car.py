@@ -47,6 +47,8 @@ The E36's meshes placed in its definition space as .obj files, from the game:
 
     BL_EXPORT_FLEX=<dir> ./build/beamlab --scene proving --vehicle bmw_e36/E36Sedan --frames 2 --hidden --screenshot x.png
     python3 tools/make_shell_car.py <dir>          (BIW_ONLY=1: the body-in-white alone; NO_WHEELS=1: no wheels)
+    SC_M3=1 python3 tools/make_shell_car.py <dir>  (the Shell Car M3: shell_car_m3.truck, the same car under the E36
+                                                    Lightweight's meshes as flexbodies on its parts' nodes)
 
 Coordinates are Rigs of Rods' (and the E36's): -x forward, y up, +z left.
 """
@@ -58,7 +60,12 @@ import sys
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.environ.get("SC_OUT") or os.path.join(ROOT, "assets", "vehicles", "shell_car", "shell_car.truck")
+# SC_M3=1: the Shell Car M3 - the same car with the E36 Lightweight's (the M3's) graphical model on it instead of the
+# sheet body's and the plates' look: its meshes as flexbodies skinned to the nodes of the parts they are (RoR's way:
+# each vertex on the three nodes of its forset nearest it), its rims on the ring tyres; its meshes stay in the E36's folder (`;resources:`)
+M3 = bool(os.environ.get("SC_M3"))
+E36_DIR = os.path.join(ROOT, "assets", "vehicles", "bmw_e36")
+OUT = os.environ.get("SC_OUT") or os.path.join(ROOT, "assets", "vehicles", "shell_car", "shell_car_m3.truck" if M3 else "shell_car.truck")
 MESH_DIR = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("E36_OBJ", "")
 
 
@@ -1159,10 +1166,130 @@ class Marks:
             self.cur = layer
 
 
+# ------------------------------------------------------------------------- the M3's graphical model (SC_M3=1)
+M3_TRUCK = os.path.join(E36_DIR, "E36Lightweight.truck")
+M3_WHEEL = (0.34, 0.262, 0.24, "E36LW_Frim.mesh")   # (its tyres' radius, its 17" rims' with their flanges, the tyre's width; the rim's mesh)
+# each mesh on the nodes of what it is of: the body-in-white's, or its parts'
+M3_FORSET = {"CHASSIS": ["biw"], "SKIRT": ["biw"], "WIND": ["biw"], "WINDINT": ["biw"], "DASH": ["biw"], "SEAT": ["biw"], "NOSE": ["grille", "biw"],
+             "TAILLIGHT": ["lamp 1", "lamp -1"], "TRUNK": ["trunk"], "FFENDER": ["fender 1", "fender -1"], "HOOD": ["hood"],
+             "FDOOR": ["door 1 front", "door -1 front"], "MIRRORS": ["door 1 front", "door -1 front"], "RDOOR": ["door 1 rear", "door -1 rear"],
+             "HEADLIGHTS": ["headlight 1", "headlight -1"], "FBUMP": ["fascia"], "LIP": ["fascia"], "RBUMP": ["rear bumper"]}
+
+
+def rot_xyz(deg):
+    """the truck format's rotation: Rz Ry Rx (degrees)"""
+    rx, ry, rz = (math.radians(a) for a in deg)
+    cx, sx, cy, sy, cz, sz = math.cos(rx), math.sin(rx), math.cos(ry), math.sin(ry), math.cos(rz), math.sin(rz)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def placement(pref, px, py):
+    """a flexbody's or a prop's frame on its ref, x and y nodes (VehicleVisual's place, RoR's): the offset's basis
+    (X, Y, the normal) and the orientation's (X's direction, the normal, their cross)"""
+    pref, X, Y = np.array(pref), np.array(px) - np.array(pref), np.array(py) - np.array(pref)
+    n = np.cross(Y, X)
+    n /= np.linalg.norm(n)
+    rx = X / np.linalg.norm(X)
+    return pref, np.column_stack([X, Y, n]), np.column_stack([rx, n, np.cross(rx, n)])
+
+
+def replace_frame(e36, line_nodes, off, rot, own):
+    """the offset and the rotation that place a mesh on the nodes `own` (ref, x, y of this car) where the E36 has it on
+    its nodes `line_nodes` with `off` and `rot`"""
+    pe, Be, Re = placement(*(e36[k] for k in line_nodes))
+    pos, M = pe + Be @ np.array(off), Re @ rot_xyz(rot)
+    po, Bo, Ro = placement(*(nodes[k] for k in own))
+    R = Ro.T @ M
+    ry = -math.asin(max(-1.0, min(1.0, R[2, 0])))
+    return np.linalg.solve(Bo, pos - po), [math.degrees(a) for a in (math.atan2(R[2, 1], R[2, 2]), ry, math.atan2(R[1, 0], R[0, 0]))]
+
+
+def frame_of(ns):
+    """three of the nodes ns for a frame: two far apart, the third far off their line"""
+    P = {k: np.array(nodes[k]) for k in ns}
+    a = min(ns, key=lambda k: tuple(P[k]))
+    b = max(ns, key=lambda k: np.linalg.norm(P[k] - P[a]))
+    e = (P[b] - P[a]) / np.linalg.norm(P[b] - P[a])
+    c = max(ns, key=lambda k: np.linalg.norm((P[k] - P[a]) - e * np.dot(P[k] - P[a], e)))
+    return a, b, c
+
+
+def ranges(ns):
+    """a forset's node list as ranges"""
+    ns, out = sorted(set(ns)), []
+    for k in ns:
+        if out and out[-1][1] == k - 1:
+            out[-1][1] = k
+        else:
+            out.append([k, k])
+    return ",".join("%d-%d" % (a, b) if b > a else "%d" % a for a, b in out)
+
+
+def m3_model():
+    """the E36 Lightweight's managed materials, its flexbodies and its steering wheel as this car's lines"""
+    lines = [l.rstrip("\n") for l in open(M3_TRUCK, encoding="latin-1")]
+    e36, mats, flex, props, sec = {}, [], [], [], None
+    for l in lines:
+        t = l.strip()
+        if not t or t.startswith(";"):
+            continue
+        word = t.split()[0].split(",")[0]
+        if word == t and not t[0].isdigit() and t == t.lower():   # (a section's keyword: a line of its own)
+            sec = t
+            continue
+        if word in ("forset", "add_animation") or word.startswith("set_"):
+            continue
+        if sec == "nodes":
+            f = [x.strip() for x in t.split(",")]
+            if len(f) >= 4 and f[0].isdigit():
+                e36[int(f[0])] = tuple(float(x) for x in f[1:4])
+        elif sec == "managedmaterials":
+            mats.append(t)
+        elif sec == "flexbodies" and t.count(",") >= 9:
+            f = [x.strip() for x in t.split(",")]
+            flex.append(([int(x) for x in f[0:3]], [float(x) for x in f[3:6]], [float(x) for x in f[6:9]], f[9]))
+        elif sec == "props" and "E36_STEER" in t:
+            f = [x.strip() for x in t.split(",")]
+            props.append(([int(x) for x in f[0:3]], [float(x) for x in f[3:6]], [float(x) for x in f[6:9]], ",".join(f[9:])))
+    by_part = {}
+    for k, g in node_part.items():
+        by_part.setdefault(g, []).append(k)
+    out_flex = []
+    for ln, off, rot, mesh in flex:
+        key = "LIP" if "lip" in mesh else mesh.split(".")[0].replace("E36_", "").replace("_B", "")
+        if key not in M3_FORSET:    # (the tyres' flexbodies: the ring tyres draw their own)
+            continue
+        ns = [k for g in M3_FORSET[key] for k in by_part.get(g, [])]
+        if len(ns) < 3:
+            continue
+        own = frame_of(ns)
+        o, r = replace_frame(e36, ln, off, rot, own)
+        out_flex.append("%d, %d, %d, %.5f, %.5f, %.5f, %.4f, %.4f, %.4f, %s\nforset %s" % (own + tuple(o) + tuple(r) + (mesh, ranges(ns))))
+        # (how far its vertices are from the nodes they hang on: the sedan's mesh, the same geometry)
+        fn = [f_ for f_ in os.listdir(MESH_DIR) if f_.endswith("_E36_" + key + ".mesh.obj")]
+        if fn:
+            V = load_obj(os.path.join(MESH_DIR, fn[0]))[0]
+            P = np.array([nodes[k] for k in ns])
+            d = np.array([np.min(np.linalg.norm(P - v, axis=1)) for v in V[::7]])
+            print("  M3 %s on %d nodes: its vertices %.2f m from their nearest node at most, %.2f on average" % (mesh, len(ns), d.max(), d.mean()))
+    out_props = []
+    floor = [k for k in by_part["biw"] if abs(nodes[k][1] - Y_FLOOR) < 0.02 and -0.9 < nodes[k][0] < 0.6]
+    for ln, off, rot, tail in props:   # (the steering wheel: on the floor's nodes under it)
+        own = frame_of(floor)
+        o, r = replace_frame(e36, ln, off, rot, own)
+        out_props.append("%d, %d, %d, %.5f, %.5f, %.5f, %.4f, %.4f, %.4f, %s" % (own + tuple(o) + tuple(r) + (tail,)))
+    return mats, out_flex, out_props
+
+
+M3_MODEL = m3_model() if M3 and MESH_DIR else None
+
 # ------------------------------------------------------------------------------------------------------ the file
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 with open(OUT, "w") as f:
-    f.write("Shell Car\n")
+    f.write("Shell Car M3\n" if M3 else "Shell Car\n")
     f.write(";generated by tools/make_shell_car.py: a saloon on the BMW E36's lines, its body-in-white FEM members (sills, pillars,\n")
     f.write(";rails, bows, cross members) with single sheets of FEM triangles between them (floor, firewall, roof, aprons, wheelhouses,\n")
     f.write(";quarters, rear panel), the hood, fenders, doors, trunk lid, bumpers, tail lights and headlights FEM triangles, a sheet\n;body over them but the lamps;\n")
@@ -1171,7 +1298,12 @@ with open(OUT, "w") as f:
     # over their FEM plates, its dents and cracks; the car's crashes were tuned with it, without it its plates took the
     # blows alone - thousands of strain clamps in a head-on, the bumpers' plastic most. The bumpers' is black; the lamps
     # and the headlights keep out of it, their own colours seen, their FEM triangles collide)
-    f.write("globals\n;dry mass, cargo mass, cab material (the sheet body over the shells below)\n%.1f, 0.0, sheet/Steel/%.1f/0.004/1\n" % (DRY_KG, SHEET_KG_M2))
+    if M3_MODEL:
+        f.write(";its look: the BMW E36 Lightweight's (the M3's) meshes, flexbodies skinned to the nodes of the parts they are (SC_M3=1);\n")
+        f.write(";the sheet body and the FEM plates are there and not drawn (the cab material's `hidden`), the body's members hidden\n")
+        f.write(";resources: ../bmw_e36\n")
+        f.write("managedmaterials\n%s\n" % "\n".join(M3_MODEL[0]))
+    f.write("globals\n;dry mass, cargo mass, cab material (the sheet body over the shells below)\n%.1f, 0.0, sheet/Steel/%.1f/0.004/1%s\n" % (DRY_KG, SHEET_KG_M2, "/hidden" if M3_MODEL else ""))
     f.write("minimass\n0.05\n")
     f.write(";editor-layers:%s\n" % "".join(" %s|1|0" % l for l in LAYERS))
     mark = Marks(f)
@@ -1194,7 +1326,7 @@ with open(OUT, "w") as f:
         f.write(";%s\nset_beam_defaults 3000000, 400, 80000, 700000, 0.05, tracks/beam, 0\nset_frame_section %s, %s, %.4f, %.4f, %s%s\n" % (
             sec, spec[0], spec[1], spec[2], spec[3], spec[4], extra))
         mark(layer_of(sec))
-        opt = "Fi" if sec in HIDDEN_SECS else "F"   # (i: not drawn)
+        opt = "Fi" if sec in HIDDEN_SECS or (M3_MODEL and sec not in ("arm", "tierod", "rack", "upright")) else "F"   # (i: not drawn; under the M3's meshes: the body's all, the hubs' stubs through the rims)
         for a, b, ja, jb in lst:
             if ja or jb:
                 f.write("%d, %d, %s, %s, %s\n" % (a, b, opt, ja or spec[4], jb or spec[4]))
@@ -1238,6 +1370,10 @@ with open(OUT, "w") as f:
         f.write("ringwheels\n;(BeamLab) radius, rim radius, width, node1, node2, braking, propulsion, arm, mass, tyre stiffness (N/m, 2 cm in), damping (N s/m), grip\n")
         mark.section(), mark("Suspension")
         for n1, n2, arm, front in wheels if not os.environ.get("NO_WHEELS") else []:
+            if M3_MODEL:   # (the M3's 17" wheels: its rims' mesh on them - the side, the mesh)
+                f.write("%.2f, %.3f, %.2f, %d, %d, 1, %d, %d, 20.0, 200000.0, 1000.0, 1.0, %s, %s\n" % (
+                    M3_WHEEL[:3] + (n1, n2, 0 if front else 1, arm, "r" if nodes[n1][2] > 0 else "l", M3_WHEEL[3])))
+                continue
             f.write("%.2f, %.3f, %.2f, %d, %d, 1, %d, %d, 20.0, 200000.0, 1000.0, 1.0\n" % (WHEEL_R, RIM_R, WHEEL_W, n1, n2, 0 if front else 1, arm))
     f.write("engine\n;min rpm, max rpm, torque, differential, reverse, neutral, gears...\n900.0, 6500.0, 280.0, 3.15, 3.7, 1.0, 4.2, 2.5, 1.66, 1.22, 1.0, -1.0\n")
     f.write("engoption\n;inertia (rpm-based: 0.02 ~ 0.2 kg m2), type, clutch force, shift time, clutch time, post-shift time\n0.02, c, 1000.0, 0.3, 0.4, 0.3\n")
@@ -1284,6 +1420,11 @@ with open(OUT, "w") as f:
         mark(layer_of(name))
         for a, b, c in fem[name]:
             f.write("%d, %d, %d\n" % (a, b, c))
+    if M3_MODEL:
+        f.write("flexbodies\n;the E36 Lightweight's meshes, each on its part's nodes: ref, x, y, offset, rotation, mesh - forset: the nodes it is skinned to\n")
+        f.write("\n".join(M3_MODEL[1]) + "\n")
+        if M3_MODEL[2]:
+            f.write("props\n;the steering wheel\n" + "\n".join(M3_MODEL[2]) + "\nadd_animation -460, 0, 0, source: steeringwheel, mode: x-rotation\n")
     f.write("end\n")
 
 kg_tri = {name: sum(area(t) for t in lst) * SHELLS[name][1] * DENSITY[SHELLS[name][0]] for name, lst in fem.items()}

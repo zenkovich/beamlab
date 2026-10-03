@@ -1174,7 +1174,7 @@ int main() {
         read_text_file(path_join(root, rel), text);
         shipped += rel.rfind("editor/", 0) != 0 && text.find(";written by the BeamLab model editor") == std::string::npos;
     }
-    CHECK(shipped == 75, "expected 75 vehicle files, found %zu", shipped);
+    CHECK(shipped == 76, "expected 76 vehicle files, found %zu", shipped);
     CHECK(worst_ms_per_kline * 5 < 5.0, "parsing is too slow");
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "ALL CHECKS PASSED", g_failures);
     return g_failures ? 1 : 0;

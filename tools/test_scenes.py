@@ -434,6 +434,15 @@ def susp_ok(out):
     m = re.findall(r"susp: (\d+) bent \(most ([\d.]+) rad\), (\d+) torn", out)
     return bool(m) and m[-1][0] == "0" and m[-1][2] == "0", ("suspension %s bent, %s torn" % (m[-1][0], m[-1][2])) if m else "no suspension line"
 SUSP = {"BL_SUSPDBG": "1"}
+# the Shell Car M3 (the same car under the E36 Lightweight's meshes, when that mod is there): it loads without a warning
+# - every mesh and material found - stands, and into the wall it is as stable as the Shell Car
+if os.path.exists(os.path.join(ROOT, "assets", "vehicles", "bmw_e36", "E36_CHASSIS_B.mesh")):
+    out = run(["--scene", "shell_car_m3", "--size", "640x360", "--frames", "240", "--hidden", "--novsync", "--drive", "0,0", "--action", "Launch at the wall",
+               "--screenshot", os.path.join(TMP, "m3.png")])
+    wm = re.findall(r"vehicle 'Shell Car M3': .*?(\d+) warnings", out)
+    sl = shell_line(out)
+    check("shell car m3: its meshes load, into the wall stable", bool(wm) and wm[0] == "0" and bool(sl) and sl[0] == 0 and unstable(out) == 0,
+          "%s warnings, %s" % (wm[0] if wm else "?", shell_text(sl)))
 out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--drive", "0,0", "--screenshot", os.path.join(TMP, "sc0.png")])
 sl = shell_line(out)
 check("shell car: standing, nothing yields or comes off", bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[3] == 0 and sl[4] == 0 and unstable(out) == 0,
