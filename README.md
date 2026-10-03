@@ -583,7 +583,9 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     wedged between them, passing through their own car and pushed out of the other on their nodes' masses (the rigid
     piece moving a tenth as far, the push came again every step). A loose fragment's nodes move no faster than 50 m/s
     against the body's mean velocity (`FemFrame::cap_loose`, each substep: a shard of a few grams squeezed between two
-    crashed cars' plates, pushed out by both in turn, ran away to 400 m/s and was reset, once a head-on).
+    crashed cars' plates, pushed out by both in turn, ran away to 400 m/s and was reset, once a head-on) - only those
+    faster than the body's speed and the cap, so a shard lying on the ground stays there behind a car driving off at
+    any speed (against the fragment's own mean instead, a shard flung whole at 100 m/s went through the ground).
     `BL_NOLOOSE=1`: they stay in the frame's step.
   - *Cuts.* The destroy tool tears the members within reach and the laser the ones crossing its sweep, where they are
     hit: off the joint near an end, else split there and torn (FemFrame::cut).
@@ -818,8 +820,12 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
   every short step (the short step's length and the torque zeroed after the first ran the engine, the gearbox and the
   steering 2-4x slow and drove at a fraction of the power: a car with one dented panel crawled).
 - **Aerodynamics.** RoR's per-node drag (-0.05*|v|*v on every node, ~9 kN at 75 km/h on a 440-node car) is applied
-  only to each node's velocity relative to the body, so it still damps flapping parts; the body gets real drag
-  0.5*rho*CdA*|v|*v from its frontal area.
+  only to each node's velocity relative to its part's mean (`SoftBody::part_labels`: the nodes held together by
+  anything - beams, members, triangles, mounts, sheets, joints, welds, slides), so it still damps flapping parts; each
+  part gets real drag 0.5*rho*CdA*|v|*v from the body's frontal area, its share by mass. (Against the whole body's mean,
+  a panel torn off and lying on the road was pulled after the car - 30 N on a 20 g node at 25 m/s - and slid along
+  behind it.) The parts are cached on the body's topology and counted again at most every 8 substeps; one part takes
+  the old path to the bit.
 - **Contacts.** RoR `primitiveCollision` with adhesion + Stribeck friction and ground models. Mud and sand are fluid
   layers. A road can carry a detailed surface (`phys::RoadSurface`): the heightfield holds the smooth bed, the ruts,
   camber, bumps, stones, potholes and washboard are an analytic shape baked into a 0.1 m grid that both the
@@ -913,29 +919,63 @@ src/game      application loop, input, camera, UI, the model editor (editor.cpp,
     change): a volume looks at those in its range - each volume over every triangle of the other car cost 8 ms a frame
     in a head-on, now about 1.5. `test_physics sheet_mids`: a 1 x 1 m sheet of two triangles thrown at a bar under its
     middle, or at two bars off its triangles' middles, between its corners, stops on them (without: through).
-  - **Ring tyres** (`Wheel::ring`, the truck's `ringwheels`; `World::ring_tyres`): the rim a rigid round disc turning on
-    the axle - its spin and angle its own state, no rim or tread nodes (the wheel's mass on the axle nodes) - and the
-    tyre a flexible ring over it: 40 points round its tread in three rows across it and 20 round each sidewall, each
-    pressed into the static world (the ground, a curb's edge and face, a wall) pushing back with a stiffness per area
-    of the tyre (from the one given, the tyre pressed 2 cm into the flat: the patch then 2 sqrt(2 R 0.02) long) and a
-    damping of the wheel's own approach (not of the tread turning into the patch: that is the rolling resistance,
-    Crr 0.012 of the load at the radius); the tread's points in contact sheared along the ground (a brush: each point's
-    own shear since it came into the patch as the rim turns it through, up to the ground's grip, sliding past it with
-    85% of it), let go as they leave. The force onto the axle nodes at the centre, the moment across the axle as a pair
-    on them, the moment along it into the spin with the drive and the brake (it holds the rim still up to its torque),
-    their reaction onto the wheel's arm. Other bodies meet it through a collision volume of a 16-sided drum on its axle
-    (`CollisionVolume::tyre`: no static world, no parts). Drawn round, its section swept round the rim's angle, the
-    tread pressed in and sheared as its points are, the sidewalls bulging, the rim's two faces with five spokes. A
-    quarter car of 300 kg presses one in 16.7 mm (its patch's 16.3), 400 N m rolls it on at 3.8% slip
-    (`test_physics ring`). The differential's coupling between two of them is kept under half what a light rim takes at
+  - **Ring tyres** (`Wheel::ring`, the truck's `ringwheels`; `World::ring_tyres`): a wheel of its own - a rigid body
+    (the rim and the tyre: the given mass, 1/2 m R^2 about the axle, half that and m W^2/12 across it) with its own pose
+    and motion (its angular momentum stepped in the world's frame: it precesses as a spinning wheel does), on a bearing
+    at each of its axle's two nodes (at their distance apart as built: a spring of 2e7 N/m and a damper stepped
+    implicitly on the pair's mass - the node's, half the wheel's with its turn across - so stiff at any step, 0.2-1 mm
+    off under a car's load; free about the axle), no rim or tread nodes (before, its mass sat on the axle nodes and it
+    was placed between them). Placed on its hub when built, moved and set going with the body (`SoftBody::seat_wheels`:
+    `translate`, `set_velocity`, `transform`, a vehicle's reset and launch; a bearing found 0.25 m off - a body set
+    elsewhere - again on the step). Its tyre a flexible ring over the rim: 40 strips of tread round it in four rows
+    across, two under each sidewall, and 20 points round each sidewall's face, each pressed into the static world (the
+    ground, a curb's edge and face, a wall). Each sidewall (left: axle0's side, right) pushes back on its own two rows
+    with a stiffness per area of the tyre (from the one given, the tyre pressed 2 cm into the flat: the patch then
+    2 sqrt(2 R 0.02) long) and a damping of the rim's own approach there (its turn across the axle in it: a rolling or
+    cambered wheel damps each side apart; not the tread turning into the patch: that is the rolling resistance, Crr
+    0.012 of the load at the radius); past half its height pressed in it folds over (a buckle: beyond that a third as
+    stiff, three times as damped, coming on over ~3 ms past 1.1 of it, off below 0.8 - a hysteresis), past 0.85 of it it
+    is crushed (the rim's flange on the ground through the folded wall: 20 times as stiff and damped; counted once a
+    blow, `Wheel::pinches`). The tread's points in contact are sheared along the ground (a brush: each point's own shear
+    since it came into the patch as the rim turns it through, up to the ground's grip, sliding past it with 85% of it),
+    let go as they leave. The tread at the patch - the belt - shifts on the rim along the tread and across it by what
+    the brush passes on (the sidewalls bending: each way a spring and a damper, from the tyre's stiffness: 0.8 of it
+    across, 1 along - 160 and 200 kN/m on the Shell Car's; a 2 ms lag; a folded sidewall holds 30% less across), its
+    strips round the patch with it (to none 60 degrees off it), in series with the brush - solved implicitly over the
+    patch's rows (stuck, then the sliding ones at their grip): in steady rolling it holds still and the brush alone
+    takes the slip (the cornering stiffness the brush's, as before), as the side load changes it lags (a road tyre's
+    relaxation length, ~0.3 m). (A shift of each strip of its own, from nothing as it came into the patch, was a second
+    brush in series: a third of the cornering stiffness - the Frame Car ran wide off its circle into the pad's kerb.)
+    The belt shifted across leans on the sidewall on the side it left (its outer rows pressed in 0.35 of the shift more,
+    the inner a third of that): the rim rolls over its outer sidewall - the Shell Car's outer tyre on its circle at
+    5.4 kN: the belt 40 mm across, that sidewall pressed in 41 mm against the inner's 17 - which folds first. Onto the
+    wheel: the rows' pushes where they are, its weight, the bearings' (their reaction onto the axle nodes); the drive's
+    moment about the axle and the rolling resistance on its spin about it (the world's: the differential is on the
+    body - read against the hub's turn, the rear hubs' wind-up under the drive's reaction, +-2.4 rad/s, fed the
+    differential's coupling and the driven wheels ran at 25% slip; read off the wheel's arm, the suspension's travel
+    - the arm on the body - read as the hub turning, opposite on the two sides, pumped 285 kW into a car of 158); the
+    brake, its caliper on the hub, holds the spin on the hub (the turn of the hub's frame node about the axle: an axle
+    of frame elements; else the world's) up to its torque; the drive's and the brake's reaction onto the wheel's arm. Other bodies meet it through a collision volume of a 16-sided drum on its axle
+    (`CollisionVolume::tyre`: no static world, no parts). Drawn round the wheel's own pose, its section swept round it,
+    the tread pressed in, shifted and sheared as its strips are, each sidewall bulging as its side is pressed (a folded
+    one further), the rim's two faces with five spokes. A quarter car of 300 kg presses one in 17.5 mm with the wheel's
+    own 20 kg (its patch's 17.0), 400 N m rolls it on at 3.5% slip (`test_physics ring`); on a cart (`test_physics
+    ring_wheel`) the ground carries the wheel's weight, the wheel sits 0.2 mm off its axle's middle, a side load of 0.4 g
+    shifts an outer wheel's belt 8 mm across its rim and presses the sidewall its rim leans over 19 mm against 14 without
+    sliding, cambered 5 degrees under 1.8 t the lower sidewall folds (63 mm) and the upper does not (52), 5 t a wheel
+    folds both and crushes them onto the rims (held 15 mm over the rim), and moved the wheels go with the body.
+    The differential's coupling between two of them is kept under half what a light rim takes at
     a step (`Differential::compute`'s stiff: 1e4 N m per m/s swung the rear wheels' torques to +-30 kN m). The test cars
     run on them (`NODE_WHEELS=1` for the tools' generators: RoR's wheels of nodes as before): the Shell Car 0-100 km/h
     in 7.5 s (0-80 7.5 s before), the Frame Car and the Buggy 0-100 in 4.5 s (over 9 s and 6 s) - the node wheels'
     rolling resistance gone - at the same physics time. The beam view (F3, and the wheels view) draws one as the physics
-    has it: the rim's faces (steel blue, five spokes turning with it), the tread's three rows of points pressed in and
-    sheared (white, orange to red as far as they are pressed in, the unpressed ring faint over the patch), the sidewalls,
-    the patch's points with their shear (x10, green) and its load (red, 0.1 m per kN); named close to the camera by its
-    load and its slip (the tread's speed over the ground's, of the ground's).
+    has it, on the wheel's own pose: the rim's faces (steel blue, five spokes turning with it), its bearings' line on the
+    axle's (yellow), the tread's four rows of points pressed in, shifted and sheared (white, orange to red as far as
+    their side is pressed in, the unpressed ring faint over the patch), each sidewall coloured by its own side (magenta:
+    folded over), the patch's points with their shift and shear (x10, green) and its load (red, 0.1 m per kN); named
+    close to the camera by its load, its slip (the tread's speed over the ground's, of the ground's) and how far its
+    tread is shifted across. `BL_WHEELDBG=1` prints each wheel's load, its sides pressed in and folded, its crushes, its
+    tread's shift across, its spin on its hub and its wheel off its axle.
   - Each body first gets a list of partners (bodies whose expanded boxes overlap); only nodes inside a partner's box
     enter the hash, and a body's own nodes are skipped in the scans unless it self-collides. A sheet or cloth next to
     other bodies used to scan thousands of its own nodes every rebuild.
