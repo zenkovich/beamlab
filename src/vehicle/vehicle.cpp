@@ -253,6 +253,7 @@ void Vehicle::reset(vec3 pos, float yaw_deg) {
         if (!w.ring) continue;
         const vec3 c = (b.nodes[w.axle0].p + b.nodes[w.axle1].p) * 0.5f;
         const float g = m_world ? ground_height_at(*m_world, c.x, c.z, top + 20.0f) : 0.0f;
+        if (getenv("BL_LIFTDBG")) fprintf(stderr, "lift: wheel at (%.3f %.3f %.3f) r %.3f ground %.3f -> lift %.3f\n", c.x, c.y, c.z, w.radius, g, g - (c.y - w.radius));
         lift = std::max(lift, g - (c.y - w.radius));
         w.spin = w.angle = 0;
         w.pinches = 0, w.crushed = false;

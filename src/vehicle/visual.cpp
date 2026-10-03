@@ -223,8 +223,17 @@ void VehicleVisual::build(const ror::Document& d, const SoftBody& b, std::vector
                 k++;
             }
         }
-        // (tools: BL_EXPORT_FLEX=dir writes each flexbody placed in definition space as dir/<n>_<mesh>.obj)
+        // (tools: BL_EXPORT_FLEX=dir writes each flexbody placed in definition space as dir/<n>_<mesh>.obj, and
+        // dir/vehicle.txt: every flexbody's and prop's placement - its line in the truck file, its mesh, its position
+        // and its orientation's three columns - the wheels (their axle's two ends, sizes, rim mesh, side, drive) and
+        // the mass: what tools/make_skin_car.py builds a FEM car under the same meshes from)
         if (const char* ex = getenv("BL_EXPORT_FLEX")) {
+            if (FILE* fv = fopen((std::string(ex) + "/vehicle.txt").c_str(), fi == 0 ? "w" : "a")) {
+                fprintf(fv, "flex %zu %d %s %.5f %.5f %.5f", fi, fb.line, fb.mesh.c_str(), pl.pos.x, pl.pos.y, pl.pos.z);
+                for (int c = 0; c < 3; c++) fprintf(fv, " %.6f %.6f %.6f", pl.orient.c[c].x, pl.orient.c[c].y, pl.orient.c[c].z);
+                fprintf(fv, "\n");
+                fclose(fv);
+            }
             FILE* fo = fopen((std::string(ex) + "/" + std::to_string(fi) + "_" + fb.mesh + ".obj").c_str(), "w");
             if (fo) {
                 for (size_t i = 0; i < total; i++) fprintf(fo, "v %.5f %.5f %.5f\n", wp[i].x, wp[i].y, wp[i].z);
@@ -308,6 +317,14 @@ void VehicleVisual::build(const ror::Document& d, const SoftBody& b, std::vector
         if (p.ref >= N || p.x >= N || p.y >= N) continue;
         const OgreMesh* om = mesh(p.mesh);
         if (!om) continue;
+        if (const char* ex = getenv("BL_EXPORT_FLEX"))
+            if (FILE* fv = fopen((std::string(ex) + "/vehicle.txt").c_str(), "a")) {
+                const Placement pl = place(nd[p.ref].p, nd[p.x].p, nd[p.y].p, p.offset, quat_euler_xyz_deg(p.rot.x, p.rot.y, p.rot.z));
+                fprintf(fv, "prop %zu %d %s %.5f %.5f %.5f", pi, p.line, p.mesh.c_str(), pl.pos.x, pl.pos.y, pl.pos.z);
+                for (int c = 0; c < 3; c++) fprintf(fv, " %.6f %.6f %.6f", pl.orient.c[c].x, pl.orient.c[c].y, pl.orient.c[c].z);
+                fprintf(fv, " %.4f %.4f %.4f %.4f %.4f %.4f\n", om->bounds.mn.x, om->bounds.mn.y, om->bounds.mn.z, om->bounds.mx.x, om->bounds.mx.y, om->bounds.mx.z);
+                fclose(fv);
+            }
         Rigid r;
         r.kind = Rigid::PROP;
         r.ref = p.ref;
@@ -371,6 +388,20 @@ void VehicleVisual::build(const ror::Document& d, const SoftBody& b, std::vector
         m_solids.push_back(std::move(s));
     }
     // ---- wheels
+    if (const char* ex = getenv("BL_EXPORT_FLEX"))
+        if (FILE* fv = fopen((std::string(ex) + "/vehicle.txt").c_str(), "a")) {
+            for (const Wheel& w : b.wheels) {
+                if (w.tag < 0 || w.tag >= (int)d.wheels.size()) continue;
+                const ror::WheelDef& wd = d.wheels[w.tag];
+                const vec3 p0 = nd[w.axle0].p, p1 = nd[w.axle1].p;
+                fprintf(fv, "wheel %.5f %.5f %.5f %.5f %.5f %.5f %.4f %.4f %.4f %d %d %c %s\n", p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, wd.radius, wd.rim_radius, w.width, w.propulsed, w.braked,
+                        wd.side, wd.rim_mesh.empty() ? "-" : wd.rim_mesh.c_str());
+            }
+            float mass = 0;
+            for (const Node& n : b.nodes) mass += n.mass;
+            fprintf(fv, "mass %.1f\nnodes %zu\n", mass, b.nodes.size());
+            fclose(fv);
+        }
     for (int wi = 0; wi < (int)b.wheels.size(); wi++) {
         const Wheel& w = b.wheels[wi];
         if (w.tag < 0 || w.tag >= (int)d.wheels.size()) continue;
