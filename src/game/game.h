@@ -120,6 +120,13 @@ public:
     void finish_terrain();
     void add_static_box(vec3 center, vec3 half, const quat& rot, uint8_t surface, MaterialPtr mat, bool render = true);
     void add_static_cylinder(vec3 base, float radius, float height, uint8_t surface, MaterialPtr mat);
+    // a mesh of the scene's own, in world space (drawn, nothing to collide with: a road's ribbon over the terrain, a
+    // building's walls round its static box)
+    void add_static_mesh(const std::vector<Vertex>& v, const std::vector<uint32_t>& idx, MaterialPtr mat);
+    // a mesh kept by someone else (a model of assets/models) drawn at `model`
+    void add_static_visual(const GpuMesh* mesh, MaterialPtr mat, const mat4& model) { m_static_visuals.push_back({mesh, mat, model}); }
+    // (before finish_terrain: the terrain's render mesh lowered per heightfield vertex - under a road's ribbon)
+    std::vector<float> terrain_drop;
     DynamicObject* add_object(std::unique_ptr<DynamicObject> o);
     void set_spawn(vec3 pos, float yaw_deg) {
         spawn_pos = pos;
@@ -223,6 +230,7 @@ private:
         mat4 model;
     };
     std::vector<StaticVisual> m_static_visuals;
+    std::vector<std::unique_ptr<GpuMesh>> m_static_meshes;
     InstanceCollector m_instances;
     Camera m_last_cam;
     std::unordered_map<const phys::SoftBody*, std::vector<int>> m_vol_hits; // (the debug view: each volume's contacts at the last frame)

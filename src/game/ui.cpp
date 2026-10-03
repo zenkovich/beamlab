@@ -508,8 +508,25 @@ void App::ui_main_menu() {
         const auto& sc = scene_registry()[std::max(0, m_game.scene_index)];
         ImGui::SeparatorText(sc.name.c_str());
         if (ImGui::MenuItem("Reload scene", "F5")) select_scene(m_game.scene_index);
-        for (const SceneAction& a : m_game.scene_actions)
-            if (ImGui::MenuItem(a.label.c_str())) a.run(m_game);
+        // (a label "Group/Item": the items of a group under a submenu of its name)
+        for (size_t i = 0; i < m_game.scene_actions.size();) {
+            const SceneAction& a = m_game.scene_actions[i];
+            const size_t slash = a.label.find('/');
+            if (slash == std::string::npos) {
+                if (ImGui::MenuItem(a.label.c_str())) a.run(m_game);
+                i++;
+                continue;
+            }
+            const std::string group = a.label.substr(0, slash);
+            size_t j = i;
+            while (j < m_game.scene_actions.size() && m_game.scene_actions[j].label.compare(0, slash + 1, group + "/") == 0) j++;
+            if (ImGui::BeginMenu(group.c_str())) {
+                for (size_t k = i; k < j; k++)
+                    if (ImGui::MenuItem(m_game.scene_actions[k].label.c_str() + slash + 1)) m_game.scene_actions[k].run(m_game);
+                ImGui::EndMenu();
+            }
+            i = j;
+        }
         if (sc.id == "vehicle_crash") {
             ImGui::SeparatorText("Crash setup");
             auto vehicle_combo = [&](const char* label, std::string& id) {

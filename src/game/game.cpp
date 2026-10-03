@@ -25,14 +25,7 @@ void Game::create_terrain(int nx, int nz, float cell, vec2 origin) {
 }
 
 float Game::ground_height(float x, float z) const {
-    const auto& st = world.statics;
-    float h = st.has_terrain ? st.terrain.height(x, z) : 0.0f;
-    if (h < -1e20f) h = 0.0f;
-    if (st.road) {
-        float s, lat;
-        if (st.road->locate(x, z, s, lat)) h += st.road->detail(s, lat);
-    }
-    return h;
+    return world.statics.ground_height(x, z);
 }
 
 void Game::finish_terrain() {
@@ -43,8 +36,17 @@ void Game::finish_terrain() {
         road_render = std::make_unique<RoadRender>();
         road_render->build(*world.statics.road, world.statics.terrain, make_road_material(world.statics.road->half_width, world.statics.road->edge));
     } else {
-        terrain_render.build(world.statics.terrain);
+        const bool drop = terrain_drop.size() == (size_t)world.statics.terrain.nx() * world.statics.terrain.nz();
+        terrain_render.build(world.statics.terrain, drop ? &terrain_drop : nullptr);
     }
+    terrain_drop.clear();
+}
+
+void Game::add_static_mesh(const std::vector<Vertex>& v, const std::vector<uint32_t>& idx, MaterialPtr mat) {
+    if (v.empty() || idx.empty() || !mat) return;
+    m_static_meshes.push_back(std::make_unique<GpuMesh>());
+    m_static_meshes.back()->create(v, idx, false);
+    m_static_visuals.push_back({m_static_meshes.back().get(), mat, mat4()});
 }
 
 void Game::add_static_box(vec3 center, vec3 half, const quat& rot, uint8_t surface, MaterialPtr mat, bool render) {
@@ -129,6 +131,8 @@ void Game::load_scene(int index) {
     player = -1;
     objects.clear();
     m_static_visuals.clear();
+    m_static_meshes.clear();
+    terrain_drop.clear();
     world.clear();
     world.statics = phys::StaticWorld();
     // a piece cracked off a sheet becomes its own object with the sheet's look
