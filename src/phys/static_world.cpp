@@ -245,6 +245,56 @@ void StaticBox::update_aabb() {
     aabb.mx = center + e;
 }
 
+void PavedLayer::create(vec2 origin, vec2 size, float cell) {
+    clear();
+    m_origin = origin, m_cell = cell;
+    m_nx = (int)std::ceil(size.x / cell) + 1, m_nz = (int)std::ceil(size.y / cell) + 1;
+    m_tx = (m_nx + kTile - 1) >> kTileShift, m_tz = (m_nz + kTile - 1) >> kTileShift;
+    m_tile_of.assign((size_t)m_tx * m_tz, -1);
+}
+
+void PavedLayer::set(int ix, int iz, float dh, uint8_t surface) {
+    if (ix < 0 || iz < 0 || ix >= m_nx || iz >= m_nz) return;
+    int& t = m_tile_of[(size_t)(iz >> kTileShift) * m_tx + (ix >> kTileShift)];
+    if (t < 0) {
+        t = (int)(m_dh.size() >> (2 * kTileShift));
+        m_dh.resize(m_dh.size() + (size_t)kTile * kTile, 0.0f);
+        m_surf.resize(m_surf.size() + (size_t)kTile * kTile, kNone);
+    }
+    const size_t k = ((size_t)t << (2 * kTileShift)) + ((size_t)(iz & (kTile - 1)) << kTileShift) + (ix & (kTile - 1));
+    m_dh[k] = dh, m_surf[k] = surface;
+    max_raise = std::max(max_raise, dh);
+}
+
+bool PavedLayer::sample(float x, float z, float& dh_out, vec2& grad, uint8_t& surface) const {
+    const float fx = (x - m_origin.x) / m_cell, fz = (z - m_origin.y) / m_cell;
+    const int ix = (int)std::floor(fx), iz = (int)std::floor(fz);
+    if (ix < 0 || iz < 0 || ix + 1 >= m_nx || iz + 1 >= m_nz) return false;
+    const float u = fx - (float)ix, v = fz - (float)iz;
+    surface = surf(ix + (u > 0.5f), iz + (v > 0.5f));
+    if (surface == kNone) return false;
+    const float h00 = dh(ix, iz), h10 = dh(ix + 1, iz), h01 = dh(ix, iz + 1), h11 = dh(ix + 1, iz + 1);
+    dh_out = lerpf(lerpf(h00, h10, u), lerpf(h01, h11, u), v);
+    grad = vec2(lerpf(h10 - h00, h11 - h01, v), lerpf(h01 - h00, h11 - h10, u)) * (1.0f / m_cell);
+    return true;
+}
+
+float StaticWorld::ground_height(float x, float z) const {
+    float h = has_terrain ? terrain.height(x, z) : 0.0f;
+    if (h < -1e20f) h = 0.0f;
+    if (road) {
+        float s, lat;
+        if (road->locate(x, z, s, lat)) h += road->detail(s, lat);
+    }
+    if (!paved.empty()) {
+        float dh;
+        vec2 g;
+        uint8_t sf;
+        if (paved.sample(x, z, dh, g, sf)) h += dh;
+    }
+    return h;
+}
+
 void StaticWorld::add_box(vec3 center, vec3 half, const quat& rot, uint8_t surface) {
     StaticBox b;
     b.center = center;
@@ -332,6 +382,17 @@ bool StaticWorld::collide_point(vec3 p, float r, const int* box_ids, int nbox, c
                     if (std::fabs(lat) < road->half_width + 0.3f) surf = road->surface;
                 }
             }
+            if (!paved.empty()) {
+                float dh;
+                vec2 g;
+                uint8_t sf;
+                if (paved.sample(p.x, p.z, dh, g, sf)) {
+                    const float hx = -n.x / n.y + g.x, hz = -n.z / n.y + g.y;
+                    th += dh;
+                    n = normalize(vec3(-hx, 1.0f, -hz));
+                    surf = sf;
+                }
+            }
             float d = (th - p.y) * n.y + r;
             if (d > 0) {
                 out.depth = d;
@@ -350,7 +411,23 @@ bool StaticWorld::collide_point(vec3 p, float r, const int* box_ids, int nbox, c
         float dist2 = dot(d, d);
         float depth;
         vec3 nl;
-        if (dist2 > 1e-12f) {
+        if (!b.planes.empty()) { // (a hull: the box and its planes - the signed distance the larger of the two's)
+            float sd;
+            if (dist2 > 1e-12f) {
+                sd = std::sqrt(dist2), nl = d / sd;
+            } else {
+                const vec3 pen = b.half - vabs(l);
+                if (pen.x <= pen.y && pen.x <= pen.z) sd = -pen.x, nl = vec3(signf(l.x), 0, 0);
+                else if (pen.y <= pen.z) sd = -pen.y, nl = vec3(0, signf(l.y), 0);
+                else sd = -pen.z, nl = vec3(0, 0, signf(l.z));
+            }
+            for (const vec4& pl : b.planes) {
+                const float s = pl.x * l.x + pl.y * l.y + pl.z * l.z - pl.w;
+                if (s > sd) sd = s, nl = vec3(pl.x, pl.y, pl.z);
+            }
+            if (sd >= r) continue;
+            depth = r - sd;
+        } else if (dist2 > 1e-12f) {
             if (dist2 >= r * r) continue;
             float dist = std::sqrt(dist2);
             depth = r - dist;

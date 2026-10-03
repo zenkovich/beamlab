@@ -118,6 +118,9 @@ struct StaticBox {
     vec3 half;
     uint8_t surface = SURF_CONCRETE;
     float max_force = 0; // > 0: yields (bushes, bendable trees): the contact force per node is capped, a car pushes through
+    // a convex hull inside the box: planes in its frame (n . p <= d inside) cut it down - a boulder, a kerb's bevel;
+    // none: the box itself
+    std::vector<vec4> planes;
     AABB aabb;
     void update_aabb();
 };
@@ -126,6 +129,47 @@ struct StaticCylinder { // vertical
     vec3 base;
     float radius, height;
     uint8_t surface = SURF_CONCRETE;
+};
+
+// Paved ground: a fine layer over the terrain where it is laid - roads, pads - the terrain itself stays earth and
+// grass. Per cell (0.25 m) the height over the terrain's (the road's own shape: its crown, waves, dips, patches,
+// potholes, kerbs) and the surface; in tiles of 64 x 64 cells made where it is set. The contacts and the roads' render
+// meshes sample the same grid.
+class PavedLayer {
+public:
+    static constexpr int kTileShift = 6, kTile = 1 << kTileShift;
+    static constexpr uint8_t kNone = 0xff;
+    void create(vec2 origin, vec2 size, float cell = 0.25f);
+    void clear() { m_tile_of.clear(), m_dh.clear(), m_surf.clear(), m_nx = m_nz = 0, max_raise = 0; }
+    bool empty() const { return m_dh.empty(); }
+    float cell() const { return m_cell; }
+    vec2 origin() const { return m_origin; }
+    int nx() const { return m_nx; }
+    int nz() const { return m_nz; }
+    void set(int ix, int iz, float dh, uint8_t surface);
+    float dh(int ix, int iz) const {
+        const int t = tile(ix, iz);
+        return t < 0 ? 0.0f : m_dh[((size_t)t << (2 * kTileShift)) + ((size_t)(iz & (kTile - 1)) << kTileShift) + (ix & (kTile - 1))];
+    }
+    uint8_t surf(int ix, int iz) const {
+        const int t = tile(ix, iz);
+        return t < 0 ? kNone : m_surf[((size_t)t << (2 * kTileShift)) + ((size_t)(iz & (kTile - 1)) << kTileShift) + (ix & (kTile - 1))];
+    }
+    // the height over the terrain and its slope at (x, z), the surface there; false off the paving
+    bool sample(float x, float z, float& dh, vec2& grad, uint8_t& surface) const;
+    float max_raise = 0; // (the most it stands over the terrain: the contacts' culling margin)
+
+private:
+    int tile(int ix, int iz) const {
+        if (ix < 0 || iz < 0 || ix >= m_nx || iz >= m_nz) return -1;
+        return m_tile_of[(size_t)(iz >> kTileShift) * m_tx + (ix >> kTileShift)];
+    }
+    vec2 m_origin;
+    float m_cell = 0.25f;
+    int m_nx = 0, m_nz = 0, m_tx = 0, m_tz = 0;
+    std::vector<int> m_tile_of;
+    std::vector<float> m_dh;
+    std::vector<uint8_t> m_surf;
 };
 
 struct ContactInfo {
@@ -142,6 +186,9 @@ public:
     std::vector<StaticBox> boxes;
     std::vector<StaticCylinder> cylinders;
     std::shared_ptr<RoadSurface> road; // detailed road over the terrain (optional)
+    PavedLayer paved;                  // paved ground over the terrain (optional)
+    // the ground's height at (x, z): the terrain's with the road's detail and the paving
+    float ground_height(float x, float z) const;
     float kill_y = -200.0f; // nodes below are frozen (fell off the world)
 
     void add_box(vec3 center, vec3 half, const quat& rot, uint8_t surface);

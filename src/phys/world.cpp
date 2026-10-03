@@ -721,7 +721,7 @@ void World::build_islands(float frame_time) {
             isl.cyl_ids[k].clear();
             statics.query(a, isl.box_ids[k], isl.cyl_ids[k]);
             isl.terrain_max[k] = statics.has_terrain ? statics.terrain.max_height(a.mn.x, a.mn.z, a.mx.x, a.mx.z) +
-                                                           (statics.road ? statics.road->max_raise : 0.0f)
+                                                           (statics.road ? statics.road->max_raise : 0.0f) + statics.paved.max_raise
                                                      : -1e30f;
         }
         if (w != i) std::swap(m_islands[w], m_islands[i]);
