@@ -191,6 +191,24 @@ void Renderer::bind_material(Shader& s, const Material* m) {
     s.set("u_blend", m->blend ? 1.0f : 0.0f);
     s.set("u_emissive", m->emissive);
     s.set("u_unlit", m->unlit ? 1.0f : 0.0f);
+    const bool pbr = !m->vertex_color && (m->normal_map || m->rough_map || m->ao_map);
+    s.set("u_pbr", pbr ? 1.0f : 0.0f);
+    if (pbr) {
+        TextureCache& tc = TextureCache::get();
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, (m->normal_map ? m->normal_map : tc.flat_normal())->id);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, (m->rough_map ? m->rough_map : tc.white())->id);
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D, (m->ao_map ? m->ao_map : tc.white())->id);
+        glActiveTexture(GL_TEXTURE0);
+        s.set("u_normal_map", 2);
+        s.set("u_rough_map", 3);
+        s.set("u_ao_map", 4);
+        s.set("u_roughness", m->roughness);
+        s.set("u_arm", m->arm ? 1.0f : 0.0f);
+        s.set("u_normal_strength", m->normal_strength);
+    }
     if (m->vertex_color) {
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, m->diffuse2 ? m->diffuse2->id : t->id);
@@ -389,6 +407,20 @@ void Renderer::render() {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, m_terrain_splat);
             m_terrain.set("u_splat", 0);
+            const bool detail = terrain_grass && terrain_dirt && terrain_grass->diffuse && terrain_dirt->diffuse;
+            if (detail) {
+                TextureCache& tc = TextureCache::get();
+                const GLuint ids[4] = {terrain_grass->diffuse->id, (terrain_grass->normal_map ? terrain_grass->normal_map : tc.flat_normal())->id, terrain_dirt->diffuse->id,
+                                       (terrain_dirt->normal_map ? terrain_dirt->normal_map : tc.flat_normal())->id};
+                const char* names[4] = {"u_grass", "u_grass_normal", "u_dirt", "u_dirt_normal"};
+                for (int k = 0; k < 4; k++) {
+                    glActiveTexture(GL_TEXTURE6 + k);
+                    glBindTexture(GL_TEXTURE_2D, ids[k]);
+                    m_terrain.set(names[k], 6 + k);
+                }
+                glActiveTexture(GL_TEXTURE0);
+            }
+            m_terrain.set("u_has_detail", detail ? 1 : 0);
             m_terrain_mesh->draw();
             m_draw_calls++;
             m_tris += m_terrain_mesh->index_count() / 3;
@@ -417,6 +449,14 @@ void Renderer::render() {
             set_common_uniforms(m_sky);
             m_sky.set("u_inv_viewproj", inverse(m_cam.viewproj));
             m_sky.set("u_clouds", sky_clouds ? 1.0f : 0.0f);
+            m_sky.set("u_panorama_on", m_light.sky_panorama ? 1.0f : 0.0f);
+            if (m_light.sky_panorama) {
+                glActiveTexture(GL_TEXTURE5);
+                glBindTexture(GL_TEXTURE_2D, m_light.sky_panorama->id);
+                glActiveTexture(GL_TEXTURE0);
+                m_sky.set("u_panorama", 5);
+                m_sky.set("u_sky_yaw", m_light.sky_yaw);
+            }
             glBindVertexArray(m_empty_vao);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             m_draw_calls++;

@@ -2,11 +2,24 @@
 in vec2 v_ndc;
 uniform mat4 u_inv_viewproj;
 uniform float u_clouds; // 0: a plain gradient (the model editor)
+uniform float u_panorama_on;
+uniform sampler2D u_panorama; // an equirectangular sky (tonemapped sRGB)
+uniform float u_sky_yaw;
 out vec4 frag;
 void main() {
     vec4 a = u_inv_viewproj * vec4(v_ndc, -1.0, 1.0);
     vec4 b = u_inv_viewproj * vec4(v_ndc, 1.0, 1.0);
     vec3 dir = normalize(b.xyz / b.w - a.xyz / a.w);
+    if (u_panorama_on > 0.5) {
+        float az = atan(dir.z, dir.x) + u_sky_yaw;
+        vec2 uv = vec2(az / 6.2831853 + 0.5, acos(clamp(dir.y, -1.0, 1.0)) / 3.14159265);
+        // (the seam at +-pi: the derivatives taken off the continuous direction)
+        vec3 c = textureGrad(u_panorama, uv, vec2(length(dFdx(dir)) / 6.2831853, 0.0), vec2(0.0, length(dFdy(dir)) / 3.14159265)).rgb;
+        // (below the horizon the ground's colour: the terrain's far edge meets it)
+        c = mix(c, pow(u_fog_color, vec3(1.0 / 2.2)), smoothstep(0.0, -0.08, dir.y));
+        frag = vec4(c, 1.0);
+        return;
+    }
     vec3 col = sky_radiance(dir);
     // soft procedural clouds
     if (dir.y > 0.0 && u_clouds > 0.5) {

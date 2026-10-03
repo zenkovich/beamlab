@@ -1,4 +1,5 @@
 #include "game/app.h"
+#include "world/static_model.h"
 #include "phys/cache_sim.h"
 #include "core/jobs.h"
 #include "core/profiler.h"
@@ -78,6 +79,9 @@ bool App::init(const AppOptions& opt) {
 
     if (!m_renderer.init()) return false;
     if (!m_game.init()) return false;
+    // (the terrain's ground materials: assets/textures, tools/fetch_assets.py; without them the shader's noise)
+    m_renderer.terrain_grass = pbr_material("grass");
+    m_renderer.terrain_dirt = pbr_material("dirt");
     register_metrics();
 
     // initial scene / vehicle
@@ -331,12 +335,7 @@ void App::apply_camera_preset(const std::string& p) {
         if (sscanf(p.c_str() + 6, "%f,%f,%f,%f,%f,%f", &e.x, &e.z, &e.y, &t.x, &t.z, &t.y) == 6) {
             const auto& st = m_game.world.statics;
             auto gh = [&](float x, float z) {
-                float h = st.has_terrain ? st.terrain.height(x, z) : 0.0f;
-                if (st.road) {
-                    float s, lat;
-                    if (st.road->locate(x, z, s, lat)) h += st.road->detail(s, lat);
-                }
-                return h > -1e20f ? h : 0.0f;
+                return st.ground_height(x, z);
             };
             e.y += gh(e.x, e.z);
             t.y += gh(t.x, t.z);

@@ -19,3 +19,7 @@ assets/vehicles/editor/1998_mercedes_benz_clk_200_elegance.truck
 assets/vehicles/editor/seat_ibiza_2_0l_gti.truck
 # the editor's copies saved next to the project's own vehicles
 assets/vehicles/*/*_edited.truck
+
+# open assets (CC0: ambientCG textures, Poly Haven models and sky), downloaded by tools/fetch_assets.py
+assets/textures/
+assets/models/

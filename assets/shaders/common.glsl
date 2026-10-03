@@ -80,6 +80,29 @@ vec3 shade(vec3 albedo, vec3 N, vec3 wpos, float spec, float gloss, float reflec
     return col;
 }
 
+// A surface lit by its roughness: Lambert, GGX for the sun, the sky's light off it by its Fresnel (dielectric, F0 0.04).
+vec3 shade_pbr(vec3 albedo, vec3 N, vec3 wpos, float rough, float ao) {
+    vec3 V = normalize(u_cam_pos - wpos);
+    vec3 L = u_sun_dir;
+    float ndl = max(dot(N, L), 0.0), ndv = max(dot(N, V), 1e-3);
+    float sh = ndl > 0.0 ? shadow_factor(wpos, N) : 0.0;
+    vec3 H = normalize(L + V);
+    float ndh = max(dot(N, H), 0.0), vdh = max(dot(V, H), 0.0);
+    float a = max(rough * rough, 0.02), a2 = a * a;
+    float d = ndh * ndh * (a2 - 1.0) + 1.0;
+    float D = a2 / (3.14159 * d * d);
+    float k = (rough + 1.0) * (rough + 1.0) / 8.0;
+    float G = (ndl / (ndl * (1.0 - k) + k)) * (ndv / (ndv * (1.0 - k) + k));
+    float F = 0.04 + 0.96 * pow(1.0 - vdh, 5.0);
+    float spec = min(D * G * F / max(4.0 * ndl * ndv, 1e-3), 8.0);
+    vec3 ambient = mix(u_ground_color, u_sky_color, N.y * 0.5 + 0.5) * ao;
+    vec3 col = albedo * (ambient * 0.9 + u_sun_color * ndl * sh) + u_sun_color * (spec * ndl * sh);
+    // the sky in it: sharper and stronger the smoother it is, at grazing angles
+    float fres = 0.04 + (max(1.0 - rough, 0.04) - 0.04) * pow(1.0 - ndv, 5.0);
+    col = mix(col, sky_radiance(reflect(-V, N)) * ao, fres * (1.0 - rough * 0.6));
+    return col;
+}
+
 vec3 apply_fog(vec3 col, vec3 wpos) {
     float d = distance(wpos, u_cam_pos);
     float f = 1.0 - exp(-d * u_fog_density);

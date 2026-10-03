@@ -13,6 +13,13 @@ namespace bl {
 
 struct Material {
     TexturePtr diffuse;
+    // (PBR maps, any of them: a tangent-space normal map (OpenGL's: +y up), a roughness map (its red), an ambient
+    // occlusion map; with one of them the surface is lit by its roughness - GGX and the sky's reflection - instead of
+    // specular and gloss; `roughness` multiplies the map, `detail_scale` > 0 tiles the normal map that many times a uv)
+    TexturePtr normal_map, rough_map, ao_map;
+    float roughness = 1.0f;
+    float normal_strength = 1.0f;
+    bool arm = false;          // (rough_map is an ARM texture: occlusion in its red, roughness in its green)
     TexturePtr diffuse2;       // vertex_color only: second layer (uv2), blended over the first by its alpha
     bool vertex_color = false; // mesh built from VertexC: albedo *= vertex colour (baked lighting)
     vec4 color{1, 1, 1, 1};
@@ -55,6 +62,10 @@ struct LightSettings {
     float fog_density = 0.0011f;
     float exposure = 0.9f;
     bool shadows = true;
+    // the sky as a picture: an equirectangular panorama (tonemapped, sRGB) turned by sky_yaw about the vertical (rad);
+    // none: the gradient and the procedural clouds
+    TexturePtr sky_panorama;
+    float sky_yaw = 0;
 };
 
 class Renderer {
@@ -65,6 +76,9 @@ public:
     void draw_mesh(const GpuMesh* mesh, const Material* mat, const mat4& model, int first = 0, int count = -1);
     void draw_instanced(const InstanceBatch* batch, const Material* mat, bool wind = false);
     void draw_terrain(const GpuMesh* mesh, GLuint splat_tex);
+    // the terrain's ground: tiled grass and earth materials (colour, normal map), the splat their tint; none: the
+    // shader's noise over the splat as before
+    MaterialPtr terrain_grass, terrain_dirt;
 
     // Debug primitives (world space).
     void line(vec3 a, vec3 b, uint32_t color);
