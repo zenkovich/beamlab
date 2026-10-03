@@ -1781,6 +1781,7 @@ void frame_car_stunt(Game& g, vec3 pos, float yaw, float lift, const quat& turn,
     for (Node& n : b.nodes)
         if (n.inv_mass > 0) n.v += cross(w, n.p - c2);
     for (vec3& x : b.fem.w) x += w;
+    b.seat_wheels(); // (the ring tyres' wheels turning with it)
     b.wake();
 }
 

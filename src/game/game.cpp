@@ -346,30 +346,35 @@ void Game::draw_debug(Renderer& r) {
     }
     const float cull2 = 120.0f * 120.0f;
     const bool labels = debug.labels && (debug.beams || debug.wheels || debug.volumes);
-    // a ring tyre (Wheel::ring): its rim (steel blue, the rigid disc; five spokes turn with it), its tread's three rows of
-    // points as the physics has them - pressed in towards the axle and sheared along the ground - white, orange to red
-    // as far as they are pressed in (of the sidewall's height), the ring as it would be unpressed faint over the patch,
-    // the sidewalls from the rim to the tread; the patch's points and their shear (x10, green); its load and slip
+    // a ring tyre (Wheel::ring): its wheel's own pose - its rim (steel blue, the rigid disc; five spokes turn with it), its
+    // bearings on the axle nodes (yellow: the axle, the wheel's axle through them) - its tread's rows of points as the
+    // physics has them - pressed in towards the axle, shifted on the rim and sheared along the ground - white, orange to
+    // red as far as they are pressed in (of the sidewall's height), the ring as it would be unpressed faint over the
+    // patch, each sidewall from the rim to the tread coloured by its own side's pressing-in (magenta: folded over); the
+    // patch's points and their shift and shear (x10, green); its load and slip
     auto ring_tyre = [&](const phys::SoftBody& b, const phys::Wheel& w) {
-        const vec3 a0 = b.nodes[w.axle0].p, a1 = b.nodes[w.axle1].p, c = (a0 + a1) * 0.5f, ax = normalize_or(a1 - a0, vec3(0, 0, 1));
-        vec3 e1 = w.ref - ax * dot(w.ref, ax);
-        e1 = normalize_or(e1, normalize(any_perpendicular(ax)));
-        const vec3 e2 = cross(ax, e1);
+        const vec3 a0 = b.nodes[w.axle0].p, a1 = b.nodes[w.axle1].p;
+        const mat3 Rw = to_mat3(w.rot);
+        const vec3 c = w.pos, ax = Rw.c[0], e1 = Rw.c[1], e2 = Rw.c[2];
         const float R = w.radius, W = w.width, rim = std::min(w.rim_radius, 0.95f * R), wall = std::max(0.01f, R - rim);
         const int NP = (int)w.squash.size(), N = NP > 0 ? NP : std::max(8, w.ring_n);
+        const bool sides = NP > 0 && (int)w.side_sq.size() == 2 * NP && (int)w.fold.size() == 2 * NP;
         auto dir = [&](int i) {
-            const float th = w.angle + 2.0f * kPi * (float)i / (float)N;
+            const float th = 2.0f * kPi * (float)i / (float)N;
             return e1 * std::cos(th) + e2 * std::sin(th);
         };
         auto sq = [&](int i) { return NP > 0 ? w.squash[i % N] : 0.0f; };
+        auto sqs = [&](int i, int sd) { return sides ? w.side_sq[2 * (i % N) + sd] : sq(i); };
+        auto fold = [&](int i, int sd) { return sides ? w.fold[2 * (i % N) + sd] : 0.0f; };
         auto sh = [&](int i) { return NP > 0 && (int)w.shift.size() == NP ? w.shift[i % N] : vec3(0); };
-        auto tread = [&](int i, float lat) { return c + ax * lat + dir(i) * (R - sq(i)) + sh(i); };
+        auto tread = [&](int i, float lat) { return c + ax * lat + dir(i) * (R - std::min(wall, sqs(i, lat < 0 ? 0 : 1))) + sh(i); };
         auto press_col = [&](float s, float a) {
             const float u = clampf(s / wall, 0, 1);
             return s > 1e-4f ? Renderer::rgba(1.0f, 0.62f - 0.5f * u, 0.15f, a) : Renderer::rgba(0.88f, 0.9f, 0.92f, 0.75f * a);
         };
         const uint32_t steel = Renderer::rgba(0.55f, 0.72f, 1.0f);
         r.line(a0, a1, Renderer::rgba(1, 1, 0));
+        r.line(c - ax * w.bearing_half, c + ax * w.bearing_half, Renderer::rgba(1, 0.8f, 0.2f));
         for (int side = 0; side < 2; side++) {
             const vec3 face = c + ax * ((side ? 0.46f : -0.46f) * W);
             for (int i = 0; i < N; i++) r.thick_line(face + dir(i) * rim, face + dir(i + 1) * rim, steel, 2.0f);
@@ -378,16 +383,18 @@ void Game::draw_debug(Renderer& r) {
         constexpr int kRows = phys::Wheel::kRingRows;
         for (int j = 0; j < kRows; j++) {
             const float lat = ((float)j - 0.5f * (kRows - 1)) * W / (float)kRows;
+            const int sd = lat < 0 ? 0 : 1;
             for (int i = 0; i < N; i++) {
-                const float s = std::max(sq(i), sq(i + 1));
+                const float s = std::max(sqs(i, sd), sqs(i + 1, sd));
                 r.thick_line(tread(i, lat), tread(i + 1, lat), press_col(s, 1.0f), s > 1e-4f ? 2.5f : 1.5f);
-                if (j == kRows / 2 && s > 1e-4f) r.line(c + dir(i) * R, c + dir(i + 1) * R, Renderer::rgba(1, 1, 1, 0.3f));
+                if (j == kRows / 2 && std::max(sq(i), sq(i + 1)) > 1e-4f) r.line(c + dir(i) * R, c + dir(i + 1) * R, Renderer::rgba(1, 1, 1, 0.3f));
             }
         }
-        for (int i = 0; i < N; i += 2) // (the sidewalls: the physics' points on every other one)
+        for (int i = 0; i < N; i += 2) // (the sidewalls: one each side on every other point)
             for (int side = 0; side < 2; side++) {
                 const float f = side ? 1.0f : -1.0f;
-                r.line(c + ax * (0.46f * f * W) + dir(i) * rim, tread(i, f * W / (float)kRows), press_col(sq(i), 0.55f));
+                const uint32_t col = fold(i, side) > 0.5f ? Renderer::rgba(1.0f, 0.2f, 0.9f) : press_col(sqs(i, side), 0.55f);
+                r.line(c + ax * (0.46f * f * W) + dir(i) * rim, tread(i, f * 0.375f * W), col);
             }
         vec3 patch(0);
         int np = 0;
@@ -400,13 +407,13 @@ void Game::draw_debug(Renderer& r) {
         }
         if (np > 0) r.line(patch / (float)np, patch / (float)np + vec3(0, 1, 0) * std::min(1.0f, w.load * 1e-4f), Renderer::rgba(1.0f, 0.4f, 0.3f));
         if (labels) {
-            const vec3 vc = (b.nodes[w.axle0].v + b.nodes[w.axle1].v) * 0.5f, f = normalize_or(cross(ax, vec3(0, 1, 0)), vec3(1, 0, 0)); // (rolling: vc = spin R f)
+            const vec3 vc = w.vel, f = normalize_or(cross(ax, vec3(0, 1, 0)), vec3(1, 0, 0)); // (rolling: vc = spin R f)
             const float vx = dot(vc, f), vt = w.spin * R;
-            char t[64];
+            char t[96];
             if (std::fabs(vx) > 0.5f || std::fabs(vt) > 0.5f)
-                snprintf(t, sizeof(t), "%.1f kN  slip %+.0f%%", w.load * 1e-3f, 100.0f * (vt - vx) / std::max(std::fabs(vx), 1.0f));
+                snprintf(t, sizeof(t), "%.1f kN  slip %+.0f%%  side %.0f mm", w.load * 1e-3f, 100.0f * (vt - vx) / std::max(std::fabs(vx), 1.0f), w.lat_most * 1e3f);
             else
-                snprintf(t, sizeof(t), "%.1f kN", w.load * 1e-3f);
+                snprintf(t, sizeof(t), "%.1f kN  side %.0f mm", w.load * 1e-3f, w.lat_most * 1e3f);
             debug_labels.push_back({c + vec3(0, R + 0.12f, 0), t, vec4(1.0f, 0.85f, 0.5f, 1)});
         }
     };

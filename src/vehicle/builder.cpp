@@ -143,7 +143,6 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
 
     // ---- wheels: generate nodes + beams
     body.wheels.clear();
-    std::vector<float> ring_mass(N, 0.0f); // (the ring tyres' mass on their axle nodes)
     for (const auto& w : d.wheels) {
         int A = w.n1, B = w.n2;
         if (A < 0 || B < 0 || A >= N || B >= N) continue;
@@ -164,21 +163,27 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
         if (w.arm >= 0 && w.arm < N) wh.near_attach = length2(pos[w.arm] - pos[A]) < length2(pos[w.arm] - pos[B]) ? A : B;
         float node_fric = w.nd.friction > 0 ? w.nd.friction : 1.0f;
         if (w.type == ror::WheelDef::RINGWHEELS) {
-            // a ring tyre (phys::Wheel::ring): no nodes of its own, its mass on the axle nodes; its stiffness given as the
-            // tyre's pressed 2 cm into the flat (its patch then 2 sqrt(2 R 0.02) long), per area of the tyre
+            // a ring tyre (phys::Wheel::ring): no nodes of its own - a wheel body of its own mass on bearings at the axle
+            // nodes (their distance apart as built); its stiffness given as the tyre's pressed 2 cm into the flat (its
+            // patch then 2 sqrt(2 R 0.02) long), per area of the tyre; its belt on the sidewalls across and along the
+            // tread from that (0.8 and 1 of it: 160 and 200 kN/m on 200 kN/m - a road tyre's 0.3 m relaxation
+            // length on the brush's cornering stiffness), their damping a 2 ms lag
             wh.ring = true;
             wh.type = Wheel::W_RING;
             wh.width = w.width > 0 ? w.width : wh.width;
-            wh.mass = w.mass;
-            wh.inertia = std::max(0.05f, 0.5f * w.mass * w.radius * w.radius);
+            wh.mass = std::max(1.0f, w.mass);
+            wh.inertia = std::max(0.05f, 0.5f * wh.mass * w.radius * w.radius);
+            wh.inertia_t = 0.5f * wh.inertia + wh.mass * wh.width * wh.width / 12.0f;
+            wh.bearing_half = 0.5f * length(pos[B] - pos[A]);
             wh.grip = w.grip > 0 ? w.grip : 1.0f;
             const float patch = (4.0f / 3.0f) * wh.width * std::sqrt(2.0f * w.radius * 0.02f);
             wh.k_area = (w.spring > 0 ? w.spring : 2.0e5f) / patch;
             wh.c_area = (w.damp > 0 ? w.damp : 500.0f) / patch;
             wh.k_shear = 1.5f * wh.k_area;
             wh.c_shear = 2.5f * wh.c_area;
+            wh.k_lat = 0.8f * wh.k_area * patch, wh.c_lat = 0.002f * wh.k_lat;
+            wh.k_long = wh.k_area * patch, wh.c_long = 0.002f * wh.k_long;
             wh.ref = ogre_perpendicular(axis);
-            ring_mass[A] += 0.5f * w.mass, ring_mass[B] += 0.5f * w.mass;
             body.wheels.push_back(std::move(wh));
             continue;
         }
@@ -571,7 +576,6 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
         const bool frame_only = frame_node[i] && !plain_node[i];
         if (!frame_only && !(d.minimass_skip_loaded && loaded[i]) && mass[i] < minimass[i]) mass[i] = minimass[i];
         if (mass[i] <= 0) mass[i] = 1.0f;
-        mass[i] += ring_mass[i];
     }
 
     // ---- collision cabs / contact flags
@@ -637,6 +641,7 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
         }
     }
     for (auto& w : body.wheels) {
+        if (w.ring) continue; // (its wheel body's own mass)
         w.mass = 0;
         for (uint32_t ni : w.nodes) w.mass += body.nodes[ni].mass;
         // contact radius of the tread nodes ~1.5x the sag of the polygon chord: the patch always has 2-3 nodes
@@ -836,6 +841,8 @@ bool VehicleBuilder::build(const ror::Document& d, SoftBody& body, Drivetrain& d
     body.collision_radius = d.collision_range > 0 ? std::max(0.03f, d.collision_range) : 0.05f;
     body.force.resize(body.nodes.size());
     body.compute_aabb();
+    for (Wheel& w : body.wheels) w.seated = false;
+    body.seat_wheels(); // (the ring tyres' wheels on their hubs)
     return true;
 }
 

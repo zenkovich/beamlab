@@ -168,6 +168,7 @@ int SoftBody::stabilize(float dt, float k_budget, float d_budget) {
 float SoftBody::total_mass() const {
     float m = 0;
     for (auto& n : nodes) m += n.mass;
+    for (const Wheel& w : wheels) m += w.ring ? w.mass : 0.0f; // (a ring tyre's wheel: a body of its own)
     return m;
 }
 
@@ -276,6 +277,7 @@ void SoftBody::compute_aabb() {
 void SoftBody::translate(vec3 d) {
     for (auto& n : nodes) n.p += d;
     compute_aabb();
+    seat_wheels();
 }
 
 void SoftBody::set_velocity(vec3 v) {
@@ -283,6 +285,32 @@ void SoftBody::set_velocity(vec3 v) {
         if (n.inv_mass > 0) n.v = v;
     for (auto& f : frames) f.w = vec3(0);
     fem.stop();
+    seat_wheels();
+}
+
+void SoftBody::seat_wheels() {
+    for (Wheel& w : wheels) seat_wheel(w);
+}
+
+void SoftBody::seat_wheel(Wheel& w) {
+    if (!w.ring || w.axle0 >= nodes.size() || w.axle1 >= nodes.size()) return;
+    const Node &n0 = nodes[w.axle0], &n1 = nodes[w.axle1];
+    const vec3 d = n1.p - n0.p;
+    const float L = length(d);
+    if (!(L > 1e-4f)) return;
+    const vec3 a = d / L;
+    if (!(w.bearing_half > 0)) w.bearing_half = 0.5f * L;
+    // (its turn about the axle kept: its frame's y, before it is placed the reference)
+    const vec3 y0 = w.seated ? w.rot.rotate(vec3(0, 1, 0)) : w.ref;
+    vec3 e1 = y0 - a * dot(y0, a);
+    e1 = length2(e1) > 1e-8f ? normalize(e1) : normalize(any_perpendicular(a));
+    w.rot = normalize(from_mat3(mat3(a, e1, cross(a, e1))));
+    w.ref = e1, w.angle = 0;
+    w.pos = (n0.p + n1.p) * 0.5f;
+    w.vel = (n0.v + n1.v) * 0.5f;
+    // (turning as its axle turns across itself, spinning about it)
+    w.mom = w.momentum(cross(d, n1.v - n0.v) / (L * L) + a * w.spin);
+    w.seated = true;
 }
 
 void SoftBody::transform(const quat& r, vec3 pivot, vec3 t) {
@@ -296,6 +324,7 @@ void SoftBody::transform(const quat& r, vec3 pivot, vec3 t) {
     }
     fem.rotate(r);
     compute_aabb();
+    seat_wheels();
 }
 
 void SoftBody::clear_forces(vec3 g) {

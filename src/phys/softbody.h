@@ -474,7 +474,7 @@ struct Wheel {
     int propulsed = 0;              // 0 none, 1 forward, 2 backward
     int arm = -1;                   // reference arm node (reaction torque)
     int near_attach = -1;           // axle node closest to the arm node
-    float mass = 0;                 // sum of tyre node masses
+    float mass = 0;                 // sum of tyre node masses (a ring tyre: its wheel body's mass, kg)
     // per-substep inputs (set by the vehicle controller)
     float torque = 0;               // drive torque from the differentials (N m)
     float drive_torque = 0;         // (the drivetrain's torque for the whole substep: held for its later short steps)
@@ -488,26 +488,69 @@ struct Wheel {
     int tag = -1;                   // user tag (vehicle builder: index of the wheel definition)
     // visual: tyre model type
     enum Type : uint8_t { W_WHEELS, W_WHEELS2, W_MESHWHEELS, W_MESHWHEELS2, W_FLEXBODY, W_RING } type = W_WHEELS;
-    // (BeamLab) a ring tyre (the truck's `ringwheels`, World::ring_tyres): the rim a rigid round disc turning on the
-    // axle - its spin and its angle its own state, no rim or tread nodes (`nodes` empty; the wheel's mass on the axle
-    // nodes) - and the tyre a flexible ring over it: points round its tread (kRingRows across it) and its sidewalls,
-    // pressed in by the static world (a stiffness and a damping per area of the tyre), the tread's points in contact
-    // sheared along the ground (a brush: each held by its grip since it came into the patch, sliding past it). Other
-    // bodies meet it through a collision volume round it (CollisionVolume::tyre)
-    static constexpr int kRingRows = 3;
+    // (BeamLab) a ring tyre (the truck's `ringwheels`, World::ring_tyres): a wheel of its own - a rigid body (the rim and
+    // the tyre: their mass, their inertia, its pose and motion) on a bearing at each of its axle's two nodes (a stiff
+    // spring and damper stepped implicitly, free to turn about the axle), no nodes of its own (`nodes` empty) - and the
+    // tyre a flexible ring over its rim: a strip of tread at each point round it (kRingRows rows across it, two under
+    // each sidewall) on two sidewalls of its own, pressed in by the static world (a stiffness and a damping per area of
+    // the tyre), the tread's points in contact sheared along the ground (a brush: each held by its grip since it came
+    // into the patch, sliding past it). Other bodies meet it through a collision volume round it (CollisionVolume::tyre)
+    static constexpr int kRingRows = 4;
     bool ring = false;
-    float spin = 0, angle = 0;       // rad/s about the axle (axle0 -> axle1), rad
-    vec3 ref{0, 1, 0};               // (the rim's reference across the axle, carried along as the axle turns)
-    float inertia = 1.0f;            // kg m2
+    float spin = 0, angle = 0;       // rad/s about the axle (axle0 -> axle1), rad (the visual: 0, its pose has it)
+    vec3 ref{0, 1, 0};               // (the rim's reference across the axle: its frame's y)
+    float inertia = 1.0f;            // kg m2 about the axle
+    float inertia_t = 0.5f;          // kg m2 across it
+    // the wheel's body: its centre and velocity, its frame (x along the axle, y and z across it, turning with it) and its
+    // angular momentum; its bearings at +-bearing_half along the axle from the centre on the axle's nodes. Placed on the
+    // hub when built and when its nodes are moved (SoftBody::seat_wheels; a bearing 0.25 m off: again on the step)
+    vec3 pos{0, 0, 0}, vel{0, 0, 0};
+    quat rot;
+    vec3 mom{0, 0, 0};
+    float bearing_half = 0;          // m (0: half the axle nodes' distance apart when it is first placed)
+    float bearing_k = 2.0e7f, bearing_c = 2.0e4f; // N/m, N s/m: each bearing
+    bool seated = false;
     float k_area = 6.0e6f, c_area = 6.0e3f;   // the tyre pressed in: N/m3 (per area, per metre), N s/m3
     float k_shear = 9.0e6f, c_shear = 1.5e4f; // the tread sheared: N/m3, N s/m3
+    // Each sidewall (left: axle0's side; right) carries its two rows as they are pressed in: past `fold_at` of its height
+    // it folds over (the stiffness beyond that `fold_soft` of it - a buckle - until it is let off below 0.8 of that;
+    // the fold comes on over a few ms past 1.1 of it), past `crush_at` it is crushed (the rim's flange on the ground
+    // through the folded wall, `crush_k` times as stiff). The tread at the patch - the belt - shifts on the rim along
+    // the tread and across it as the ground shears it (the sidewalls bending: a spring and a damper each way, a folded
+    // sidewall holding less across), its strips round the patch with it (to none 60 degrees off it), in series with
+    // the brush: in steady rolling it holds still and the brush takes the slip, as the load changes it lags behind (the
+    // tyre's relaxation length). Shifted across it loads the sidewall on the side it left (`lean`: the pressing-in its
+    // outer rows gain per metre of shift, the inner a third of it)
+    float fold_at = 0.5f, fold_soft = 0.3f, crush_at = 0.85f, crush_k = 20.0f;
+    float k_lat = 1.6e5f, c_lat = 320.0f;     // the belt across the rim: N/m, N s/m
+    float k_long = 2.0e5f, c_long = 400.0f;   // along the tread (the sidewalls wound round)
+    float lean = 0.35f;
+    vec3 belt{0, 0, 0};              // (the belt's shift, world: along the ground)
+    vec3 belt_dir{0, -1, 0};         // (the patch's direction from the centre, world)
     float grip = 1.0f;               // (times the ground's friction)
     float crr = 0.012f;              // rolling resistance: its moment load x crr x radius
     int ring_n = 40;                 // points round it
     std::vector<vec3> shear;         // (each tread point's shear on the ground: ring_n x kRingRows, world)
-    std::vector<float> squash;       // (per point round it: how far the tread is pressed in - the visual)
-    std::vector<vec3> shift;         // (per point round it: its mean shear - the visual)
+    std::vector<vec2> carcass;       // (each strip's shift on the rim with the belt: along the tread, across it towards axle1 - m)
+    std::vector<float> side_sq;      // (each point's sidewalls pressed in: left, right - m)
+    std::vector<float> fold;         // (each point's sidewalls folded: left, right - 0 .. 1)
+    std::vector<float> squash;       // (per point round it: how far the tread is pressed in - the more of its two sides)
+    std::vector<vec3> shift;         // (per point round it: its strip's shift and its mean shear, world - the visual)
+    int pinches = 0;                 // (times a sidewall was crushed: the rim's flange through it)
+    bool crushed = false;
+    float lat_most = 0;              // (the belt's shift across, m: the last step)
     float load = 0;                  // (the ground's push on it at the last step, N)
+    // the wheel body's axle (its frame's x), its angular velocity from its momentum and the other way (an axisymmetric
+    // body: `inertia` about the axle, `inertia_t` across it)
+    vec3 axis() const { return rot.rotate(vec3(1, 0, 0)); }
+    vec3 omega() const {
+        const vec3 a = axis();
+        return mom * (1.0f / inertia_t) + a * (dot(a, mom) * (1.0f / inertia - 1.0f / inertia_t));
+    }
+    vec3 momentum(vec3 om) const {
+        const vec3 a = axis();
+        return om * inertia_t + a * (dot(a, om) * (inertia - inertia_t));
+    }
 };
 
 // RoR slide node: a node pulled onto the nearest point of a rail (polyline of nodes) by a stiff spring.
@@ -907,6 +950,10 @@ public:
     void compute_aabb();
     void translate(vec3 d);
     void set_velocity(vec3 v);
+    // the ring tyres' wheels placed on their hubs: at the axle nodes' middle, turned with the axle (their spin about it
+    // kept), at their velocity (after the nodes are moved or set going: translate, set_velocity, transform do it)
+    void seat_wheels();
+    void seat_wheel(Wheel& w);
     // Rigid transform of the whole body around `pivot`.
     void transform(const quat& r, vec3 pivot, vec3 translation);
     void wake() { sleeping = false; sleep_timer = 0; rest_timer = 0, rigid_avg = 10; }

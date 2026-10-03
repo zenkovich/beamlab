@@ -532,35 +532,40 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
         const mat3 R = to_mat3(q);
         for (size_t k = 0; k < s.pos.size(); k++) V[s.first + k].pos = c + R * s.pos[k], V[s.first + k].normal = R * s.nrm[k];
     }
-    // the ring tyres: the section swept round the axle on the rim's angle, the tread where the ring's points are pressed in
-    // and sheared (between them: halfway), the sidewalls bulging as it is pressed
+    // the ring tyres: the section swept round the wheel's own axle (its body's pose), the tread where the ring's points
+    // are pressed in and shifted on the rim and sheared (between them: halfway), each sidewall bulging as its side is
+    // pressed (a folded one further out)
     for (const RingTyre& t : m_rings) {
         const Wheel& w = b.wheels[t.wheel];
-        const vec3 a0 = nd[w.axle0].p, a1 = nd[w.axle1].p, c = (a0 + a1) * 0.5f, ax = normalize_or(a1 - a0, vec3(0, 0, 1));
-        vec3 e1 = w.ref - ax * dot(w.ref, ax);
-        e1 = normalize_or(e1, normalize(any_perpendicular(ax)));
-        const vec3 e2 = cross(ax, e1);
+        const mat3 Rw = to_mat3(w.rot);
+        const vec3 c = w.pos, ax = Rw.c[0], e1 = Rw.c[1], e2 = Rw.c[2];
         const float R = w.radius, W = w.width, rim = std::min(w.rim_radius, 0.95f * R), wall = R - rim;
         // (the section: lateral, radial from the rim; its normal)
         static const float PS[kProfile] = {-0.46f, -0.5f, -0.5f, -0.44f, -0.30f, 0.30f, 0.44f, 0.5f, 0.5f, 0.46f};
         const float PR[kProfile] = {0.0f, 0.35f, 0.75f, 0.97f, 1.0f, 1.0f, 0.97f, 0.75f, 0.35f, 0.0f};
         const float PN[kProfile][2] = {{-1, -0.2f}, {-1, 0}, {-0.9f, 0.3f}, {-0.5f, 0.85f}, {0, 1}, {0, 1}, {0.5f, 0.85f}, {0.9f, 0.3f}, {1, 0}, {1, -0.2f}};
         const int S = t.segs, NP = (int)w.squash.size();
+        const bool sides = NP > 0 && (int)w.side_sq.size() == 2 * NP && (int)w.fold.size() == 2 * NP;
         for (int i = 0; i <= S; i++) {
-            const float th = w.angle + 2.0f * kPi * (float)i / (float)S;
+            const float th = 2.0f * kPi * (float)i / (float)S;
             const vec3 d = e1 * std::cos(th) + e2 * std::sin(th);
-            float sq = 0;
+            float sq[2] = {0, 0}, fo[2] = {0, 0};
             vec3 sh(0);
             if (NP > 0) { // (the ring has half the segments: its points on the even ones, the odd ones halfway)
                 const int k0 = (i / 2) % NP, k1 = (k0 + (i & 1)) % NP;
-                sq = 0.5f * (w.squash[k0] + w.squash[k1]);
+                for (int sd = 0; sd < 2; sd++) {
+                    sq[sd] = sides ? 0.5f * (w.side_sq[2 * k0 + sd] + w.side_sq[2 * k1 + sd]) : 0.5f * (w.squash[k0] + w.squash[k1]);
+                    fo[sd] = sides ? 0.5f * (w.fold[2 * k0 + sd] + w.fold[2 * k1 + sd]) : 0.0f;
+                    sq[sd] = std::min(sq[sd], wall);
+                }
                 sh = (w.shift[k0] + w.shift[k1]) * 0.5f;
             }
             Vertex* rv = V + t.tyre + i * kProfile;
             for (int k = 0; k < kProfile; k++) {
+                const int sd = k < kProfile / 2 ? 0 : 1;
                 const float tread = k >= 3 && k <= 6 ? 1.0f : k == 2 || k == 7 ? 0.5f : k == 1 || k == 8 ? 0.2f : 0.0f;
-                const float r = rim + PR[k] * wall - sq * tread;
-                const float bulge = (k == 1 || k == 2 || k == 7 || k == 8) ? 0.5f * sq * (PS[k] < 0 ? -1.0f : 1.0f) : 0.0f;
+                const float r = rim + PR[k] * wall - sq[sd] * tread;
+                const float bulge = (k == 1 || k == 2 || k == 7 || k == 8) ? (0.5f + 0.6f * fo[sd]) * sq[sd] * (PS[k] < 0 ? -1.0f : 1.0f) : 0.0f;
                 rv[k].pos = c + ax * (PS[k] * W + bulge) + d * r + sh * tread;
                 rv[k].normal = normalize(ax * PN[k][0] + d * PN[k][1]);
             }
@@ -571,7 +576,7 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
             rv[0].pos = face - ax * ((side ? 0.08f : -0.08f) * W); // (the hub dished in)
             rv[0].normal = side ? ax : -ax;
             for (int i = 0; i <= S; i++) {
-                const float th = w.angle + 2.0f * kPi * (float)i / (float)S;
+                const float th = 2.0f * kPi * (float)i / (float)S;
                 rv[1 + i].pos = face + (e1 * std::cos(th) + e2 * std::sin(th)) * rim;
                 rv[1 + i].normal = side ? ax : -ax;
             }

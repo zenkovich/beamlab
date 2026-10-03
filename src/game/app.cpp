@@ -547,11 +547,15 @@ void App::frame(float dt) {
                 // (camber against the body's up, not the world's: the body's roll is not the wheel's)
                 const float toe = std::atan2(dot(ax, f) * side, std::fabs(dot(ax, l))) * kRad2Deg,
                             camber = std::asin(clampf(dot(ax, v->up()) * side, -1, 1)) * kRad2Deg;
-                if (w.ring) { // (a ring tyre: its load, how far it is pressed in, its spin)
-                    float sq = 0;
+                if (w.ring) { // (a ring tyre: its load, how far it is pressed in - each side - its spin, its wheel on its bearings)
+                    float sq = 0, side[2] = {0, 0}, fo[2] = {0, 0};
                     for (float q : w.squash) sq = std::max(sq, q);
-                    rs = w.radius - sq, rmin = rs, rmax = w.radius, ymin = 0.5f * (a0.y + a1.y) - rs;
-                    printf("    ring load %.0f N pressed in %.3f spin %.2f rad/s\n", w.load, sq, w.spin);
+                    for (size_t k = 0; k < w.side_sq.size(); k++) side[k & 1] = std::max(side[k & 1], w.side_sq[k]);
+                    for (size_t k = 0; k < w.fold.size(); k++) fo[k & 1] = std::max(fo[k & 1], w.fold[k]);
+                    rs = w.radius - sq, rmin = rs, rmax = w.radius, ymin = w.pos.y - rs;
+                    printf("    ring load %.0f N pressed in %.3f (left %.3f%s, right %.3f%s, %d crushed) shifted across %.1f mm spin %.2f rad/s, wheel %.1f mm off its axle\n", w.load, sq, side[0],
+                           fo[0] > 0.5f ? " folded" : "", side[1], fo[1] > 0.5f ? " folded" : "", w.pinches, w.lat_most * 1e3f, w.spin,
+                           length(w.pos - 0.5f * (a0 + a1)) * 1e3f);
                 } else if (!w.nodes.empty()) {
                     rs /= (float)w.nodes.size();
                 }

@@ -253,13 +253,19 @@ void Vehicle::reset(vec3 pos, float yaw_deg) {
         const float g = m_world ? ground_height_at(*m_world, c.x, c.z, top + 20.0f) : 0.0f;
         lift = std::max(lift, g - (c.y - w.radius));
         w.spin = w.angle = 0;
+        w.pinches = 0, w.crushed = false;
+        w.belt = vec3(0);
         std::fill(w.shear.begin(), w.shear.end(), vec3(0));
         std::fill(w.squash.begin(), w.squash.end(), 0.0f);
         std::fill(w.shift.begin(), w.shift.end(), vec3(0));
+        std::fill(w.carcass.begin(), w.carcass.end(), vec2(0));
+        std::fill(w.side_sq.begin(), w.side_sq.end(), 0.0f);
+        std::fill(w.fold.begin(), w.fold.end(), 0.0f);
     }
     if (lift > -1e8f)
         for (auto& n : b.nodes) n.p.y += lift + 0.03f;
     b.compute_aabb();
+    b.seat_wheels(); // (the ring tyres' wheels with their hubs)
     b.max_speed = 0;
     b.wake();
     // drivetrain state
@@ -293,6 +299,7 @@ void Vehicle::launch(vec3 v) {
         if (w.ring) w.spin = dot(omega, normalize(b.nodes[w.axle1].p - b.nodes[w.axle0].p)); // (a ring tyre rolls on)
         w.speed = w.avg_speed = length(v);
     }
+    b.seat_wheels(); // (the ring tyres' wheels at the speed, spinning)
     m_drive->speed = length(v);
     last_com_vel = v;
     peak_g = 0;
@@ -457,8 +464,7 @@ void Vehicle::make_sheet_body(const ShellMaterial& mat, float kg_m2, MaterialPtr
         m_spawn_volumes = b.volumes;
     }
 
-    m_mass = 0;
-    for (const Node& n : b.nodes) m_mass += n.mass;
+    m_mass = b.total_mass();
     m_spawn_shells = b.shells;
     m_spawn_tris = b.tris;
     m_spawn_info = b.info;
@@ -486,6 +492,7 @@ void Vehicle::place_definition(vec3 origin) {
     for (auto& f : b.frames) f.w = vec3(0);
     b.fem.set_orientation(quat()); // (the definition's own orientation: the frame nodes' rest one)
     b.compute_aabb();
+    b.seat_wheels();
     if (m_visual) m_visual->mark_dirty();
 }
 

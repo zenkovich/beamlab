@@ -1534,13 +1534,18 @@ void World::volume_find(Island& isl, int sq) {
     }
 }
 
-// The ring tyres (Wheel::ring): the rim a rigid disc turning on the axle, the tyre a ring of points over it - its
-// tread's in rows across it and its sidewalls' - each pressed into the static world (the ground, a curb, a wall)
-// pushing back with a stiffness and a damping per area of the tyre; the tread's points in contact held on the ground by
-// their shear (a brush: each point's own since it came into the patch, as the rim turns it through) up to the ground's
-// grip, sliding past it (the rubber keeps 85% of it), let go as they leave. Onto the axle nodes: the force at the
-// centre and the moment across the axle as a pair; the moment along it into the rim's spin with the drive and the
-// brake (which holds the rim up to its torque), their reaction onto the wheel's arm.
+// The ring tyres (Wheel::ring): each a wheel of its own - a rigid body (the rim and the tyre) on a bearing at each of its
+// axle's nodes - its tyre a ring of tread strips round the rim, each on two sidewalls of its own. A strip's rows are
+// pressed into the static world (the ground, a curb, a wall), each sidewall pushing back on its two rows with a
+// stiffness and a damping per area of the tyre (folding over, crushed - Wheel::fold_at); the rows in contact held on the
+// ground by their shear (a brush: each point's own since it came into the patch, as the rim turns it through) up to the
+// ground's grip, sliding past it (the rubber keeps 85% of it), let go as they leave; the tread at the patch - the belt -
+// shifted on the rim along the tread and across it by what the brush passes on (the sidewalls bending: a spring and a
+// damper each way, in series with the brush - solved implicitly over the patch's rows, stuck and then the sliding ones
+// at their grip; the strips round the patch shifted with it, less the further off it they are). Onto
+// the wheel: the ground's pushes at the rows, its weight, the bearings' (implicit springs - their reaction onto the
+// axle nodes); the drive's moment about the axle, the rolling resistance and the brake (it holds the spin up to its
+// torque) - the drive's and the brake's reaction onto the wheel's arm.
 void World::ring_tyres(SoftBody& b, const std::vector<int>& box_ids, const std::vector<int>& cyl_ids, float terrain_max_h, float dt) {
     const auto& gms = ground_models();
     Node* nd = b.nodes.data();
@@ -1549,85 +1554,128 @@ void World::ring_tyres(SoftBody& b, const std::vector<int>& box_ids, const std::
     constexpr int kRows = Wheel::kRingRows;
     for (Wheel& w : b.wheels) {
         if (!w.ring || w.detached || w.axle0 >= b.nodes.size() || w.axle1 >= b.nodes.size()) continue;
-        const Node& n0 = nd[w.axle0];
-        const Node& n1 = nd[w.axle1];
-        vec3 a = n1.p - n0.p;
-        const float L = length(a);
-        if (!(L > 1e-4f)) continue;
-        a = a / L;
-        const vec3 c = (n0.p + n1.p) * 0.5f, vc = (n0.v + n1.v) * 0.5f;
-        // the rim's frame: its reference carried along as the axle turns, the rim's angle on it
-        vec3 e1 = w.ref - a * dot(w.ref, a);
-        e1 = length2(e1) > 1e-8f ? normalize(e1) : normalize(any_perpendicular(a));
-        w.ref = e1;
-        const vec3 e2 = cross(a, e1);
+        Node& n0 = nd[w.axle0];
+        Node& n1 = nd[w.axle1];
+        const vec3 hd = n1.p - n0.p;
+        const float L = length(hd);
+        if (!(L > 1e-4f) || !(w.mass > 0) || !(w.inertia > 0) || !(w.inertia_t > 0)) continue;
+        const vec3 ah = hd / L;
+        // (not placed yet, or its nodes moved away from it - a body set somewhere else: on its hub again)
+        if (!w.seated || length2((n0.p + n1.p) * 0.5f - w.pos) > 0.25f * 0.25f) {
+            w.seated = false;
+            b.seat_wheel(w);
+        }
+        const mat3 Rw = to_mat3(w.rot);
+        const vec3 c = w.pos, a = Rw.c[0], e1 = Rw.c[1], e2 = Rw.c[2];
+        w.ref = e1, w.angle = 0;
+        const vec3 om = w.omega(), om_t = om - a * dot(om, a); // (its turn across the axle: the sidewalls' damping)
         const int N = std::max(8, w.ring_n);
         if ((int)w.shear.size() != N * kRows) w.shear.assign(N * kRows, vec3(0));
-        if ((int)w.squash.size() != N) w.squash.assign(N, 0.0f), w.shift.assign(N, vec3(0));
+        if ((int)w.squash.size() != N || (int)w.carcass.size() != N || (int)w.fold.size() != 2 * N || (int)w.side_sq.size() != 2 * N) {
+            w.squash.assign(N, 0.0f), w.shift.assign(N, vec3(0)), w.carcass.assign(N, vec2(0));
+            w.side_sq.assign(2 * N, 0.0f), w.fold.assign(2 * N, 0.0f);
+        }
         const float R = w.radius, W = w.width, rim = std::min(w.rim_radius, 0.95f * R);
         const float wall = std::max(0.01f, R - rim);
+        const float arc = 2.0f * kPi * R / (float)N;
         const bool terrain = statics.has_terrain && c.y - R <= terrain_max_h + 0.05f;
         vec3 Ft(0), Mt(0);
-        float load = 0;
+        float load = 0, lat_most = 0;
+        bool crushed = false;
         if (terrain || !box_ids.empty() || !cyl_ids.empty()) {
-            const float dA = 2.0f * kPi * R / (float)N * W / (float)kRows;
+            const float dA = arc * W / (float)kRows;
             const float dAs = 2.0f * kPi * (R - 0.5f * wall) / (float)(N / 2) * 0.5f * wall;
+            const float kb = w.k_shear * dA, cb = w.c_shear * dA;
+            const float sb = w.fold_at * wall, sc = w.crush_at * wall;
             auto touch = [&](vec3 q, ContactInfo& ci) {
                 return statics.collide_point(q, 0.0f, box_ids.data(), (int)box_ids.size(), cyl_ids.data(), (int)cyl_ids.size(), terrain && q.y <= terrain_max_h + 0.05f, ci) &&
                        ci.depth > 0;
             };
+            // a sidewall's push per area pressed in by s: up to its fold linear, beyond it (folded) softer, crushed stiff
+            auto law = [&](float s, float folded) {
+                float sig = w.k_area * (std::min(s, sb) + (1.0f - (1.0f - w.fold_soft) * folded) * std::max(0.0f, s - sb));
+                if (s > sc) sig += w.crush_k * w.k_area * (s - sc);
+                return sig;
+            };
+            struct Row {
+                vec3 q, n, v, u, u1, f; // (its point, the ground's normal, its base's velocity along the ground, its shear and
+                                        // the new one, its push along the ground)
+                float cap, wt;          // (its grip, its strip's share of the belt's shift)
+                int at;
+                bool slide;
+            };
+            thread_local std::vector<Row> rw;
+            rw.clear();
+            // the belt: the tread's shift on the rim at the patch, its strips the more of it the nearer they are to it
+            const vec3 dp = normalize_or(w.belt_dir - a * dot(w.belt_dir, a), -e1);
+            vec3 nsum(0), dsum(0);
+            float fold_most = 0;
             for (int i = 0; i < N; i++) {
-                const float th = w.angle + 2.0f * kPi * (float)i / (float)N;
-                const vec3 d = e1 * std::cos(th) + e2 * std::sin(th);
-                float sq = 0;
-                vec3 sh(0);
+                const float th = 2.0f * kPi * (float)i / (float)N;
+                const vec3 d = e1 * std::cos(th) + e2 * std::sin(th), t = cross(a, d);
+                const float wt = clampf((dot(d, dp) - 0.5f) * 2.0f, 0.0f, 1.0f);
+                const vec3 Sw = w.belt * wt;
+                const float lat = dot(Sw, a);
+                float* fo = &w.fold[2 * i];
+                float* ss = &w.side_sq[2 * i];
+                float side[2] = {0.0f, 0.0f};
                 for (int j = 0; j < kRows; j++) {
                     vec3& u = w.shear[i * kRows + j];
-                    const vec3 q = c + a * (((float)j - 0.5f * (kRows - 1)) * W / (float)kRows) + d * R;
+                    const float y = ((float)j - 0.5f * (kRows - 1)) * W / (float)kRows;
+                    const vec3 q = c + a * y + d * R + Sw;
                     ContactInfo ci;
                     if (!touch(q, ci)) {
                         u = vec3(0);
                         continue;
                     }
-                    const GroundModel& gm = gms[ci.surface < gms.size() ? ci.surface : 0];
+                    // (the tread shifted towards axle1 leans on the left sidewall: its outer row the most)
+                    const int sd = j < kRows / 2 ? 0 : 1;
+                    const float s = std::min(ci.depth, 1.2f * wall) - w.lean * lat * (y / (0.375f * W));
+                    if (!(s > 0)) {
+                        u = vec3(0);
+                        continue;
+                    }
+                    side[sd] = std::max(side[sd], s);
                     const vec3 n = ci.normal;
-                    const float pen = std::min(ci.depth, wall); // (no deeper than the sidewall: the rim)
-                    // (damped as the wheel comes down on the ground, not as its tread turns into the patch: that is the
-                    // rolling resistance, taken apart below)
-                    const vec3 vq = vc + cross(a * w.spin, q - c);
-                    const float fn = (w.k_area * pen - w.c_area * dot(vc, n)) * dA;
+                    // (damped as the rim comes down on the ground there, not as its tread turns into the patch: that is
+                    // the rolling resistance, taken apart below; a folded sidewall's rubber the more, a crushed one -
+                    // the rim's flange through it - as it is stiff)
+                    const float damp = w.c_area * (1.0f + 2.0f * fo[sd] + (s > sc ? w.crush_k : 0.0f));
+                    const float fn = (law(s, fo[sd]) - damp * dot(w.vel + cross(om_t, q - c), n)) * dA;
                     if (!(fn > 0)) {
                         u = vec3(0);
                         continue;
                     }
-                    // the brush: the tread's tip stuck to the ground, sheared as its base moves on
-                    const vec3 vt = vq - n * dot(vq, n);
-                    u -= n * dot(u, n);
-                    u -= vt * dt;
-                    vec3 ft = (u * w.k_shear - vt * w.c_shear) * dA;
-                    const float cap = fn * gm.ms * gm.strength * w.grip * fric_body;
-                    const float fl = length(ft);
-                    if (fl > cap) { // (sliding: the rubber keeps 85% of the grip, the shear what that holds)
-                        ft *= 0.85f * cap / fl;
-                        u = ft / (w.k_shear * dA);
-                    }
-                    const vec3 f = n * fn + ft;
-                    Ft += f;
-                    Mt += cross(q - c, f);
+                    const GroundModel& gm = gms[ci.surface < gms.size() ? ci.surface : 0];
+                    const vec3 vq = w.vel + cross(om, q - c);
+                    Row r;
+                    r.q = q, r.n = n, r.v = vq - n * dot(vq, n), r.u = u - n * dot(u, n), r.u1 = vec3(0), r.f = vec3(0);
+                    r.cap = fn * gm.ms * gm.strength * w.grip * fric_body, r.wt = wt, r.at = i * kRows + j, r.slide = false;
+                    rw.push_back(r);
+                    nsum += n * fn, dsum += d * fn;
+                    if (wt > 0.5f) fold_most = std::max(fold_most, std::max(fo[0], fo[1]));
+                    Ft += n * fn;
+                    Mt += cross(q - c, n * fn);
                     load += fn;
-                    sq = std::max(sq, std::min(wall, pen / std::max(0.3f, -dot(d, n))));
-                    sh += u / (float)kRows;
                 }
-                w.squash[i] = sq;
-                w.shift[i] = sh;
-                // the sidewalls (every other point round them): pushed by a wall, a curb's face; their rubber's grip
+                // each sidewall's fold: coming on past 1.1 of the fold's pressing-in, off below 0.8 of it, over ~3 ms
+                for (int sd = 0; sd < 2; sd++) {
+                    const float target = side[sd] > 1.1f * sb ? 1.0f : side[sd] < 0.8f * sb ? 0.0f : fo[sd];
+                    fo[sd] += (target - fo[sd]) * std::min(1.0f, dt / 0.003f);
+                    crushed |= side[sd] > sc;
+                    ss[sd] = side[sd];
+                }
+                w.squash[i] = std::max(side[0], side[1]);
+                w.carcass[i] = vec2(dot(Sw, t), lat);
+                w.shift[i] = Sw; // (and its rows' mean shear: below)
+                // the sidewalls' faces (every other point round them): pushed by a wall, a curb's face; their rubber's grip
                 if (i % 2) continue;
                 for (int j = 0; j < 2; j++) {
                     const vec3 q = c + a * ((j ? 0.5f : -0.5f) * W) + d * (R - 0.5f * wall);
                     ContactInfo ci;
                     if (!touch(q, ci)) continue;
-                    const vec3 vq = vc + cross(a * w.spin, q - c);
-                    const float fn = (w.k_area * std::min(ci.depth, 0.5f * W) - w.c_area * dot(vc, ci.normal)) * dAs;
+                    const vec3 vq = w.vel + cross(om, q - c);
+                    const float fn = (w.k_area * std::min(ci.depth, 0.5f * W) - w.c_area * dot(w.vel + cross(om_t, q - c), ci.normal)) * dAs;
                     if (!(fn > 0)) continue;
                     const vec3 vt = vq - ci.normal * dot(vq, ci.normal);
                     const float vl = length(vt);
@@ -1637,38 +1685,129 @@ void World::ring_tyres(SoftBody& b, const std::vector<int>& box_ids, const std::
                     load += fn;
                 }
             }
+            // the belt's shift along the tread and across it: the rows stuck (the sliding ones at their grip, fixed), the
+            // sidewalls' springs and dampers against the brush's - implicit; in steady rolling it holds still and the
+            // brush alone takes the slip (a cornering tyre's stiffness as the brush's), as it changes it lags (its
+            // relaxation length)
+            const float ry = w.c_lat / (w.c_lat + w.k_lat * dt), rx = w.c_long / (w.c_long + w.k_long * dt);
+            const vec3 ns = length2(nsum) > 0 ? normalize(nsum) : vec3(0);
+            vec3 ag = a - ns * dot(a, ns);
+            if (!rw.empty() && length2(ns) > 0 && length2(ag) > 0.01f) {
+                ag = normalize(ag);
+                vec3 tg = cross(ag, ns);
+                if (dot(tg, cross(a, normalize_or(dsum, dp))) < 0) tg = -tg;
+                const float soft = 1.0f - 0.3f * fold_most; // (a folded sidewall holds less across)
+                const float kx = w.k_long, cx = w.c_long, ky = w.k_lat * soft, cy = w.c_lat * soft;
+                const vec2 B(dot(w.belt, tg), dot(w.belt, ag));
+                auto solve = [&]() {
+                    vec3 base(0);
+                    float m = 0;
+                    for (const Row& r : rw) {
+                        if (r.slide) base += r.f * r.wt;
+                        else base += ((r.u - r.v * dt) * kb - r.v * cb) * r.wt, m += r.wt * r.wt * (kb + cb / dt);
+                    }
+                    return vec2((dot(base, tg) + (m + cx / dt) * B.x) / (m + kx + cx / dt), (dot(base, ag) + (m + cy / dt) * B.y) / (m + ky + cy / dt));
+                };
+                auto rows = [&](vec2 B2, bool mark) {
+                    const vec3 Bd = (tg * (B2.x - B.x) + ag * (B2.y - B.y)) / dt;
+                    bool any = false;
+                    for (Row& r : rw) {
+                        if (r.slide) continue;
+                        const vec3 vb = r.v + Bd * r.wt;
+                        r.u1 = r.u - vb * dt;
+                        vec3 f = r.u1 * kb - vb * cb;
+                        const float fl = length(f);
+                        if (fl > r.cap) { // (sliding: the rubber keeps 85% of the grip, the shear what that holds)
+                            f *= 0.85f * r.cap / fl;
+                            r.u1 = f / kb;
+                            if (mark) r.slide = any = true;
+                        }
+                        r.f = f;
+                    }
+                    return any;
+                };
+                vec2 B1 = solve();
+                if (rows(B1, true)) B1 = solve(), rows(B1, false);
+                w.belt = std::isfinite(B1.x) && std::isfinite(B1.y) ? tg * B1.x + ag * B1.y : vec3(0);
+                lat_most = std::fabs(B1.y);
+            } else
+                w.belt = w.belt * std::min(rx, ry); // (in the air: let back)
+            for (const Row& r : rw) {
+                Ft += r.f;
+                Mt += cross(r.q - c, r.f);
+                w.shear[r.at] = r.u1;
+                w.shift[r.at / kRows] += r.u1 / (float)kRows;
+            }
+            if (length2(dsum) > 0) w.belt_dir = normalize(dsum);
         } else {
             std::fill(w.shear.begin(), w.shear.end(), vec3(0));
             std::fill(w.squash.begin(), w.squash.end(), 0.0f);
-            std::fill(w.shift.begin(), w.shift.end(), vec3(0));
+            std::fill(w.side_sq.begin(), w.side_sq.end(), 0.0f);
+            std::fill(w.fold.begin(), w.fold.end(), 0.0f);
+            w.belt = w.belt * std::min(w.c_long / (w.c_long + w.k_long * dt), w.c_lat / (w.c_lat + w.k_lat * dt)); // (let back)
+            const vec3 dp = normalize_or(w.belt_dir - a * dot(w.belt_dir, a), -e1);
+            for (int i = 0; i < N; i++) {
+                const float th = 2.0f * kPi * (float)i / (float)N;
+                const vec3 d = e1 * std::cos(th) + e2 * std::sin(th);
+                const vec3 Sw = w.belt * clampf((dot(d, dp) - 0.5f) * 2.0f, 0.0f, 1.0f);
+                w.carcass[i] = vec2(dot(Sw, cross(a, d)), dot(Sw, a));
+                w.shift[i] = Sw;
+            }
         }
-        // onto the axle: the force at the centre, the moment across it as a pair on its two nodes
-        const float Ma = dot(Mt, a);
-        const vec3 pair = cross(Mt - a * Ma, a) / L;
-        F[w.axle0] += Ft * 0.5f - pair;
-        F[w.axle1] += Ft * 0.5f + pair;
-        // the spin: the ground's moment, the drive's, the rolling resistance's (its load times Crr at its radius, no more
-        // than stops it); the brake holds the rim up to its torque
+        // the bearings: each axle node holds the wheel's axle at its place along it (a spring and a damper stepped
+        // implicitly on the pair's mass - the node's, half the wheel's with its turn across - so stiff at any step)
+        vec3 Fb(0), Mb(0);
+        for (int k = 0; k < 2; k++) {
+            Node& hn = k ? n1 : n0;
+            const vec3 r = a * (k ? w.bearing_half : -w.bearing_half), x = hn.p - (c + r), xv = hn.v - (w.vel + cross(om, r));
+            const float mu = 1.0f / (hn.inv_mass + 2.0f / w.mass + 2.0f * w.bearing_half * w.bearing_half / w.inertia_t);
+            const vec3 v1 = (xv - x * (dt * w.bearing_k / mu)) / (1.0f + dt * w.bearing_c / mu + dt * dt * w.bearing_k / mu);
+            const vec3 f = (x + v1 * dt) * w.bearing_k + v1 * w.bearing_c;
+            F[k ? w.axle1 : w.axle0] -= f;
+            Fb += f;
+            Mb += cross(r, f);
+        }
+        // its motion: the ground's push, the bearings', its weight; its moments and the drive's
         const float Td = w.propulsed == 2 ? -w.torque : w.torque;
-        float spin = w.spin + dt * (Td + Ma) / w.inertia, Tb = 0;
-        const float rr = dt * w.crr * load * R / w.inertia;
+        w.vel += (Ft + Fb) * (dt / w.mass) + settings.gravity * dt;
+        w.pos += w.vel * dt;
+        w.mom += (Mt + Mb + a * Td) * dt;
+        // the spin about the axle (the world's: the differential is on the body - read against the hub's turn, the hubs'
+        // wind-up under the drive's reaction, +-2.4 rad/s, fed the differential's coupling and the driven wheels ran at
+        // 25% slip; read off the wheel's arm, the suspension's travel - the arm on the body - pumped 285 kW into a car of
+        // 158): the rolling resistance (its load times Crr at its radius, no more than stops it); the brake - its caliper
+        // on the hub - holding the spin on the hub (the hub's frame node's turn about the axle, an axle of frame
+        // elements; else the world's) up to its torque
+        float spin = dot(w.omega(), a), Tb = 0;
+        const float s0 = spin, rr = dt * w.crr * load * R / w.inertia;
         spin = std::fabs(spin) <= rr ? 0.0f : spin - std::copysign(rr, spin);
         if (w.brake > 0) {
-            const float lim = dt * w.brake / w.inertia;
-            if (std::fabs(spin) <= lim) Tb = -spin * w.inertia / dt, spin = 0;
-            else Tb = -std::copysign(w.brake, spin), spin -= std::copysign(lim, spin);
+            float hub = 0;
+            if (const int sl = b.fem.slot(w.axle0); sl >= 0 && sl < (int)b.fem.w.size()) hub = dot(b.fem.w[sl], a);
+            const float rel = spin - hub, lim = dt * w.brake / w.inertia;
+            if (std::fabs(rel) <= lim) Tb = -rel * w.inertia / dt, spin = hub;
+            else Tb = -std::copysign(w.brake, rel), spin -= std::copysign(lim, rel);
         }
-        if (!std::isfinite(spin)) spin = 0;
-        w.spin = spin;
-        w.angle = std::fmod(w.angle + spin * dt, 2.0f * kPi);
+        w.mom += a * ((spin - s0) * w.inertia);
+        if (!std::isfinite(spin) || !std::isfinite(dot(w.mom, w.mom)) || !std::isfinite(dot(w.vel, w.pos))) { // (on its hub again)
+            w.spin = 0, w.seated = false;
+            b.seat_wheel(w);
+        } else
+            w.spin = spin;
+        // its turn over the step
+        const vec3 om1 = w.omega();
+        if (const float wl = length(om1); wl * dt > 1e-9f) w.rot = normalize(quat::axis_angle(om1 / wl, wl * dt) * w.rot);
         w.load = load;
+        w.lat_most = lat_most;
+        if (crushed && !w.crushed) w.pinches++; // (a sidewall crushed: the rim's flange on the ground through it - once a blow)
+        w.crushed = crushed;
         // the drive's and the brake's reaction onto the wheel's support (as Wheel's arm takes the node wheels')
         const float T = Td + Tb;
         if (w.arm >= 0 && w.near_attach >= 0 && std::fabs(T) > 0.01f) {
-            const vec3 rr = nd[w.arm].p - nd[w.near_attach].p, r = rr - a * dot(rr, a);
-            const float off = length(rr - r), rl = length(r);
+            const vec3 rr2 = nd[w.arm].p - nd[w.near_attach].p, r = rr2 - ah * dot(rr2, ah);
+            const float off = length(rr2 - r), rl = length(r);
             if (rl > 0.01f && 2 * off < rl) {
-                const vec3 cf = cross(a, r / rl) * (0.5f * T / rl) * (1.0f - 2.0f * off / rl);
+                const vec3 cf = cross(ah, r / rl) * (0.5f * T / rl) * (1.0f - 2.0f * off / rl);
                 F[w.arm] -= cf;
                 F[w.near_attach] += cf;
             }

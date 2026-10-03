@@ -2854,6 +2854,165 @@ static void test_ring_tyre() {
     printf("    braked 3 kN m: stopped at %.3f m/s\n", length(b->nodes[0].v));
 }
 
+// A ring tyre's wheel as the builder makes it (vehicle/builder.cpp): R 0.32, rim 0.2, 0.22 wide, 20 kg, the tyre
+// 200 kN/m pressed 2 cm into the flat; on the axle nodes a0 -> a1
+static Wheel ring_wheel(uint32_t a0, uint32_t a1) {
+    Wheel wh;
+    wh.ring = true, wh.type = Wheel::W_RING;
+    wh.axle0 = a0, wh.axle1 = a1;
+    wh.radius = 0.32f, wh.rim_radius = 0.2f, wh.width = 0.22f, wh.mass = 20;
+    wh.inertia = 0.5f * 20 * 0.32f * 0.32f;
+    wh.inertia_t = 0.5f * wh.inertia + 20 * 0.22f * 0.22f / 12.0f;
+    const float patch = (4.0f / 3.0f) * 0.22f * std::sqrt(2.0f * 0.32f * 0.02f);
+    wh.k_area = 2.0e5f / patch, wh.c_area = 1500.0f / patch, wh.k_shear = 1.5f * wh.k_area, wh.c_shear = 2.5f * wh.c_area;
+    wh.k_lat = 0.8f * wh.k_area * patch, wh.c_lat = 0.002f * wh.k_lat;
+    wh.k_long = wh.k_area * patch, wh.c_long = 0.002f * wh.k_long;
+    wh.ref = vec3(0, 1, 0);
+    return wh;
+}
+
+// A cart: four ring wheels (two axles 1.6 m apart, the wheels 1.1 m apart on each) on a rigid frame (the axle nodes and
+// one above them, every pair a beam), `load` kg on each wheel's axle nodes; each wheel's axle turned by `camber` (rad: its
+// axle1 end raised - its axle0 side lower)
+static SoftBody* ring_cart(World& w, float load, float camber) {
+    w.settings.gravity = vec3(0, -9.81f, 0);
+    w.statics.terrain.create(41, 81, 1.0f, vec2(-20, -20));
+    w.statics.has_terrain = true;
+    w.statics.terrain.update_bounds();
+    auto body = std::make_unique<SoftBody>();
+    body->name = "ring cart";
+    body->can_sleep = false;
+    const vec3 a(0, std::sin(camber), std::cos(camber));
+    std::vector<uint32_t> fr;
+    for (float x : {-0.8f, 0.8f})
+        for (float z : {-0.55f, 0.55f}) {
+            const vec3 c(x, 0.322f, z);
+            fr.push_back(body->add_node(c - a * 0.15f, 0.5f * load, NF_NONE));
+            fr.push_back(body->add_node(c + a * 0.15f, 0.5f * load, NF_NONE));
+        }
+    fr.push_back(body->add_node(vec3(0, 0.9f, 0), 40.0f, NF_NONE));
+    for (size_t i = 0; i < fr.size(); i++)
+        for (size_t j = i + 1; j < fr.size(); j++) body->add_beam(fr[i], fr[j], 1e7f, 2e3f, 1e12f, 1e12f);
+    for (int k = 0; k < 4; k++) body->wheels.push_back(ring_wheel(fr[2 * k], fr[2 * k + 1]));
+    body->finalize();
+    body->seat_wheels();
+    return w.add_body(std::move(body));
+}
+
+// The ring tyre's wheel a body of its own on its bearings; its sidewalls each side their own, folding over and
+// crushed; the tread's strips shifted across the rim by a side load (the tyre bending sideways)
+static void test_ring_wheel() {
+    printf("ring tyres: the wheel's body, the sidewalls, the side load\n");
+    auto side_most = [](const Wheel& wh, int sd, const std::vector<float>& v) {
+        float m = 0;
+        for (size_t k = sd; k < v.size(); k += 2) m = std::max(m, v[k]);
+        return m;
+    };
+    {
+        World w;
+        SoftBody* b = ring_cart(w, 200.0f, 0.0f);
+        for (int f = 0; f < 120; f++) w.step_substeps(33);
+        const Wheel& wh = b->wheels[0];
+        const vec3 mid = (b->nodes[wh.axle0].p + b->nodes[wh.axle1].p) * 0.5f;
+        const float want = (200.0f + 20.0f + 10.0f) * 9.81f; // (its axle nodes', its own, a quarter of the frame's top)
+        CHECK(std::fabs(wh.load - want) < 0.04f * want, "the ground carries %.0f N (want %.0f: the wheel's own 20 kg on it)", wh.load, want);
+        CHECK(length(wh.pos - mid) < 1e-3f && length(wh.vel) < 0.01f, "the wheel %.2f mm off its axle's middle, at %.3f m/s", 1e3f * length(wh.pos - mid), length(wh.vel));
+        CHECK(std::fabs(b->total_mass() - (8 * 100.0f + 40.0f + 4 * 20.0f)) < 0.01f, "the cart weighs %.1f kg (its wheels with it)", b->total_mass());
+        const float l = side_most(wh, 0, wh.side_sq), r = side_most(wh, 1, wh.side_sq);
+        CHECK(std::fabs(l - r) < 1e-3f && l > 0.01f, "upright: its sidewalls pressed in %.1f and %.1f mm (alike)", l * 1e3f, r * 1e3f);
+        printf("    220 kg on a wheel: %.0f N on the ground, the wheel %.2f mm off its axle, its sidewalls %.1f / %.1f mm\n", wh.load, 1e3f * length(wh.pos - mid), l * 1e3f, r * 1e3f);
+        // a side load (0.4 of the weight, along the axles: towards axle1) - the strips shifted on the rims, the sidewall
+        // the rim leans over pressed further; it stands, not sliding
+        const float Fs = 0.4f * 4 * want;
+        const float z0 = b->nodes[0].p.z;
+        float drift = 0;
+        b->pre_substep = [&](SoftBody& x, float) {
+            for (int q = 0; q < 8; q++) x.force[q] += vec3(0, 0, 0.125f * Fs);
+        };
+        for (int f = 0; f < 150; f++) {
+            w.step_substeps(33);
+            if (f == 120) drift = b->nodes[0].p.z;
+        }
+        b->pre_substep = nullptr;
+        (void)z0;
+        drift = std::fabs(b->nodes[0].p.z - drift);
+        const Wheel& wo = b->wheels[1]; // (an outer one: the cart's weight leans on them)
+        const float l2 = side_most(wo, 0, wo.side_sq), r2 = side_most(wo, 1, wo.side_sq);
+        float shift = 0;
+        for (const vec2& S : wo.carcass) shift = std::min(shift, S.y);
+        CHECK(shift < -0.002f && shift > -0.05f, "the belt shifted across the rim by %.1f mm (want the tread behind the rim: -2 .. -50 mm)", shift * 1e3f);
+        CHECK(r2 > l2 + 0.002f, "the side the rim leans over pressed in %.1f mm, the other %.1f mm", r2 * 1e3f, l2 * 1e3f);
+        CHECK(drift < 0.005f, "it slides on at %.1f mm in 0.5 s under %.0f N", drift * 1e3f, Fs);
+        printf("    %.0f N across the cart: an outer wheel's belt %.1f mm across its rim, its sidewalls %.1f / %.1f mm, %.1f mm in the last 0.5 s\n", Fs, shift * 1e3f, l2 * 1e3f,
+               r2 * 1e3f, drift * 1e3f);
+    }
+    {
+        // cambered 5 deg (its axle0 side lower): that sidewall pressed further and folding over first
+        World w;
+        SoftBody* b = ring_cart(w, 1800.0f, 5.0f * kPi / 180.0f);
+        for (int f = 0; f < 240; f++) w.step_substeps(33);
+        const Wheel& wh = b->wheels[0];
+        const float l = side_most(wh, 0, wh.side_sq), r = side_most(wh, 1, wh.side_sq), fl = side_most(wh, 0, wh.fold), fr2 = side_most(wh, 1, wh.fold);
+        CHECK(l > r + 0.005f, "cambered: the lower sidewall pressed in %.1f mm, the upper %.1f mm", l * 1e3f, r * 1e3f);
+        CHECK(fl > 0.5f && fr2 < 0.5f, "cambered under 1.8 t: the lower sidewall folded %.2f, the upper %.2f", fl, fr2);
+        CHECK(length(b->nodes[0].v) < 0.02f && length(wh.vel) < 0.02f, "it stands: %.3f m/s, the wheel %.3f m/s", length(b->nodes[0].v), length(wh.vel));
+        printf("    1.8 t on a wheel cambered 5 deg: its sidewalls %.1f mm (folded %.2f) / %.1f mm (%.2f)\n", l * 1e3f, fl, r * 1e3f, fr2);
+    }
+    {
+        // overloaded (5 t a wheel): both sidewalls folded, the rim's flange on the ground through them - crushed, held
+        World w;
+        SoftBody* b = ring_cart(w, 5000.0f, 0.0f);
+        for (int f = 0; f < 240; f++) w.step_substeps(33);
+        const Wheel& wh = b->wheels[0];
+        const float l = side_most(wh, 0, wh.side_sq), fl = side_most(wh, 0, wh.fold), fr2 = side_most(wh, 1, wh.fold);
+        const float y = wh.pos.y;
+        CHECK(fl > 0.5f && fr2 > 0.5f, "5 t on a wheel: its sidewalls folded %.2f, %.2f", fl, fr2);
+        CHECK(wh.pinches > 0 && y > 0.2f && length(wh.vel) < 0.02f, "crushed %d times, the axle %.3f m up (the rim 0.2), at %.3f m/s", wh.pinches, y, length(wh.vel));
+        printf("    5 t on a wheel: pressed in %.1f mm, both sidewalls folded, crushed (%d), the axle %.0f mm up\n", l * 1e3f, wh.pinches, y * 1e3f);
+    }
+    {
+        // driven: the work of the drive on the wheels (its torque times their spin on their hubs) covers what the cart
+        // gains - its motion and its wheels' spin - nothing from nowhere (the bearings, the belt, the brush)
+        World w;
+        SoftBody* b = ring_cart(w, 200.0f, 0.0f);
+        for (int f = 0; f < 60; f++) w.step_substeps(33);
+        auto energy = [&]() {
+            double e = 0;
+            for (const Node& n : b->nodes) e += 0.5 * n.mass * length2(n.v) + n.mass * 9.81 * n.p.y;
+            for (const Wheel& wh : b->wheels) e += 0.5 * wh.mass * length2(wh.vel) + wh.mass * 9.81 * wh.pos.y + 0.5 * dot(wh.omega(), wh.mom);
+            return e;
+        };
+        const double e0 = energy();
+        double work = 0;
+        const float T = 350.0f, h = 1.0f / (60.0f * 33.0f);
+        for (int f = 0; f < 180; f++)
+            for (int k = 0; k < 33; k++) {
+                for (Wheel& wh : b->wheels) wh.torque = T;
+                w.step_substeps(1);
+                for (const Wheel& wh : b->wheels) work += (double)T * wh.spin * h;
+            }
+        const double gain = energy() - e0;
+        float v = 0, tread = 0;
+        for (const Wheel& wh : b->wheels) v += length(wh.vel) / 4, tread += std::fabs(wh.spin) * wh.radius / 4;
+        CHECK(gain < work && gain > 0.5 * work, "driven 3 s: the cart gained %.0f J of the drive's %.0f J", gain, work);
+        printf("    driven 4 x %.0f N m for 3 s: %.2f m/s, the tread at %.2f m/s; %.1f kJ gained of the drive's %.1f kJ\n", T, v, tread, gain * 1e-3, work * 1e-3);
+    }
+    {
+        // the body moved: its wheels with it
+        World w;
+        SoftBody* b = ring_cart(w, 200.0f, 0.0f);
+        for (int f = 0; f < 30; f++) w.step_substeps(33);
+        b->translate(vec3(4, 0.5f, 0));
+        b->set_velocity(vec3(0, 0, 0));
+        const Wheel& wh = b->wheels[1];
+        const vec3 mid = (b->nodes[wh.axle0].p + b->nodes[wh.axle1].p) * 0.5f;
+        CHECK(length(wh.pos - mid) < 1e-4f, "moved: the wheel %.3f mm off its axle", 1e3f * length(wh.pos - mid));
+        for (int f = 0; f < 120; f++) w.step_substeps(33);
+        CHECK(std::fabs(b->nodes[0].p.x - 3.2f) < 0.01f && length(wh.vel) < 0.05f, "and fell back onto its wheels where it was put: x %.3f (want 3.2), %.3f m/s", b->nodes[0].p.x,
+              length(wh.vel));
+    }
+}
+
 static void test_volumes() {
     printf("one-sided springs, a one-node ball, collision volumes\n");
     const FrameSection tube = frame_tube(2e-4f);
@@ -3394,6 +3553,7 @@ int main(int argc, char** argv) {
     run("hull", test_hull);
     run("volumes", test_volumes);
     run("ring", test_ring_tyre);
+    run("ring_wheel", test_ring_wheel);
     run("mids", test_tri_mids);
     run("sheet_cut", test_sheet_cut_hinge);
     run("sheet_mids", test_sheet_mids);
