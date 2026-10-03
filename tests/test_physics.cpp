@@ -3147,6 +3147,46 @@ static void test_sheet_cut_hinge() {
 // a 1 x 1 m sheet of two triangles (8 kg/m2 of steel) thrown flat at 3 m/s at a bar (a volume on a heavy body) that
 // runs under it between its corners - under its middle (0.4 m wide), or two off its triangles' middles (0.2 m wide,
 // either side of it) - it stops on it; without it goes through
+// A fragment torn off lies still while its body drives away: the RoR air drag is relative to each part's mean velocity
+// (against the body's mean it pulled the fragment after the car) and the loose shards' cap leaves a slow one alone.
+static void test_loose_drag() {
+    printf("a torn-off fragment against its driving body\n");
+    SoftBody b;
+    b.name = "car and fragment";
+    b.can_sleep = false;
+    b.air_drag = 0.05f, b.aero_cda = 0.7f;
+    // the car: a 400 kg rod at 25 m/s; the fragment: a 3-node shard of 60 g at rest, 5 m off
+    const uint32_t c0 = b.add_node(vec3(0, 1, 0), 200.0f, NF_NONE), c1 = b.add_node(vec3(0, 1, 2), 200.0f, NF_NONE);
+    b.add_beam(c0, c1, 1e6f, 1e3f, 1e12f, 1e12f);
+    const uint32_t f0 = b.add_node(vec3(5, 0, 0), 0.02f, NF_NONE), f1 = b.add_node(vec3(5.1f, 0, 0), 0.02f, NF_NONE),
+                   f2 = b.add_node(vec3(5, 0, 0.1f), 0.02f, NF_NONE);
+    b.add_beam(f0, f1, 1e3f, 1.0f, 1e12f, 1e12f), b.add_beam(f1, f2, 1e3f, 1.0f, 1e12f, 1e12f), b.add_beam(f2, f0, 1e3f, 1.0f, 1e12f, 1e12f);
+    b.finalize();
+    b.nodes[c0].v = b.nodes[c1].v = vec3(0, 0, 25);
+    int np = 0;
+    b.part_labels(&np);
+    CHECK(np == 2, "%d parts (want the car and the fragment)", np);
+    b.clear_forces(vec3(0));
+    float worst = 0;
+    for (uint32_t q : {f0, f1, f2}) worst = std::max(worst, length(b.force[q]));
+    CHECK(worst < 1e-6f, "the fragment at rest pulled by %.3g N", worst);
+    const float fc = length(b.force[c0] + b.force[c1]), want = 0.5f * 1.225f * 0.7f * 25 * 25 * (400.0f / 400.06f);
+    CHECK(std::fabs(fc - want) < 0.01f * want, "the car's drag %.1f N (want %.1f, its share)", fc, want);
+    // the shard cap: a car at 60 m/s leaves the shard lying, a shard flung at 120 m/s is caught at 50 against the car
+    FemFrame& fr = b.fem;
+    FemFrame::LooseTri lt{};
+    lt.n[0] = f0, lt.n[1] = f1, lt.n[2] = f2;
+    fr.loose_tris.push_back(lt);
+    b.nodes[c0].v = b.nodes[c1].v = vec3(0, 0, 60);
+    fr.cap_loose(b);
+    CHECK(length(b.nodes[f0].v) < 1e-6f, "the shard at rest dragged to %.2f m/s after a 60 m/s car", length(b.nodes[f0].v));
+    b.nodes[c0].v = b.nodes[c1].v = vec3(0);
+    b.nodes[f1].v = vec3(120, 0, 0);
+    fr.cap_loose(b);
+    CHECK(std::fabs(length(b.nodes[f1].v) - FemFrame::kLooseCap) < 0.5f, "the flung shard node at %.1f m/s (want the cap %.0f)", length(b.nodes[f1].v), FemFrame::kLooseCap);
+    printf("    the fragment's pull %.2g N (a 25 m/s car's drag %.0f N); a 120 m/s shard kept to %.1f m/s\n", worst, fc, length(b.nodes[f1].v));
+}
+
 static void test_sheet_mids() {
     printf("a sheet's triangles against a collision volume\n");
     for (int on = 2; on >= 0; on--) {
@@ -3357,6 +3397,7 @@ int main(int argc, char** argv) {
     run("mids", test_tri_mids);
     run("sheet_cut", test_sheet_cut_hinge);
     run("sheet_mids", test_sheet_mids);
+    run("loose_drag", test_loose_drag);
     if (do_bench) bench();
     printf("\n%d checks passed, %d failed\n", g_pass, g_fail);
     JobSystem::get().shutdown();

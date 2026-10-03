@@ -181,9 +181,11 @@ vec3 SoftBody::center_of_mass() const {
     return m > 0 ? c / m : c;
 }
 
-void SoftBody::largest_parts(float& first, float& second) const {
-    first = second = 0;
-    std::vector<uint32_t> up(nodes.size());
+// the parts held together by anything: each node's root
+static void part_roots(const SoftBody& b, std::vector<uint32_t>& up) {
+    const auto& nodes = b.nodes;
+    const auto& fem = b.fem;
+    up.resize(nodes.size());
     for (uint32_t i = 0; i < up.size(); i++) up[i] = i;
     auto find = [&](uint32_t x) {
         while (up[x] != x) x = up[x] = up[up[x]];
@@ -192,7 +194,7 @@ void SoftBody::largest_parts(float& first, float& second) const {
     auto join = [&](uint32_t a, uint32_t c) {
         if (a < up.size() && c < up.size()) up[find(a)] = find(c);
     };
-    for (const Beam& bm : beams)
+    for (const Beam& bm : b.beams)
         if (!(bm.flags & BF_BROKEN)) join(bm.a, bm.b);
     for (const FrameElement& e : fem.elems)
         if (!e.broken) join(fem.node[e.a], fem.node[e.b]);
@@ -203,25 +205,56 @@ void SoftBody::largest_parts(float& first, float& second) const {
             join(m.a, m.b);
             for (int k = 0; k < m.nb; k++) join(m.a, m.bn[k]);
         }
-    for (const Shell& sh : shells) join(sh.n[0], sh.n[1]), join(sh.n[1], sh.n[2]);
-    for (const Joint& j : joints)
-        if (!j.broken && j.parent_frame < frames.size()) join(frames[j.parent_frame].node, j.child_node);
-    for (const Weld& w : welds)
+    for (const Shell& sh : b.shells) join(sh.n[0], sh.n[1]), join(sh.n[1], sh.n[2]);
+    for (const Joint& j : b.joints)
+        if (!j.broken && j.parent_frame < b.frames.size()) join(b.frames[j.parent_frame].node, j.child_node);
+    for (const Weld& w : b.welds)
         if (!w.broken) {
             if (w.t > 0) join(w.anchor, w.anchor2);
-            for (uint32_t k = 0; k < w.count; k++) join(w.anchor, weld_nodes[w.first + k]);
+            for (uint32_t k = 0; k < w.count; k++) join(w.anchor, b.weld_nodes[w.first + k]);
         }
-    for (const SlideNode& sn : slides)
+    for (const SlideNode& sn : b.slides)
         if (!sn.broken)
             for (uint32_t r : sn.rail) join(sn.node, r);
+    for (uint32_t i = 0; i < up.size(); i++) up[i] = find(i);
+}
+
+void SoftBody::largest_parts(float& first, float& second) const {
+    first = second = 0;
+    std::vector<uint32_t> up;
+    part_roots(*this, up);
     std::vector<float> pm(up.size(), 0.0f);
     float total = 0;
-    for (uint32_t i = 0; i < up.size(); i++) pm[find(i)] += nodes[i].mass, total += nodes[i].mass;
+    for (uint32_t i = 0; i < up.size(); i++) pm[up[i]] += nodes[i].mass, total += nodes[i].mass;
     if (!(total > 0)) return;
     for (float m : pm)
         if (m > first) second = first, first = m;
         else if (m > second) second = m;
     first /= total, second /= total;
+}
+
+const std::vector<uint32_t>& SoftBody::part_labels(int* count) {
+    // (what changes its parts: tears, breaks, lets go - the counters of them, and its sizes)
+    uint64_t key = 1469598103934665603ull;
+    for (uint64_t x : {(uint64_t)topo_version, (uint64_t)stats.broken_beams, (uint64_t)stats.broken_welds, (uint64_t)stats.broken_joints,
+                       (uint64_t)fem.mounts_broken, (uint64_t)fem.tris_torn, (uint64_t)fem.broken, (uint64_t)fem.loose_count, (uint64_t)nodes.size(),
+                       (uint64_t)beams.size(), (uint64_t)shells.size(), (uint64_t)fem.elems.size()})
+        key = (key ^ x) * 1099511628211ull;
+    part_age_++;
+    if (part_of_.size() != nodes.size() || (key != part_key_ && part_age_ >= 8)) {
+        std::vector<uint32_t> up;
+        part_roots(*this, up);
+        part_of_.assign(nodes.size(), 0);
+        std::vector<int32_t> id(nodes.size(), -1);
+        part_count_ = 0;
+        for (uint32_t i = 0; i < up.size(); i++) {
+            if (id[up[i]] < 0) id[up[i]] = part_count_++;
+            part_of_[i] = (uint32_t)id[up[i]];
+        }
+        part_key_ = key, part_age_ = 0;
+    }
+    if (count) *count = part_count_;
+    return part_of_;
 }
 
 vec3 SoftBody::average_velocity() const {
@@ -271,22 +304,49 @@ void SoftBody::clear_forces(vec3 g) {
     const Node* nd = nodes.data();
     if (air_drag > 0 || aero_cda > 0) {
         // RoR applies -0.05*|v|*v to every node (~9 kN at 75 km/h on a 440-node car, 50x a real car's drag).
-        // Here: the RoR term on each node's velocity relative to the body mean (it still damps flapping parts),
-        // plus real aerodynamic drag 0.5*rho*CdA*|v|*v on the mean velocity, shared by mass.
-        vec3 mv(0);
-        float M = 0;
-        for (size_t i = 0; i < n; i++) {
-            mv += nd[i].v * nd[i].mass;
-            M += nd[i].mass;
-        }
-        vec3 vm = M > 0 ? mv / M : vec3(0);
-        vec3 aero_acc = M > 0 ? vm * (-0.5f * 1.225f * aero_cda * length(vm) / M) : vec3(0);
-        const NodeInfo* inf = info.data();
-        for (size_t i = 0; i < n; i++) {
-            f[i] = (g + aero_acc) * nd[i].mass;
-            if (inf[i].flags & (NF_TYRE | NF_RIM)) continue; // spinning tread: not a flapping part
-            vec3 vr = nd[i].v - vm;
-            f[i] -= vr * (air_drag * length(vr));
+        // Here: the RoR term on each node's velocity relative to its part's mean (it still damps flapping parts),
+        // plus real aerodynamic drag 0.5*rho*CdA*|v|*v on each part's mean velocity, shared by mass. (Against the body's
+        // mean, a fragment torn off and lying on the ground was pulled after the car, 7 N on a 50 g node at 12 m/s.)
+        int np = 1;
+        const std::vector<uint32_t>& part = part_labels(&np);
+        if (np <= 1) { // (one part: the body's mean - as it always was, to the bit)
+            vec3 mv(0);
+            float M = 0;
+            for (size_t i = 0; i < n; i++) {
+                mv += nd[i].v * nd[i].mass;
+                M += nd[i].mass;
+            }
+            vec3 vm = M > 0 ? mv / M : vec3(0);
+            vec3 aero_acc = M > 0 ? vm * (-0.5f * 1.225f * aero_cda * length(vm) / M) : vec3(0);
+            const NodeInfo* inf = info.data();
+            for (size_t i = 0; i < n; i++) {
+                f[i] = (g + aero_acc) * nd[i].mass;
+                if (inf[i].flags & (NF_TYRE | NF_RIM)) continue; // spinning tread: not a flapping part
+                vec3 vr = nd[i].v - vm;
+                f[i] -= vr * (air_drag * length(vr));
+            }
+        } else {
+            thread_local std::vector<vec3> pmv;
+            thread_local std::vector<float> pM;
+            pmv.assign(np, vec3(0)), pM.assign(np, 0.0f);
+            float M = 0;
+            for (size_t i = 0; i < n; i++) {
+                pmv[part[i]] += nd[i].v * nd[i].mass;
+                pM[part[i]] += nd[i].mass;
+                M += nd[i].mass;
+            }
+            for (int q = 0; q < np; q++) pmv[q] = pM[q] > 0 ? pmv[q] / pM[q] : vec3(0); // (each part's mean velocity)
+            thread_local std::vector<vec3> pacc;
+            pacc.assign(np, vec3(0));
+            for (int q = 0; q < np; q++) pacc[q] = M > 0 ? pmv[q] * (-0.5f * 1.225f * aero_cda * length(pmv[q]) / M) : vec3(0);
+            const NodeInfo* inf = info.data();
+            for (size_t i = 0; i < n; i++) {
+                const uint32_t q = part[i];
+                f[i] = (g + pacc[q]) * nd[i].mass;
+                if (inf[i].flags & (NF_TYRE | NF_RIM)) continue; // spinning tread: not a flapping part
+                vec3 vr = nd[i].v - pmv[q];
+                f[i] -= vr * (air_drag * length(vr));
+            }
         }
     } else {
         for (size_t i = 0; i < n; i++) f[i] = g * nd[i].mass;

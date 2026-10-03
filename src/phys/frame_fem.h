@@ -537,8 +537,9 @@ public:
     };
     std::vector<LooseTri> loose_tris;
     int loose_count = 0;            // (fragments let loose so far)
-    // The loose fragments' nodes no faster than `cap` against the body's mean velocity (each substep: a shard of a few
-    // grams squeezed between two cars' plates, pushed out by both in turn, ran away to 400 m/s and was reset)
+    // The loose fragments' nodes no faster than `cap` against the body's mean velocity, of those faster than the body's
+    // speed and `cap` (each substep: a shard of a few grams squeezed between two cars' plates, pushed out by both in
+    // turn, ran away to 400 m/s and was reset)
     static constexpr float kLooseCap = 50.0f;
     void cap_loose(SoftBody& b, float cap = kLooseCap) const;
     // drops the broken members and the frame nodes left without members (renumbering the frame nodes)

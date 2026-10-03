@@ -4590,11 +4590,15 @@ int FemFrame::cut(SoftBody& b, uint32_t ei, float t) {
 
 void FemFrame::cap_loose(SoftBody& b, float cap) const {
     if (loose_tris.empty()) return;
+    // (against the body's mean velocity, but only a node faster than the body's speed and the cap: one lying on the
+    // ground was dragged after a car faster than the cap; against its own fragment's mean a shard ran away whole)
     const vec3 vm = b.average_velocity();
+    const float top = length(vm) + cap;
     for (const LooseTri& t : loose_tris)
         for (uint32_t v : t.n) {
             if (v >= b.nodes.size()) continue;
             Node& x = b.nodes[v];
+            if (length2(x.v) <= top * top) continue;
             const vec3 d = x.v - vm;
             const float l2 = length2(d);
             if (l2 > cap * cap) x.v = vm + d * (cap / std::sqrt(l2));

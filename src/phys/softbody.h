@@ -634,7 +634,11 @@ public:
     float rest_plastic = 3.0f, rest_rigid = 0.3f;
     bool resting = false;               // (the last frame's)
     float rigid_speed = 1e9f;           // (the last frame's speed as a whole, on the ground: the rest damping's)
-    float air_drag = 0.0f;              // RoR per-node drag coefficient (0.05), applied to the velocity relative to the body
+    std::vector<uint32_t> part_of_;     // (part_labels' cache: each node's part, their count, the topology it was made for,
+    int part_count_ = 0;                // the calls since)
+    uint64_t part_key_ = ~0ull;
+    int part_age_ = 0;
+    float air_drag = 0.0f;              // RoR per-node drag coefficient (0.05), applied to the velocity relative to its part's
     float aero_cda = 0.0f;              // whole-body aerodynamic drag Cd*A (m^2) on the mean velocity
     bool self_collision = false;
     // Sheet contacts as spheres (phys/sphere_contacts.cpp): at the nodes, sphere_div - 1 along each edge and at the
@@ -897,6 +901,9 @@ public:
     // Its two largest parts held together by anything (beams, members, triangle elements, mounts, sheets, joints, welds,
     // slide nodes' rails): their shares of its mass (0..1; a car cut in two: two halves)
     void largest_parts(float& first, float& second) const;
+    // Each node's part (as largest_parts': numbered 0.., `count` of them), kept until its topology changes - looked at
+    // again no more often than every 8 calls once the node count holds (a crash's tears each substep)
+    const std::vector<uint32_t>& part_labels(int* count = nullptr);
     void compute_aabb();
     void translate(vec3 d);
     void set_velocity(vec3 v);
