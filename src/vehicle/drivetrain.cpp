@@ -286,7 +286,10 @@ void Drivetrain::update(float dt, const VehicleInput& in, SoftBody& b) {
     // ---- steering (RoR digital path with speed coupling + self centering; rates scaled by the steering settings)
     float cmd = clampf(in.steer, -1, 1);
     const float centre_rate = 1.5f * steer_return;
-    if (cmd != 0) {
+    if (in.steer_direct) { // (an analogue command: followed at a hand's rate whatever the speed, lock to lock in 0.2 s)
+        const float step = dt * 10.0f;
+        dir_state = dir_state > cmd ? std::max(cmd, dir_state - step) : std::min(cmd, dir_state + step);
+    } else if (cmd != 0) {
         float rate = std::max(1.2f, 30.0f / (10.0f + steer_speed_sens * std::fabs(speed / 2.0f))) * steer_speed;
         // counter-steering: the wheels come back through the centre at the return rate on top of the turn rate
         if (dir_state * cmd < 0) rate += centre_rate;
@@ -294,7 +297,7 @@ void Drivetrain::update(float dt, const VehicleInput& in, SoftBody& b) {
         if (dir_state > cmd) dir_state = std::max(cmd, dir_state - step);
         else dir_state = std::min(cmd, dir_state + step);
     }
-    if (cmd == 0 || std::fabs(dir_state) > std::fabs(cmd)) {
+    if (!in.steer_direct && (cmd == 0 || std::fabs(dir_state) > std::fabs(cmd))) {
         float step = dt * centre_rate;
         dir_state = std::fabs(dir_state) > step ? dir_state - signf(dir_state) * step : 0.0f;
     }

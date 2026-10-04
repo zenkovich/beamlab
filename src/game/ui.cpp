@@ -155,6 +155,10 @@ void App::ui_main_menu() {
             else m_game.cam.mode = next;
         }
         if (ImGui::IsKeyPressed(ImGuiKey_H)) m_show_hud = !m_show_hud;
+        if (ImGui::IsKeyPressed(ImGuiKey_M)) {
+            m_mouse_steer = !m_mouse_steer;
+            toast(m_mouse_steer ? "Mouse steering on (M: off): the cursor is where the vehicle heads" : "Mouse steering off");
+        }
         if (ImGui::IsKeyPressed(ImGuiKey_R) && m_game.player_vehicle()) {
             if (io.KeyShift) m_game.player_vehicle()->reset(m_game.spawn_pos, m_game.spawn_yaw);
             else m_game.player_vehicle()->recover();
@@ -443,6 +447,11 @@ void App::ui_main_menu() {
             else m_game.cam.mode = (CameraController::Mode)m;
         }
         ImGui::SliderFloat("FOV", &m_game.cam.fov, 35, 100, "%.0f");
+        ImGui::SeparatorText("Steering");
+        ImGui::MenuItem("Mouse steering (as in Operation Flashpoint)", "M", &m_mouse_steer);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The mouse moves a cursor that is a direction in the world; the vehicle steers to it,\nand the cursor comes back to the middle as it turns. A / D steer as ever and put the cursor ahead.\nThe mouse is taken while it is on: M lets it go.");
+        ImGui::SliderFloat("full lock at", &m_mouse_steer_lock, 5, 45, "%.0f deg off the cursor");
         ImGui::SeparatorText("Debug views");
         ImGui::MenuItem("Beams, elements, wheels", "F3", &m_game.debug.beams);
         ImGui::MenuItem("  colored by load (off: by deformation)", "F8", &m_game.debug.stress, m_game.debug.beams);
@@ -713,6 +722,35 @@ void App::ui_main_menu() {
     if (ImGui::SmallButton(perf_label)) m_show_perf = !m_show_perf;
     ImGui::PopStyleColor();
     ImGui::EndMainMenuBar();
+}
+
+// The mouse steering's cursor: a point 60 m from the vehicle along the heading asked for, where it is on the screen (off it: a dot at the edge towards it), as Operation Flashpoint's - four ticks round a gap.
+void App::ui_mouse_steer() {
+    Vehicle* v = m_game.player_vehicle();
+    if (!m_mouse_captured || !m_aim_valid || !v) return;
+    const float D = 60.0f;
+    const vec3 p = v->position() + vec3(std::sin(m_aim_yaw), 0, std::cos(m_aim_yaw)) * D + vec3(0, 0.6f + std::tan(m_aim_pitch) * D, 0);
+    const vec4 c = m_game.last_camera().viewproj * vec4(p.x, p.y, p.z, 1.0f);
+    const ImVec2 sz = ImGui::GetIO().DisplaySize;
+    float x = 0.5f * sz.x, y = 0.5f * sz.y;
+    if (c.w > 0.01f) x = (c.x / c.w * 0.5f + 0.5f) * sz.x, y = (0.5f - c.y / c.w * 0.5f) * sz.y;
+    else x = c.x < 0 ? 2.0f * sz.x : -sz.x; // (behind the camera: off the side it is past)
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    if (x < 0 || x > sz.x || y < 0 || y > sz.y) { // (off the screen, where it is free to be: a mark at the edge towards it)
+        const ImVec2 e(clampf(x, 14.0f, sz.x - 14.0f), clampf(y, 44.0f, sz.y - 14.0f));
+        dl->AddCircleFilled(e, 5.5f, IM_COL32(0, 0, 0, 150));
+        dl->AddCircleFilled(e, 3.5f, IM_COL32(215, 235, 190, 235));
+        return;
+    }
+    const float g = 5.0f, l = 9.0f;
+    for (int pass = 0; pass < 2; pass++) {
+        const ImU32 col = pass ? IM_COL32(215, 235, 190, 235) : IM_COL32(0, 0, 0, 150);
+        const float t = pass ? 1.5f : 3.5f;
+        dl->AddLine(ImVec2(x - g - l, y), ImVec2(x - g, y), col, t);
+        dl->AddLine(ImVec2(x + g, y), ImVec2(x + g + l, y), col, t);
+        dl->AddLine(ImVec2(x, y - g - l), ImVec2(x, y - g), col, t);
+        dl->AddLine(ImVec2(x, y + g), ImVec2(x, y + g + l), col, t);
+    }
 }
 
 void App::ui_tools() {
@@ -1231,6 +1269,7 @@ void App::ui_help() {
         if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
             row("W / S", "Throttle / brake (hold S when stopped to reverse)");
             row("A / D", "Steer");
+            row("M", "Mouse steering as in Operation Flashpoint: the cursor is the heading the vehicle turns to");
             row("Space", "Handbrake");
             row("1 .. 0", "Vehicle commands (cranes, doors, tippers: odd/even key pairs)");
             row("R / Shift+R", "Recover vehicle / back to spawn");

@@ -24,6 +24,7 @@ struct VehicleEntry;
 
 struct VehicleInput {
     float throttle = 0, brake = 0, steer = 0; // steer: -1 left .. +1 right
+    bool steer_direct = false; // (the mouse's steering: the wheels follow `steer` at once, not at the keys' rate that slows with speed)
     bool handbrake = false;
     bool shift_up = false, shift_down = false;
     int command_key = 0; // RoR command key (F-keys), 0 = none

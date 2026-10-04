@@ -104,6 +104,14 @@ private:
     float m_fps = 60;
     double m_frame_ms = 0, m_cpu_ms = 0, m_render_ms = 0, m_ui_ms = 0;
     double m_prev_mx = 0, m_prev_my = 0;
+    // Steering by the mouse as in Operation Flashpoint (M): the cursor is a heading in the world, the vehicle steers to
+    // it; as it turns the cursor comes back to the screen's middle (gather_input, ui_mouse_steer).
+    bool m_mouse_steer = false;    // (the mode: View menu, M)
+    bool m_mouse_captured = false; // (the mouse taken now: the mode on, a vehicle driven, no menu)
+    bool m_aim_valid = false;
+    float m_aim_yaw = 0, m_aim_pitch = 0;    // (the cursor's heading in the world, its height over the horizon: radians)
+    float m_mouse_steer_lock = 20.0f;        // (the angle off the cursor at which the wheels are at full lock, degrees)
+    void ui_mouse_steer();
     bool m_rmb = false, m_lmb_grab = false, m_lmb_held = false;
     float m_fire_timer = 0;
     void ui_tools();

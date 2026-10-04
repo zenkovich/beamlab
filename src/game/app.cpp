@@ -252,12 +252,57 @@ void App::gather_input(float dt, VehicleInput& vin, CameraInput& cin) {
         vin.throttle = thr;
         vin.brake = brk;
         vin.steer = st;
+        // The mouse steers as in Operation Flashpoint: it moves a cursor that is a heading in the world (a pixel of the
+        // mouse a pixel of the cursor), not the wheels; the vehicle steers towards it in proportion to the angle left,
+        // so it turns to where the cursor points and, the camera turning with it, the cursor comes back to the middle.
+        // The cursor is not held to the screen: it may point anywhere round the vehicle. The steering keys take over
+        // and put the cursor back ahead; the right button looks around as ever.
+        Vehicle* pv = m_game.player_vehicle();
+        // (BL_MOUSESTEER=<degrees>: a scripted check - the mode on, the cursor put that far to the right at t = 1 s)
+        static const char* ms_test = getenv("BL_MOUSESTEER");
+        if (ms_test) m_mouse_steer = true;
+        const bool take = m_mouse_steer && pv && kb && ((!m_hide_ui && glfwGetWindowAttrib(m_win, GLFW_FOCUSED)) || ms_test);
+        if (take != m_mouse_captured) {
+            glfwSetInputMode(m_win, GLFW_CURSOR, take ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+            m_mouse_captured = take;
+            m_aim_valid = false;
+            md = vec2(0); // (the cursor jumps as it is taken or let go)
+            glfwGetCursorPos(m_win, &m_prev_mx, &m_prev_my);
+        }
+        if (take) {
+            vec3 f = pv->forward();
+            f.y = 0;
+            f = normalize_or(f, vec3(0, 0, 1));
+            const float head = std::atan2(f.x, f.z);
+            int ww0, wh0;
+            glfwGetWindowSize(m_win, &ww0, &wh0);
+            const float aspect = (float)std::max(1, ww0) / (float)std::max(1, wh0);
+            const float hfov = 2.0f * std::atan(std::tan(0.5f * m_game.cam.fov * kDeg2Rad) * aspect);
+            const float per_px = hfov / (float)std::max(1, ww0);
+            if (!m_aim_valid || st != 0) m_aim_yaw = head, m_aim_pitch = 0, m_aim_valid = true;
+            if (static bool put = false; ms_test && !put && m_game.world.time() > 1.0) put = true, m_aim_yaw -= (float)atof(ms_test) * kDeg2Rad;
+            if (ms_test) md = vec2(0);
+            if (st == 0) {
+                // (the cursor is free: any heading round the vehicle, any height, as fast as the mouse moves)
+                if (!rmb) m_aim_yaw -= md.x * per_px, m_aim_pitch = clampf(m_aim_pitch - md.y * per_px, -1.4f, 1.4f);
+                const float off = std::remainder(m_aim_yaw - head, 2.0f * kPi);
+                if (ms_test && (m_frame_index % 30) == 0) fprintf(stderr, "mouse steer t=%.2f heading %.1f cursor %.1f off %.1f deg\n", m_game.world.time(), head / kDeg2Rad, m_aim_yaw / kDeg2Rad, off / kDeg2Rad);
+                m_aim_yaw = head + off;
+                float turn = clampf(-off / (m_mouse_steer_lock * kDeg2Rad), -1, 1);
+                if (dot(pv->velocity(), f) < -0.5f) turn = -turn; // (backing up: the wheels the other way turn it the same way)
+                vin.steer = turn;
+                vin.steer_direct = true;
+            }
+        } else {
+            m_aim_valid = false;
+        }
         vin.handbrake |= key(GLFW_KEY_SPACE);
         // RoR commands (cranes, doors, tippers): number keys 1..9, 0 = command 1..10
         static const int keys[10] = {GLFW_KEY_1, GLFW_KEY_2, GLFW_KEY_3, GLFW_KEY_4, GLFW_KEY_5, GLFW_KEY_6, GLFW_KEY_7, GLFW_KEY_8, GLFW_KEY_9, GLFW_KEY_0};
         for (int k = 0; k < 10; k++)
             if (key(keys[k])) vin.command_key = k + 1;
     }
+    if (m_mouse_captured) lmb = false, mouse_free = false; // (the mouse steers: no tool under it)
     // mouse grab (LMB on a node)
     Camera c = m_game.last_camera();
     int ww, wh;
@@ -458,7 +503,7 @@ void App::frame(float dt) {
         int cmd = 0;
         sscanf(m_opt.drive.c_str(), "%f,%f,%f,%d,%f", &thr, &st, &br, &cmd, &period);
         vin.throttle = thr;
-        vin.steer = st;
+        if (!m_mouse_captured) vin.steer = st;
         // (a period s: the steering swept from side to side, a sine of that period - "in all directions")
         if (period > 0) vin.steer = st * std::sin(2.0f * kPi * (float)m_frame_index / (60.0f * period));
         vin.brake = br;
@@ -481,7 +526,7 @@ void App::frame(float dt) {
             if (v->speed_kmh() > top) vin.throttle = 0;
         }
         // steer 0 = test driver holds the initial heading (asymmetric models and open diffs pull to one side)
-        else if (Vehicle* v = m_game.player_vehicle(); v && st == 0) {
+        else if (Vehicle* v = m_game.player_vehicle(); v && st == 0 && !m_mouse_captured) {
             static vec3 hold_dir(0), hold_pos(0);
             vec3 f = v->forward();
             f.y = 0;
@@ -1075,6 +1120,7 @@ void App::frame(float dt) {
         uint64_t t0 = prof::now();
         ui_main_menu();
         if (m_show_hud && !(m_editor.active() && !m_editor.driving())) ui_hud(); // (the editor has its own overlay)
+        ui_mouse_steer();
         if (m_show_perf) ui_perf();
         if (m_show_help) ui_help();
         if (m_show_vehicle_info) ui_vehicle_info();
