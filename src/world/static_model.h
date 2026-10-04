@@ -24,4 +24,8 @@ struct StaticModel {
 };
 const StaticModel* static_model(const std::string& id);
 
+// The sky's panorama (assets/textures/sky.jpg, tools/fetch_assets.py) and its sun's light into `light`, when it is
+// there: every scene's sky unless the scene sets a sun of its own. False: none (the gradient sky).
+bool panorama_sky(LightSettings& light);
+
 } // namespace bl

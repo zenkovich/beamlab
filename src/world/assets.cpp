@@ -179,50 +179,87 @@ TexturePtr gen_bark(bool birch) {
 
 // Leaf cluster card: several leaf shapes on a transparent background.
 TexturePtr gen_leaves(vec3 base, vec3 var, uint32_t seed, bool small) {
-    const int S = 128;
-    Canvas c(S, S, vec4(base.x, base.y, base.z, 0));
+    // a spray of leaves on twigs: pointed blades with a midrib, each lit along its length, the ones drawn first (under the
+    // others) darker - a card of it reads as a bough with depth, not as a blob of flat discs
+    const int S = 256;
+    Canvas c(S, S, vec4(base.x * 0.6f, base.y * 0.6f, base.z * 0.6f, 0));
     Rng rng(seed);
-    int count = small ? 70 : 38;
-    for (int i = 0; i < count; i++) {
-        float cx = rng.range(14, S - 14), cy = rng.range(14, S - 14);
-        // keep cluster roughly round
-        float dx = cx - S / 2, dy = cy - S / 2;
-        if (dx * dx + dy * dy > (S * 0.45f) * (S * 0.45f)) continue;
-        float ang = rng.range(0, 2 * kPi);
-        float len = small ? rng.range(6, 10) : rng.range(10, 17), wid = len * rng.range(0.4f, 0.55f);
-        vec3 col = base + var * rng.range(-1, 1);
-        float shade = rng.range(0.75f, 1.1f);
-        float ca = std::cos(ang), sa = std::sin(ang);
-        for (int y = (int)(cy - len - 1); y <= (int)(cy + len + 1); y++)
-            for (int x = (int)(cx - len - 1); x <= (int)(cx + len + 1); x++) {
-                float lx = (x - cx) * ca + (y - cy) * sa, ly = -(x - cx) * sa + (y - cy) * ca;
-                float e = (lx * lx) / (len * len) + (ly * ly) / (wid * wid);
-                if (e > 1) continue;
-                float vein = std::fabs(ly) < 0.8f ? 0.85f : 1.0f;
-                vec4& p = c.at(x, y);
-                p = vec4(col * shade * vein * (0.85f + 0.15f * (1 - e)), 1);
-            }
+    const int twigs = small ? 9 : 7;
+    const int per_twig = small ? 16 : 11;
+    for (int t = 0; t < twigs; t++) {
+        // a twig from near the card's middle outwards
+        float ta = 2 * kPi * (t + rng.range(-0.3f, 0.3f)) / twigs;
+        float tx = S * 0.5f + std::cos(ta) * S * 0.06f, ty = S * 0.5f + std::sin(ta) * S * 0.06f;
+        float tl = S * rng.range(0.30f, 0.44f);
+        vec3 wood(0.22f, 0.16f, 0.10f);
+        for (int q = 0; q < (int)tl; q++) {
+            int x = (int)(tx + std::cos(ta) * q), y = (int)(ty + std::sin(ta) * q);
+            if (x > 1 && y > 1 && x < S - 2 && y < S - 2) c.at(x, y) = vec4(wood, 1), c.at(x + 1, y) = vec4(wood, 1);
+        }
+        for (int i = 0; i < per_twig; i++) {
+            float along = rng.range(0.15f, 1.0f) * tl;
+            float cx = tx + std::cos(ta) * along, cy = ty + std::sin(ta) * along;
+            float ang = ta + (rng.uniform() < 0.5f ? 1.0f : -1.0f) * rng.range(0.5f, 1.2f);
+            float len = (small ? rng.range(9, 14) : rng.range(15, 24)), wid = len * rng.range(0.30f, 0.42f);
+            // (depth: the first leaves of a twig lie under the later ones)
+            float depth = 0.55f + 0.45f * (float)i / per_twig;
+            vec3 col = (base + var * rng.range(-1, 1)) * depth * rng.range(0.85f, 1.15f);
+            if (rng.uniform() < 0.08f) col = col * vec3(1.5f, 1.25f, 0.6f); // (a yellowing one)
+            float ca = std::cos(ang), sa = std::sin(ang);
+            float ox = cx + ca * len, oy = cy + sa * len; // (the blade's middle: it grows from the twig)
+            for (int y = (int)(oy - len - 2); y <= (int)(oy + len + 2); y++)
+                for (int x = (int)(ox - len - 2); x <= (int)(ox + len + 2); x++) {
+                    if (x < 1 || y < 1 || x >= S - 1 || y >= S - 1) continue;
+                    float lx = (x - ox) * ca + (y - oy) * sa, ly = -(x - ox) * sa + (y - oy) * ca;
+                    float u = lx / len; // -1 at the stalk, 1 at the tip
+                    if (u < -1 || u > 1) continue;
+                    float half = wid * std::pow(std::max(0.0f, 1.0f - u * u), 0.75f) * (1.0f - 0.25f * u); // (broader near the stalk, a point at the tip)
+                    if (std::fabs(ly) > half) continue;
+                    float rib = std::fabs(ly) < 0.7f ? 1.18f : 1.0f;
+                    float vein = 0.94f + 0.06f * std::cos((lx * 0.9f + std::fabs(ly) * 1.4f));
+                    float edge = 0.82f + 0.18f * (1.0f - std::fabs(ly) / std::max(half, 0.5f));
+                    float side = ly > 0 ? 1.06f : 0.94f; // (the blade folded a little along its rib)
+                    c.at(x, y) = vec4(col * rib * vein * edge * side, 1);
+                }
+        }
     }
     return make_tex(c, small ? "<leaves_small>" : "<leaves>", true);
 }
 
 TexturePtr gen_needles() {
-    const int S = 128;
-    Canvas c(S, S, vec4(0.12f, 0.25f, 0.12f, 0));
+    // a conifer's bough: twigs fanning out from the card's foot, each a brush of needles along it - the ones under the
+    // others darker, their tips paler
+    const int S = 256;
+    Canvas c(S, S, vec4(0.07f, 0.16f, 0.08f, 0));
     Rng rng(77);
-    for (int i = 0; i < 900; i++) {
-        float y0 = rng.range(4, S - 4), x0 = rng.range(4, S - 4);
-        float dx = x0 - S / 2, dy = y0 - S / 2;
-        if (dx * dx * 0.6f + dy * dy > (S * 0.46f) * (S * 0.46f)) continue;
-        float ang = rng.range(-0.9f, 0.9f) + (x0 < S / 2 ? kPi : 0);
-        float len = rng.range(5, 11);
-        vec3 col = vec3(0.10f, 0.24f, 0.11f) * rng.range(0.7f, 1.3f);
-        for (int s = 0; s < (int)len; s++) {
-            int x = (int)(x0 + std::cos(ang) * s), y = (int)(y0 + std::sin(ang) * s);
-            if (x < 0 || y < 0 || x >= S || y >= S) break;
-            c.at(x, y) = vec4(col, 1);
+    auto line = [&](float x0, float y0, float ang, float len, vec3 col0, vec3 col1, int thick) {
+        for (int q = 0; q < (int)len; q++) {
+            int x = (int)(x0 + std::cos(ang) * q), y = (int)(y0 + std::sin(ang) * q);
+            vec3 col = col0 + (col1 - col0) * ((float)q / len);
+            for (int t = 0; t < thick; t++)
+                if (x + t > 0 && y > 0 && x + t < S - 1 && y < S - 1) c.at(x + t, y) = vec4(col, 1);
+        }
+    };
+    const int twigs = 13;
+    for (int t = 0; t < twigs; t++) {
+        // (the card's v runs up the bough: twigs from its middle line outwards and up)
+        float along = (t + 0.5f) / twigs;
+        float side = t % 2 ? 1.0f : -1.0f;
+        float x0 = S * 0.5f, y0 = S * (0.96f - 0.86f * along);
+        float ang = -kPi * 0.5f + side * rng.range(0.75f, 1.25f);
+        float len = S * rng.range(0.26f, 0.44f) * (1.0f - 0.45f * along);
+        float depth = 0.6f + 0.4f * rng.uniform();
+        line(x0, y0, ang, len, vec3(0.20f, 0.14f, 0.09f), vec3(0.17f, 0.13f, 0.08f), 2);
+        for (int q = 4; q < (int)len; q += 2) {
+            float px = x0 + std::cos(ang) * q, py = y0 + std::sin(ang) * q;
+            for (int sd = -1; sd <= 1; sd += 2) {
+                float na = ang + sd * rng.range(0.55f, 1.0f);
+                vec3 g = vec3(0.07f, 0.20f, 0.09f) * depth * rng.range(0.75f, 1.25f);
+                line(px, py, na, rng.range(9, 16), g, g * vec3(1.5f, 1.45f, 1.2f), 1);
+            }
         }
     }
+    line(S * 0.5f, S * 0.98f, -kPi * 0.5f, S * 0.9f, vec3(0.21f, 0.15f, 0.10f), vec3(0.18f, 0.13f, 0.08f), 3);
     return make_tex(c, "<needles>", true);
 }
 
@@ -329,15 +366,19 @@ void SharedAssets::init() {
     leaves = mat(tex_leaf, vec4(1), 0.15f, 12);
     leaves->alpha_ref = 0.5f;
     leaves->double_sided = true;
+    leaves->foliage = true;
     leaves2 = mat(tex_leaf2, vec4(1), 0.15f, 12);
     leaves2->alpha_ref = 0.5f;
     leaves2->double_sided = true;
+    leaves2->foliage = true;
     needles = mat(tex_needle, vec4(1), 0.1f, 8);
     needles->alpha_ref = 0.45f;
     needles->double_sided = true;
+    needles->foliage = true;
     bush = mat(tex_leaf2, vec4(0.8f, 0.9f, 0.7f, 1), 0.1f, 8);
     bush->alpha_ref = 0.5f;
     bush->double_sided = true;
+    bush->foliage = true;
     cone_mat = mat(white_tex, vec4(0.95f, 0.35f, 0.05f, 1), 0.4f, 24);
     banner = mat(gen_banner(), vec4(1), 0.2f, 16);
     tape = mat(tex_tape, vec4(1), 0.25f, 24);

@@ -1,4 +1,6 @@
 #include "gfx/renderer.h"
+
+#include <cstdlib>
 #include "core/profiler.h"
 #include "core/util.h"
 
@@ -23,6 +25,12 @@ bool Renderer::init() {
     ok &= m_sky.load("sky");
     ok &= m_terrain.load("terrain");
     ok &= m_lines.load("lines");
+    ok &= m_post_ao.load("post_ao");
+    ok &= m_post_blur.load("post_blur");
+    ok &= m_post_final.load("post_final");
+    if (getenv("BL_NOPOST")) post_fx = false;
+    if (const char* e = getenv("BL_AO")) ao_strength = (float)atof(e);       // (diagnostics: the occlusion's and the bloom's strengths)
+    if (const char* e = getenv("BL_BLOOM")) bloom_strength = (float)atof(e);
     if (!ok) return false;
 
     glGenTextures(1, &m_shadow_tex);
@@ -169,6 +177,7 @@ void Renderer::set_common_uniforms(Shader& s) {
     s.set("u_fog_color", m_light.fog_color);
     s.set("u_fog_density", m_light.fog_density);
     s.set("u_exposure", m_light.exposure);
+    s.set("u_hdr", m_hdr ? 1.0f : 0.0f);
     s.set_array("u_shadow_mat", m_shadow_mat, 3);
     s.set("u_cascade_far", vec3(m_cascade_far[0], m_cascade_far[1], m_cascade_far[2]));
     s.set("u_shadow_enabled", m_light.shadows ? 1.0f : 0.0f);
@@ -176,6 +185,15 @@ void Renderer::set_common_uniforms(Shader& s) {
     s.set("u_viewproj", m_cam.viewproj);
     s.set("u_time", m_time);
     s.set("u_wind", vec3(1, 0, 0.5f));
+    // (the sky's panorama for the reflections: unit 5, the sky's own)
+    s.set("u_env_on", m_light.sky_panorama ? 1.0f : 0.0f);
+    s.set("u_env_yaw", m_light.sky_yaw);
+    s.set("u_env", 5);
+    if (m_light.sky_panorama) {
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, m_light.sky_panorama->id);
+        glActiveTexture(GL_TEXTURE0);
+    }
 }
 
 void Renderer::bind_material(Shader& s, const Material* m) {
@@ -188,6 +206,8 @@ void Renderer::bind_material(Shader& s, const Material* m) {
     s.set("u_spec", m->specular);
     s.set("u_gloss", m->gloss);
     s.set("u_reflect", m->reflect);
+    s.set("u_foliage", m->foliage ? 1.0f : 0.0f);
+    s.set("u_surface", (float)m->surface);
     s.set("u_blend", m->blend ? 1.0f : 0.0f);
     s.set("u_emissive", m->emissive);
     s.set("u_unlit", m->unlit ? 1.0f : 0.0f);
@@ -313,6 +333,7 @@ void Renderer::flush_debug() {
     if (m_lines_buf.empty() && m_points_buf.empty() && m_strips_buf.empty()) return;
     PROFILE_ZONE("Debug draw");
     m_lines.use();
+    m_lines.set("u_hdr", m_hdr ? 1.0f : 0.0f);
     m_lines.set("u_viewproj", m_cam.viewproj);
     glBindVertexArray(m_line_vao);
     glBindBuffer(GL_ARRAY_BUFFER, m_line_vbo);
@@ -381,7 +402,8 @@ void Renderer::render() {
 
     {
         PROFILE_ZONE("Main pass");
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        m_hdr = post_fx && m_vx < 0 && post_targets(m_w, m_h);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_hdr ? m_ms_fbo : 0);
         if (m_vx >= 0) {
             glViewport(m_vx, m_vy, m_vw, m_vh);
             glEnable(GL_SCISSOR_TEST);
@@ -420,6 +442,20 @@ void Renderer::render() {
                 }
                 glActiveTexture(GL_TEXTURE0);
             }
+            const bool paved = detail && terrain_paved && terrain_paved->diffuse;
+            if (paved) {
+                TextureCache& tc = TextureCache::get();
+                const GLuint ids[3] = {terrain_paved->diffuse->id, (terrain_paved->normal_map ? terrain_paved->normal_map : tc.flat_normal())->id,
+                                       (terrain_paved->rough_map ? terrain_paved->rough_map : tc.white())->id};
+                const char* names[3] = {"u_paved", "u_paved_normal", "u_paved_rough"};
+                for (int k = 0; k < 3; k++) {
+                    glActiveTexture(GL_TEXTURE10 + k);
+                    glBindTexture(GL_TEXTURE_2D, ids[k]);
+                    m_terrain.set(names[k], 10 + k);
+                }
+                glActiveTexture(GL_TEXTURE0);
+            }
+            m_terrain.set("u_has_paved", paved ? 1 : 0);
             m_terrain.set("u_has_detail", detail ? 1 : 0);
             m_terrain_mesh->draw();
             m_draw_calls++;
@@ -473,12 +509,136 @@ void Renderer::render() {
         glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
         flush_debug();
         glDisable(GL_SCISSOR_TEST);
+        if (m_hdr) post_process();
+        m_hdr = false;
     }
     glEndQuery(GL_TIME_ELAPSED);
     m_query_pending[qi] = true;
     m_query_idx ^= 1;
     glBindVertexArray(0);
     glEnable(GL_CULL_FACE);
+}
+
+// The post-process's buffers at the framebuffer's size (made again when it changes). False: not available.
+bool Renderer::post_targets(int w, int h) {
+    if (w == m_pw && h == m_ph && m_ms_fbo) return true;
+    auto tex = [](GLuint& t, int tw, int th, GLint internal, GLenum format, GLenum type, GLint filter) {
+        if (!t) glGenTextures(1, &t);
+        glBindTexture(GL_TEXTURE_2D, t);
+        glTexImage2D(GL_TEXTURE_2D, 0, internal, tw, th, 0, format, type, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    };
+    auto fbo = [](GLuint& f, GLuint color, GLuint depth) {
+        if (!f) glGenFramebuffers(1, &f);
+        glBindFramebuffer(GL_FRAMEBUFFER, f);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+        if (depth) glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
+        return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    };
+    bool ok = true;
+    if (!m_ms_fbo) glGenFramebuffers(1, &m_ms_fbo), glGenRenderbuffers(1, &m_ms_color), glGenRenderbuffers(1, &m_ms_depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_ms_color);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA16F, w, h);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_ms_depth);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_DEPTH_COMPONENT24, w, h);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_ms_fbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, m_ms_color);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_ms_depth);
+    ok &= glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    tex(m_rs_color, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, GL_LINEAR);
+    tex(m_rs_depth, w, h, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, GL_NEAREST);
+    ok &= fbo(m_rs_fbo, m_rs_color, m_rs_depth);
+    for (int k = 0; k < 2; k++) {
+        tex(m_ao_tex[k], std::max(1, w / 2), std::max(1, h / 2), GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_LINEAR);
+        ok &= fbo(m_ao_fbo[k], m_ao_tex[k], 0);
+    }
+    for (int k = 0; k < kBloomLevels; k++) {
+        tex(m_bloom_tex[k], std::max(1, w >> (k + 1)), std::max(1, h >> (k + 1)), GL_RGBA16F, GL_RGBA, GL_FLOAT, GL_LINEAR);
+        ok &= fbo(m_bloom_fbo[k], m_bloom_tex[k], 0);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    m_pw = ok ? w : 0, m_ph = ok ? h : 0;
+    if (!ok) {
+        log_warn("the post-process's buffers could not be made: drawing straight to the screen");
+        post_fx = false;
+    }
+    return ok;
+}
+
+// The scene (in the multisampled buffer) to the screen: resolved, its occlusion and its bloom found, then the picture.
+void Renderer::post_process() {
+    PROFILE_ZONE("Post");
+    const int w = m_pw, h = m_ph;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_ms_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_rs_fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+    glDepthMask(GL_FALSE);
+    glBindVertexArray(m_empty_vao);
+    glActiveTexture(GL_TEXTURE0);
+    auto pass = [&](GLuint target, int tw, int th, GLuint src) {
+        glBindFramebuffer(GL_FRAMEBUFFER, target);
+        glViewport(0, 0, tw, th);
+        glBindTexture(GL_TEXTURE_2D, src);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        m_draw_calls++;
+    };
+    const int hw = std::max(1, w / 2), hh = std::max(1, h / 2);
+    // the occlusion at half size, then smoothed
+    m_post_ao.use();
+    m_post_ao.set("u_depth", 0);
+    m_post_ao.set("u_proj", m_cam.proj);
+    m_post_ao.set("u_inv_proj", inverse(m_cam.proj));
+    m_post_ao.set("u_radius", ao_radius);
+    m_post_ao.set("u_texel", vec2(1.0f / hw, 1.0f / hh));
+    pass(m_ao_fbo[0], hw, hh, m_rs_depth);
+    m_post_blur.use();
+    m_post_blur.set("u_src", 0);
+    m_post_blur.set("u_mode", 3);
+    m_post_blur.set("u_texel", vec2(1.0f / hw, 1.0f / hh));
+    pass(m_ao_fbo[1], hw, hh, m_ao_tex[0]);
+    // the bloom: the brights at half size, down the levels, then back up, each added to the one above
+    m_post_blur.set("u_mode", 0);
+    m_post_blur.set("u_texel", vec2(1.0f / w, 1.0f / h));
+    pass(m_bloom_fbo[0], hw, hh, m_rs_color);
+    m_post_blur.set("u_mode", 1);
+    for (int k = 1; k < kBloomLevels; k++) {
+        m_post_blur.set("u_texel", vec2(1.0f / std::max(1, w >> k), 1.0f / std::max(1, h >> k)));
+        pass(m_bloom_fbo[k], std::max(1, w >> (k + 1)), std::max(1, h >> (k + 1)), m_bloom_tex[k - 1]);
+    }
+    m_post_blur.set("u_mode", 2);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    for (int k = kBloomLevels - 2; k >= 0; k--) {
+        m_post_blur.set("u_texel", vec2(1.0f / std::max(1, w >> (k + 2)), 1.0f / std::max(1, h >> (k + 2))));
+        pass(m_bloom_fbo[k], std::max(1, w >> (k + 1)), std::max(1, h >> (k + 1)), m_bloom_tex[k + 1]);
+    }
+    glDisable(GL_BLEND);
+    // the picture
+    m_post_final.use();
+    m_post_final.set("u_color", 0);
+    m_post_final.set("u_ao", 2);
+    m_post_final.set("u_bloom", 3);
+    m_post_final.set("u_ao_strength", ao_strength);
+    m_post_final.set("u_bloom_strength", bloom_strength);
+    static const bool ao_view = getenv("BL_AOVIEW") != nullptr; // (diagnostics: the occlusion alone)
+    m_post_final.set("u_debug", ao_view ? 1.0f : 0.0f);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, m_ao_tex[1]);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, m_bloom_tex[0]);
+    glActiveTexture(GL_TEXTURE0);
+    pass(0, w, h, m_rs_color);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 }
 
 void Renderer::clear_screen(int w, int h, vec3 color) {

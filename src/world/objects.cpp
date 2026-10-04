@@ -495,8 +495,10 @@ void ShellVisual::upload(bool first) {
 }
 
 void TreeVisual::update(const SoftBody& b, bool first) {
-    // bark: 8-sided rings at both ends of each segment, oriented by the parent frame
-    const int sides = 7;
+    // bark: a ring at both ends of each segment round its axis, both from one reference across it (the parent frame's
+    // x: each end from its own frame's, the frames turned at random about their axes, a segment was a twisted waist and
+    // its faces crossed), wound to face outwards, a cap on its far end (a pole's tip, a broken branch: no look inside)
+    const int sides = 8;
     bv.clear();
     if (first) bi.clear();
     for (const Segment& s : segments) {
@@ -504,7 +506,6 @@ void TreeVisual::update(const SoftBody& b, bool first) {
         const Frame& pf = b.frames[j.parent_frame];
         vec3 p0 = b.nodes[pf.node].p, p1 = b.nodes[j.child_node].p;
         quat q0 = pf.q;
-        quat q1 = j.child_frame >= 0 ? b.frames[j.child_frame].q : pf.q;
         if (j.broken) {
             // hide broken connection by collapsing the segment onto the child
             p0 = p1;
@@ -512,38 +513,64 @@ void TreeVisual::update(const SoftBody& b, bool first) {
         vec3 axis = normalize_or(p1 - p0, q0.rotate(vec3(0, 1, 0)));
         float len = length(p1 - p0);
         uint32_t base = (uint32_t)bv.size();
+        vec3 ref = q0.rotate(vec3(1, 0, 0));
+        vec3 u = normalize_or(ref - axis * dot(ref, axis), any_perpendicular(axis));
+        vec3 w = cross(axis, u);
         for (int e = 0; e < 2; e++) {
-            quat q = e == 0 ? q0 : q1;
             vec3 c = e == 0 ? p0 : p1;
             float r = e == 0 ? s.r0 : s.r1;
-            // ring plane perpendicular to the segment, twist from the frame
-            vec3 ref = q.rotate(vec3(1, 0, 0));
-            vec3 u = normalize_or(ref - axis * dot(ref, axis), any_perpendicular(axis));
-            vec3 w = cross(axis, u);
             for (int k = 0; k <= sides; k++) {
                 float a = 2 * kPi * k / sides;
                 vec3 n = u * std::cos(a) + w * std::sin(a);
-                bv.push_back({c + n * r, n, vec2((float)k / sides, e ? len * 0.5f : 0.0f)});
+                bv.push_back({c + n * r, n, vec2((float)k / sides * 2.0f, e ? len * 0.5f : 0.0f)});
             }
         }
-        if (first)
+        // (the cap: the far ring again with the axis for its normal, a fan round its middle)
+        for (int k = 0; k <= sides; k++) {
+            float a = 2 * kPi * k / sides;
+            bv.push_back({p1 + (u * std::cos(a) + w * std::sin(a)) * s.r1, axis, vec2(0.5f + 0.2f * std::cos(a), 0.2f * std::sin(a))});
+        }
+        bv.push_back({p1, axis, vec2(0.5f, 0.0f)});
+        if (first) {
             for (int k = 0; k < sides; k++) {
                 uint32_t a0 = base + k, a1 = base + k + 1, b0 = base + sides + 1 + k, b1 = b0 + 1;
-                bi.insert(bi.end(), {a0, b0, a1, a1, b0, b1});
+                bi.insert(bi.end(), {a0, a1, b0, a1, b1, b0});
             }
+            const uint32_t cap = base + 2 * (sides + 1), mid = cap + sides + 1;
+            for (int k = 0; k < sides; k++) bi.insert(bi.end(), {cap + k, cap + k + 1, mid});
+        }
     }
-    // leaves: two crossed quads per cluster
+    // leaves: three planes per cluster crossed about its stem. Their normals point out of the crown (from its middle,
+    // lifted a little: the crown is lit as one rounded mass, not card by card), their length is how open the cluster is
+    // to the sky - deep in the crown and low in it darker (shade_foliage)
     lv.clear();
     if (first) li.clear();
+    vec3 crown(0);
+    float crown_r = 0.5f;
+    if (!leaves.empty()) {
+        for (const Leaf& l : leaves) {
+            const Frame& f = b.frames[l.frame];
+            crown += b.nodes[f.node].p + f.q.rotate(l.offset);
+        }
+        crown = crown / (float)leaves.size();
+        for (const Leaf& l : leaves) {
+            const Frame& f = b.frames[l.frame];
+            crown_r = std::max(crown_r, length(b.nodes[f.node].p + f.q.rotate(l.offset) - crown));
+        }
+    }
     for (const Leaf& l : leaves) {
         const Frame& f = b.frames[l.frame];
         vec3 c = b.nodes[f.node].p + f.q.rotate(l.offset);
         quat q = f.q * l.rot;
         float s = l.size * 0.5f;
-        for (int k = 0; k < 2; k++) {
-            vec3 ax = q.rotate(k == 0 ? vec3(1, 0, 0) : vec3(0, 0, 1));
-            vec3 ay = q.rotate(vec3(0, 1, 0));
-            vec3 nrm = normalize(cross(ax, ay) + ay * 0.8f); // bent normals: softer lighting
+        const vec3 out = c - crown;
+        const float depth = clampf(length(out) / crown_r, 0.0f, 1.0f);
+        const float ao = clampf(0.35f + 0.65f * depth * depth + 0.25f * out.y / crown_r, 0.25f, 1.0f);
+        const vec3 nrm = normalize_or(out + vec3(0, 0.35f * crown_r, 0), vec3(0, 1, 0)) * ao;
+        const vec3 ay = q.rotate(vec3(0, 1, 0));
+        for (int k = 0; k < 3; k++) {
+            const float a = kPi * (float)k / 3.0f;
+            vec3 ax = q.rotate(vec3(std::cos(a), 0, std::sin(a)));
             uint32_t base = (uint32_t)lv.size();
             lv.push_back({c - ax * s - ay * s, nrm, {0, 1}});
             lv.push_back({c + ax * s - ay * s, nrm, {1, 1}});
@@ -1462,7 +1489,7 @@ struct TreeBuild {
             TreeVisual::Leaf l;
             l.frame = (uint32_t)f;
             l.offset = vec3(rng.range(-spread, spread), rng.range(-spread * 0.3f, spread * 0.8f), rng.range(-spread, spread));
-            l.rot = quat::axis_angle(vec3(0, 1, 0), rng.range(0, 2 * kPi)) * quat::axis_angle(vec3(1, 0, 0), rng.range(-0.5f, 0.5f));
+            l.rot = quat::axis_angle(vec3(0, 1, 0), rng.range(0, 2 * kPi)) * quat::axis_angle(vec3(1, 0, 0), rng.range(-0.9f, 0.9f));
             l.size = size * rng.range(0.8f, 1.2f);
             l.tint = vec4(1);
             vis->leaves.push_back(l);
@@ -1505,8 +1532,8 @@ struct TreeBuild {
                 }
             }
             if (leafy && (depth >= 1 || s >= segs - 1)) {
-                float sz = d->kind == TreeKind::Birch ? 1.1f : (d->kind == TreeKind::Bush ? 0.9f : 1.6f);
-                add_leaves(n, sz, depth == 0 ? 3 : 2, seg_len * 0.6f, nullptr);
+                float sz = d->kind == TreeKind::Birch ? 0.95f : (d->kind == TreeKind::Bush ? 0.8f : 1.25f);
+                add_leaves(n, sz, depth == 0 ? 4 : 3, seg_len * 0.75f, nullptr);
             }
             prev = n;
             prev_r = r;

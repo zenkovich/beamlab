@@ -33,6 +33,7 @@ TEXTURES = {
     "asphalt_new": ("Asphalt025C", "1K"),     # dark fresh asphalt: repair patches
     "asphalt_worn": ("Asphalt019", "2K"),     # cracked, patched asphalt
     "asphalt_light": ("Asphalt031", "1K"),    # worn light asphalt
+    "asphalt_fine": ("Asphalt014", "2K"),     # even mid-grey asphalt, fine aggregate: the roads' and the terrain's paving
     "grass": ("Grass004", "2K"),
     "dirt": ("Ground054", "2K"),
     "gravel": ("Gravel022", "1K"),

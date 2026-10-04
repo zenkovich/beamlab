@@ -28,6 +28,12 @@ struct Material {
     bool double_sided = false;
     bool cast_shadow = true;
     bool unlit = false;
+    // (leaves: lit from both sides, the sun's light through them, no highlight; the normal's length is the vertex's
+    // occlusion - how deep in the crown it is)
+    bool foliage = false;
+    // (a car's surfaces: its paint under a clear coat, glass, polished metal - each lit its own way, the sky in them)
+    enum Surface : uint8_t { Plain = 0, Paint = 1, Glass = 2, Chrome = 3, Lens = 4 };
+    uint8_t surface = Plain;
     float specular = 0.25f;
     float gloss = 24.0f;
     float reflect = 0.0f;
@@ -79,6 +85,8 @@ public:
     // the terrain's ground: tiled grass and earth materials (colour, normal map), the splat their tint; none: the
     // shader's noise over the splat as before
     MaterialPtr terrain_grass, terrain_dirt;
+    // (and its paving - asphalt, concrete: the splat's colour in an asphalt's grain, its normal and roughness maps)
+    MaterialPtr terrain_paved;
 
     // Debug primitives (world space).
     void line(vec3 a, vec3 b, uint32_t color);
@@ -95,6 +103,11 @@ public:
     void set_viewport(int x, int y, int w, int h) { m_vx = x, m_vy = y, m_vw = w, m_vh = h; }
     void clear_screen(int w, int h, vec3 color);
     bool draw_sky = true;
+    // The post-process (a full view alone, not the editor's split views): the scene drawn into a buffer of linear light,
+    // then over it the ambient occlusion off its depth, the bloom of its brights, the film curve and the grade
+    // (BL_NOPOST=1: straight to the screen as before)
+    bool post_fx = true;
+    float ao_strength = 0.9f, ao_radius = 0.7f, bloom_strength = 0.07f;
     bool sky_clouds = true;  // off: the sky is a plain gradient with the horizon (the model editor)
 
     const Camera& camera() const { return m_cam; }
@@ -139,6 +152,16 @@ private:
     void compute_cascades();
 
     Shader m_mesh, m_mesh_vc, m_mesh_inst, m_mesh_wind, m_shadow, m_shadow_inst, m_sky, m_terrain, m_lines;
+    Shader m_post_ao, m_post_blur, m_post_final;
+    // (the post-process's buffers: the scene multisampled, resolved - colour and depth as textures -, the occlusion at
+    // half size and its blur, the bloom's levels)
+    static constexpr int kBloomLevels = 5;
+    GLuint m_ms_fbo = 0, m_ms_color = 0, m_ms_depth = 0, m_rs_fbo = 0, m_rs_color = 0, m_rs_depth = 0;
+    GLuint m_ao_fbo[2] = {0, 0}, m_ao_tex[2] = {0, 0}, m_bloom_fbo[kBloomLevels] = {}, m_bloom_tex[kBloomLevels] = {};
+    int m_pw = 0, m_ph = 0;
+    bool m_hdr = false;   // (this render goes into the post-process's buffer)
+    bool post_targets(int w, int h);
+    void post_process();
     GLuint m_shadow_tex = 0, m_shadow_fbo = 0;
     GLuint m_line_vao = 0, m_line_vbo = 0;
     GLuint m_empty_vao = 0;

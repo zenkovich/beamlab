@@ -18,6 +18,8 @@ uniform float u_gloss;
 uniform float u_reflect;
 uniform vec3 u_emissive;
 uniform float u_unlit;
+uniform float u_foliage;
+uniform float u_surface;   // 0 as it is, 1 a car's paint, 2 glass, 3 polished metal, 4 a lamp
 uniform float u_pbr;
 uniform sampler2D u_normal_map;
 uniform sampler2D u_rough_map;
@@ -55,9 +57,15 @@ void main() {
     }
     vec3 albedo = srgb_to_linear(base.rgb);
     vec3 N = normalize(v_normal);
-    if (!gl_FrontFacing) N = -N;
+    if (!gl_FrontFacing && u_foliage < 0.5) N = -N;
     vec3 col;
+    float alpha = base.a;
     if (u_unlit > 0.5) col = albedo;
+    else if (u_foliage > 0.5) col = shade_foliage(albedo, N, v_wpos, clamp(length(v_normal), 0.0, 1.0));
+    else if (u_surface > 3.5) col = shade_lens(albedo, base.a, N, v_wpos, alpha);
+    else if (u_surface > 2.5) col = shade_chrome(albedo, N, v_wpos);
+    else if (u_surface > 1.5) col = shade_glass(albedo, base.a, N, v_wpos, alpha);
+    else if (u_surface > 0.5) col = shade_paint(albedo, N, v_wpos);
 #ifndef VCOLOR
     else if (u_pbr > 0.5) {
         // the normal map in the surface's own frame, from the position's and the uv's screen derivatives
@@ -77,5 +85,5 @@ void main() {
     else col = shade(albedo, N, v_wpos, u_spec, u_gloss, u_reflect, 1.0);
     col += u_emissive;
     col = apply_fog(col, v_wpos);
-    frag = vec4(tonemap(col), base.a);
+    frag = vec4(tonemap(col), alpha);
 }

@@ -17,6 +17,10 @@ void main() {
         vec3 c = textureGrad(u_panorama, uv, vec2(length(dFdx(dir)) / 6.2831853, 0.0), vec2(0.0, length(dFdy(dir)) / 3.14159265)).rgb;
         // (below the horizon the ground's colour: the terrain's far edge meets it)
         c = mix(c, pow(u_fog_color, vec3(1.0 / 2.2)), smoothstep(0.0, -0.08, dir.y));
+        if (u_hdr > 0.5) {   // (the picture's light again: linear, its brights stretched back out - the sun's glow blooms)
+            vec3 l = srgb_to_linear(c);
+            c = l * (1.0 + 5.0 * l * l * l) * 1.12 / max(u_exposure, 0.05) * 0.9;
+        }
         frag = vec4(c, 1.0);
         return;
     }

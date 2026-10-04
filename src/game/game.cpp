@@ -3,6 +3,7 @@
 #include "core/profiler.h"
 #include "core/util.h"
 #include "vehicle/vehicle.h"
+#include "world/static_model.h"
 
 #include <algorithm>
 #include <unordered_map>
@@ -175,6 +176,9 @@ void Game::load_scene(int index) {
     world.settings.wind = vec3(0);
     world.settings.wind_radius = 0;
     light = LightSettings();
+    // (the panorama's sky and its sun for every scene; one that sets a sun of its own keeps the gradient sky: below)
+    panorama_sky(light);
+    const vec3 sky_sun = light.sun_dir;
     scene_update = nullptr;
     scene_hint.clear();
     scene_status.clear();
@@ -190,6 +194,7 @@ void Game::load_scene(int index) {
     scene_index = index;
     double t0 = time_seconds();
     reg[index].build(*this);
+    if (light.sky_panorama && length(light.sun_dir - sky_sun) > 1e-4f) light.sky_panorama = nullptr;
     world.statics.build_grid();
     presettle_static_objects();
     for (auto& o : objects) o->visuals_dirty = true;

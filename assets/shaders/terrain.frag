@@ -8,6 +8,10 @@ uniform sampler2D u_grass_normal;
 uniform sampler2D u_dirt;          // tiled earth: colour, normal
 uniform sampler2D u_dirt_normal;
 uniform int u_has_detail;
+uniform sampler2D u_paved;         // the paving's grain: an asphalt's colour, normal, roughness
+uniform sampler2D u_paved_normal;
+uniform sampler2D u_paved_rough;
+uniform int u_has_paved;
 out vec4 frag;
 
 float hash2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -67,6 +71,26 @@ void main() {
     albedo = mix(albedo, rock_col, rock);
     float spec = mix(0.05, 0.15, paved);
     vec3 col = shade(albedo, N, v_wpos, spec, 16.0, 0.0, 1.0);
+    if (u_has_paved != 0 && paved > 0.01) {
+        // Paving: the splat's colour (asphalt dark, concrete light) in an asphalt's grain - the texture over its own
+        // mean, at two scales against the tiling's repeat - with the stains of a used road (broad darker and paler
+        // patches, a worn lighter band where it is driven most: the large scale's noise), its normal map near the eye and
+        // its roughness map: lit by roughness, the sky's sheen at a glance
+        vec2 uv = v_wpos.xz;
+        float near = 1.0 - smoothstep(30.0, 110.0, d);
+        vec3 mean = srgb_to_linear(textureLod(u_paved, uv * 0.2, 9.0).rgb);
+        vec3 t1 = srgb_to_linear(texture(u_paved, uv * 0.42).rgb), t2 = srgb_to_linear(texture(u_paved, uv.yx * 0.057 + 0.37).rgb);
+        vec3 grain = mix(t2, t1, 0.4 + 0.35 * near) / max(mean, vec3(0.02));
+        float stain = fbm(uv * 0.045 + 7.0), patch_ = fbm(uv * 0.19 - 3.0);
+        vec3 tint = srgb_to_linear(sp.rgb);
+        tint = mix(vec3(dot(tint, vec3(0.3, 0.5, 0.2))), tint, 0.35) * vec3(1.04, 1.0, 0.95) * 1.15;   // (the splat's paving is bluish: a road's grey)
+        vec3 pav = tint * grain * (0.82 + 0.30 * stain) * (0.93 + 0.14 * patch_);
+        vec3 tn = texture(u_paved_normal, uv * 0.42).xyz * 2.0 - 1.0;
+        vec3 Np = normalize(normalize(v_normal) + vec3(tn.x, 0.0, -tn.y) * (0.8 * near));
+        float rough = clamp(texture(u_paved_rough, uv * 0.42).r * (0.92 - 0.12 * patch_), 0.3, 1.0);
+        vec3 pc = shade_pbr(pav, Np, v_wpos, mix(0.85, rough, near), 1.0);
+        col = mix(col, pc, paved);
+    }
     col = apply_fog(col, v_wpos);
     frag = vec4(tonemap(col), 1.0);
 }
