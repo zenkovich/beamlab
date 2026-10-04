@@ -843,6 +843,14 @@ public:
     }
     bool sheet_on_plates = false;
     float plates_quiet = 0;             // seconds since it was last touched or its frame's topology changed
+    // (what counts as a touch: another body's, a ball's; a volume of its own closing on a plate (not lying on it: the
+    // engine's lies on its mounts' plates as it drives); the static world's while the body moves as a whole - a wreck
+    // lying on the road carries its own weight only)
+    int plates_hits = 0;                // (this frame's: other bodies' triangles, its own volumes closing)
+    int plates_static = 0;              // (this frame's: the plates' mid points on the static world)
+    float plates_rms = 1e9f;            // (the body's speed as a whole at the last frame's end)
+    static constexpr float kPlatesMoving = 0.5f, kPlatesClosing = 1.0f;
+    bool plates_touched() const { return body_contacts + sphere_touches + plates_hits > 0 || (static_contacts + plates_static > 0 && plates_rms > kPlatesMoving); }
     int plates_topo = 0;                // (the frame's tears, bisections and splits at the last frame's end)
     // A sheet whose hinges must be stiffer than the substep lets them (thin metal that holds its shape: a drum): its
     // short steps are at least 2^this per substep and every triangle is evaluated at least that often (0..2)

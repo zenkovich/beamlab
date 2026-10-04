@@ -82,6 +82,7 @@ bool App::init(const AppOptions& opt) {
     // (the terrain's ground materials: assets/textures, tools/fetch_assets.py; without them the shader's noise)
     m_renderer.terrain_grass = pbr_material("grass");
     m_renderer.terrain_dirt = pbr_material("dirt");
+    m_renderer.terrain_paved = pbr_material("asphalt_fine");
     register_metrics();
 
     // initial scene / vehicle
@@ -1157,6 +1158,10 @@ int App::run(const AppOptions& opt) {
         dt = std::min(dt, 0.1f);
         m_frame_ms = dt * 1000.0;
         m_fps = m_fps * 0.9f + 0.1f * (dt > 0 ? 1.0f / dt : 0);
+        // (a frame the physics could not keep up with is not caught up on: twice the steps next frame take twice as long, and
+        // the rate falls to the clamp - the simulation slows down under 30 frames a second instead)
+        static const float max_step = getenv("BL_MAXSTEP") ? (float)atof(getenv("BL_MAXSTEP")) : 0.034f;
+        if (!fixed) dt = std::min(dt, max_step);
         if (!fixed && !opt.realtime) dt = pace(dt);
         static const bool prof_env = getenv("BL_PROFCSV") != nullptr;
         m_game.world.settings.element_stats = m_show_perf || prof_env || !m_rec_path.empty(); // (counting costs a pass)
@@ -1263,7 +1268,7 @@ void App::write_prof_csv(float dt) {
         for (const char* z : zone_names) fprintf(m_prof_csv, ",%s", z);
         fprintf(m_prof_csv, ",bodies,bodies_awake,pieces,pieces_awake,pieces_rigid,nodes,nodes_awake,beams,beams_awake,beams_broken,shells,shells_awake,"
                             "shells_L0,shells_L1,shells_L2,shells_L3,shells_L4,shells_x1,shells_x2,shells_x4,hinges,hinges_awake,edges_border,"
-                            "edges_crack,edges_cut,tris,tris_awake,impacts,node_steps,shell_evals,hinge_evals,beam_evals,contact_pairs");
+                            "edges_crack,edges_cut,tris,tris_awake,impacts,node_steps,shell_evals,hinge_evals,beam_evals,contact_pairs,gpu_ms,fb_w,fb_h");
         fprintf(m_prof_csv, "\n");
     }
     const auto& st = m_game.world.stats();
@@ -1286,7 +1291,7 @@ void App::write_prof_csv(float dt) {
             e.shells_level[0], e.shells_level[1], e.shells_level[2], e.shells_level[3], e.shells_level[4], e.shells_rate[0], e.shells_rate[1],
             e.shells_rate[2], e.hinges, e.hinges_awake, e.edges_border, e.edges_crack, e.edges_cut, e.tris, e.tris_awake, e.impacts, e.node_steps,
             e.shell_evals, e.hinge_evals, e.beam_evals, st.contact_pairs);
-    fprintf(m_prof_csv, "\n");
+    fprintf(m_prof_csv, ",%.3f,%d,%d\n", m_renderer.gpu_ms(), m_fb_w, m_fb_h);
 }
 
 // One sample of the Elements graphs per frame (while the performance widget is open and not frozen).

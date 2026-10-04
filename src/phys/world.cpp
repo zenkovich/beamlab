@@ -714,12 +714,15 @@ void World::build_islands(float frame_time) {
         isl.cyl_ids.resize(isl.bodies.size());
         isl.terrain_max.resize(isl.bodies.size());
         for (size_t k = 0; k < isl.bodies.size(); k++) {
+            static const bool dbg = getenv("BL_STATDBG") != nullptr;
             SoftBody& b = *isl.bodies[k];
             AABB a = b.aabb;
             a.expand(std::min(b.max_speed, 200.0f) * frame_time * 2.0f + 0.5f);
             isl.box_ids[k].clear();
             isl.cyl_ids[k].clear();
             statics.query(a, isl.box_ids[k], isl.cyl_ids[k]);
+            if (static int tick = 0; dbg && isl.box_ids[k].size() > 8 && (tick++ % 4000) == 0)
+                fprintf(stderr, "statics: %s: %zu boxes, %zu cylinders, bounds %.1f x %.1f x %.1f\n", isl.bodies[k]->name.c_str(), isl.box_ids[k].size(), isl.cyl_ids[k].size(), a.mx.x - a.mn.x, a.mx.y - a.mn.y, a.mx.z - a.mn.z);
             isl.terrain_max[k] = statics.has_terrain ? statics.terrain.max_height(a.mn.x, a.mn.z, a.mx.x, a.mx.z) +
                                                            (statics.road ? statics.road->max_raise : 0.0f) + statics.paved.max_raise
                                                      : -1e30f;
@@ -1092,6 +1095,7 @@ void World::static_mids_apply(SoftBody& b, const std::vector<StaticMid>& hits, f
         }
         contacts++;
         b.mid_contacts++;
+        b.plates_static++;
         b.mid_touch[h.k] |= 1;
         // (a fast blow on a plate lays its fracture pattern there: a pole's, a wall's)
         if (b.fem.patterned() && -dot(v, c.normal) >= b.fem.pattern_speed()) // (the body's own speed: not its light node's shaking)
@@ -1333,6 +1337,7 @@ int World::collide_volumes(Island& isl, float dt, bool bodies, int stage) {
                 }
                 B.mid_contacts++;
                 if (h.kind == 3) B.body_contacts++;
+                else if (std::fabs(dot(v - V.vel_at(h.p), h.n)) > SoftBody::kPlatesClosing) B.plates_hits++;
                 break;
             }
             case 5: {
@@ -3070,6 +3075,7 @@ void World::collide_mid_pairs(Island& isl, bool detected) {
                                     SB[0] ? SB : nullptr)) {
                 contacts++, bm.touch(bt), bt.touch(bm);
                 bm.mid_contacts++;
+                bm.plates_hits++;
                 if (bm.mid_touch.size() != bm.fem.tris.size()) bm.mid_touch.assign(bm.fem.tris.size(), 0);
                 bm.mid_touch[pr.mid] |= 2;
                 if (bm.fem.patterned()) { // (a fast blow on the plate: its fracture pattern)
@@ -3109,6 +3115,7 @@ void World::simulate_island(Island& isl, int substeps) {
         b->sphere_touches = 0;
         b->body_contacts = 0;
         b->mid_contacts = 0;
+        b->plates_hits = b->plates_static = 0;
         if (!b->fem.tris.empty()) b->mid_touch.assign(b->fem.tris.size(), 0);
         b->touched.clear();
         if (b->energy_guard && !b->rigid) b->motion_energy(settings.gravity, b->guard_ke, b->guard_pe);
@@ -3763,7 +3770,7 @@ void World::simulate_island(Island& isl, int substeps) {
                     v2 = std::max(v2, p.max_v2);
                     b.static_contacts += p.contacts;
                 }
-                if (b.sheet_on_plates && b.static_contacts + b.body_contacts + b.mid_contacts + b.sphere_touches > 0) b.plates_quiet = 0; // (touched: see dt_shift)
+                if (b.sheet_on_plates && b.plates_touched()) b.plates_quiet = 0; // (touched: see dt_shift)
                 b.aabb.mn = mn;
                 b.aabb.mx = mx;
                 float ms = std::sqrt(v2);
@@ -3829,7 +3836,15 @@ void World::simulate_island(Island& isl, int substeps) {
         if (b->post_frame) b->post_frame(*b, frame_time);
         if (b->sheet_on_plates) { // (its short steps while it is crushed: SoftBody::dt_shift)
             const int topo = b->fem.tris_torn + b->fem.tris_refined + b->fem.splits + b->fem.broken + b->fem.mounts_broken;
-            const bool touched = b->static_contacts + b->body_contacts + b->mid_contacts + b->sphere_touches > 0 || topo != b->plates_topo;
+            static const bool dbg = getenv("BL_PLATESDBG") != nullptr;
+            if (static int tick = 0; dbg && (tick++ % 15) == 0)
+                fprintf(stderr, "plates: %s static %d+%d body %d hits %d sphere %d topo %d rms %.2f quiet %.2f\n", b->name.c_str(), b->static_contacts, b->plates_static, b->body_contacts, b->plates_hits, b->sphere_touches, topo != b->plates_topo, b->plates_rms, b->plates_quiet);
+            vec3 mv(0); // (the body's speed as a whole: its wheels may spin, its engine shake)
+            float mm = 0;
+            for (const Node& x : b->nodes)
+                if (x.inv_mass > 0) mv += x.v * x.mass, mm += x.mass;
+            b->plates_rms = mm > 0 ? length(mv) / mm : 0.0f;
+            const bool touched = b->plates_touched() || topo != b->plates_topo;
             b->plates_topo = topo;
             b->plates_quiet = touched ? 0.0f : b->plates_quiet + frame_time;
         }

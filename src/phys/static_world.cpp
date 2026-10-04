@@ -404,6 +404,8 @@ bool StaticWorld::collide_point(vec3 p, float r, const int* box_ids, int nbox, c
     }
     for (int k = 0; k < nbox; k++) {
         const StaticBox& b = boxes[box_ids[k]];
+        // (out of its bounds by more than the radius: out of it - most of a list are, a long body's list is long)
+        if (p.x < b.aabb.mn.x - r || p.x > b.aabb.mx.x + r || p.y < b.aabb.mn.y - r || p.y > b.aabb.mx.y + r || p.z < b.aabb.mn.z - r || p.z > b.aabb.mx.z + r) continue;
         vec3 rel = p - b.center;
         vec3 l(dot(rel, b.rot.c[0]), dot(rel, b.rot.c[1]), dot(rel, b.rot.c[2]));
         vec3 q(clampf(l.x, -b.half.x, b.half.x), clampf(l.y, -b.half.y, b.half.y), clampf(l.z, -b.half.z, b.half.z));
@@ -452,6 +454,7 @@ bool StaticWorld::collide_point(vec3 p, float r, const int* box_ids, int nbox, c
         const StaticCylinder& c = cylinders[cyl_ids[k]];
         vec3 rel = p - c.base;
         if (rel.y < -r || rel.y > c.height + r) continue;
+        if (std::fabs(rel.x) >= c.radius + r || std::fabs(rel.z) >= c.radius + r) continue;
         float dxz = std::sqrt(rel.x * rel.x + rel.z * rel.z);
         float side = c.radius + r - dxz;
         float top = c.height + r - rel.y;
