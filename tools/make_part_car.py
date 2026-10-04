@@ -77,6 +77,89 @@ CARS = {
                 ("FrontLens", ["headlight 1", "headlight -1"]), ("Door", ["door 1 front", "door -1 front"]), ("Mirror", ["door 1 front", "door -1 front"]),
                 ("Hood", ["hood", "fender 1", "fender -1"]), ("FrontBumper", ["fascia"]), ("RearBumper", ["rear bumper"])],
         clamshell=True, fender_x0=0.45, rear_y=(0.24, 0.62), rear_span=65, skip=("Brakes",)),
+    "audi_80": dict(
+        title="FEM Audi 80 Quattro", src="audi_80/Audi80Quattro",
+        meshes=dict(BODY=["Audi80Q_chassis"], HOOD=["Audi80Q_bonnet"], FENDER=["Audi80Q_LFFender", "Audi80Q_RFFender"], FDOOR=["Audi80Q_LFDoor", "Audi80Q_RFDoor"],
+                    RDOOR=["Audi80Q_LRDoor", "Audi80Q_RRDoor"], TRUNK=["Audi80Q_trunklid"], FBUMP=["Audi80Q_Fbump"], RBUMP=["Audi80Q_Rbump"], GRILLE=["Audi80Q_grille"],
+                    HEAD=["Audi80Q_LFlight", "Audi80Q_RFlight"]),
+        forset=[("LFlight", ["headlight 1"]), ("RFlight", ["headlight -1"]), ("LFDoor", ["door 1 front"]), ("RFDoor", ["door -1 front"]), ("LRDoor", ["door 1 rear"]),
+                ("RRDoor", ["door -1 rear"]), ("LMiror", ["door 1 front"]), ("RMiror", ["door -1 front"]), ("bonnet", ["hood"]), ("grille", ["grille"]),
+                ("Fbump", ["fascia"]), ("Fvalance", ["fascia"]), ("Rbump", ["rear bumper"]), ("LFFender", ["fender 1"]), ("RFFender", ["fender -1"]), ("trunklid", ["trunk"])],
+        skip=("suspen",)),
+    "bmw_e39": dict(
+        title="FEM BMW E39 M5", src="bmw_e39_m5/bmwe39",
+        meshes=dict(BODY=["bmwshell", "bmwshelltop", "bmwrearpanels"], HOOD=["bmwbonnet"], FENDER=["bmwfrontpanel"], FDOOR=["frontdoors"], RDOOR=["reardoors"], DWIN=["frontglass"],
+                    TRUNK=["bmwboot"], FBUMP=["bmwfrontbumper"], RBUMP=["bmwrearbumper"]),   # (its lamps one mesh, front and rear: on the body)
+        forset=[("foglight", ["fascia"]), ("sidelights", ["fender 1", "fender -1"]),
+                ("frontdoor", ["door 1 front", "door -1 front"]), ("frontglass", ["door 1 front", "door -1 front"]), ("reardoor", ["door 1 rear", "door -1 rear"]),
+                ("rearglass", ["door 1 rear", "door -1 rear"]), ("mirror", ["door 1 front", "door -1 front"]), ("bonnet", ["hood"]), ("frontbumper", ["fascia"]),
+                ("rearbumper", ["rear bumper"]), ("frontpanel", ["fender 1", "fender -1"]), ("quarterpaneltrim", ["fender 1", "fender -1"]), ("boot", ["trunk"])],
+        skip=("rsuspension",)),
+    "seat_ibiza": dict(
+        title="FEM SEAT Ibiza", src="seat_ibiza/SeatIbiza",
+        landmarks=dict(hdr1=1.08, floor=0.06), drop=("lid0",),   # (a hatchback: its lid from the roof's rear edge; lowered: its skirts are not its floor)
+        meshes=dict(BODY=["Ibizastreetframe"], HOOD=["Ibizastreetbonnet"], FENDER=["IbizastreetfenderL", "IbizastreetfenderR"], FDOOR=["IbizastreetdoorL", "IbizastreetdoorR"],
+                    DWIN=["IbizastreetdoorLglass", "IbizastreetdoorRglass"], TRUNK=["Ibizastreettrunklid"], FBUMP=["IbizastreetFbump"], RBUMP=["IbizastreetRbump"],
+                    GRILLE=["Ibizastreetgrille"], HEAD=["IbizastreetlightLF", "IbizastreetlightRF"], TAIL=["IbizastreetlightLR", "IbizastreetlightRR"]),
+        forset=[("lightLF", ["headlight 1"]), ("lensLF", ["headlight 1"]), ("lightRF", ["headlight -1"]), ("lensRF", ["headlight -1"]), ("lightLR", ["lamp 1"]), ("lensLR", ["lamp 1"]),
+                ("lightRR", ["lamp -1"]), ("lensRR", ["lamp -1"]), ("doorL", ["door 1 front"]), ("doorcardL", ["door 1 front"]), ("doorR", ["door -1 front"]),
+                ("doorcardR", ["door -1 front"]), ("MirrorL", ["door 1 front"]), ("MirrorR", ["door -1 front"]), ("bonnet", ["hood"]), ("grille", ["grille"]),
+                ("Fbump", ["fascia"]), ("splitter", ["fascia"]), ("fogglass", ["fascia"]), ("Rbump", ["rear bumper"]), ("fenderL", ["fender 1"]), ("FenBlinkL", ["fender 1"]),
+                ("fenderR", ["fender -1"]), ("FenBlinkR", ["fender -1"]), ("trunk", ["trunk"])],
+        skip=("hub", "Raxle", "steerrack")),
+    "toyota_ae86": dict(
+        title="FEM Toyota AE86 Trueno", src="toyota_ae86/ae86_trueno",
+        drop=("lid0",),
+        meshes=dict(BODY=["ae86_body"], HOOD=["ae86_trueno_bonnet"], FENDER=["ae86_trueno_lfender", "ae86_trueno_rfender"], FDOOR=["ae86_ldoor", "ae86_rdoor"],
+                    TRUNK=["ae86_bootlid"], FBUMP=["ae86_trueno_fbumper2"], RBUMP=["ae86_rbumper"], HEAD=["ae86_trueno_llight", "ae86_trueno_rlight"]),
+        forset=[("llight", ["headlight 1"]), ("rlight", ["headlight -1"]), ("ldoor", ["door 1 front"]), ("rdoor", ["door -1 front"]), ("lmirror", ["door 1 front"]),
+                ("rmirror", ["door -1 front"]), ("bonnet", ["hood"]), ("fbumper", ["fascia"]), ("rbumper", ["rear bumper"]), ("lightbar", ["rear bumper"]),
+                ("lfender", ["fender 1"]), ("rfender", ["fender -1"]), ("bootlid", ["trunk"])],
+        skip=("fsus", "rsus", "fhubs", "axle", "rsway")),
+    "subaru_impreza": dict(
+        title="FEM Subaru Impreza WRX", src="subaru_impreza/impreza97",
+        meshes=dict(BODY=["impreza_97_body_sedan"], HOOD=["impreza_97_bonnet_wrx"], FENDER=["impreza_97_lfender", "impreza_97_rfender"],
+                    FDOOR=["impreza_97_lfdoor", "impreza_97_rfdoor"], RDOOR=["impreza_97_lrdoor", "impreza_97_rrdoor"], TRUNK=["impreza_97_boot"],
+                    FBUMP=["impreza_97_fbumper_wrx"], RBUMP=["impreza_97_rbumper"], HEAD=["impreza_97_lhlight", "impreza_97_rhlight"],
+                    TAIL=["impreza_97_ltaillight", "impreza_97_rtaillight"]),
+        forset=[("lhlight", ["headlight 1"]), ("rhlight", ["headlight -1"]), ("lightcaps", ["headlight 1", "headlight -1"]), ("ltaillight", ["lamp 1"]), ("rtaillight", ["lamp -1"]),
+                ("lfdoor", ["door 1 front"]), ("rfdoor", ["door -1 front"]), ("lrdoor", ["door 1 rear"]), ("rrdoor", ["door -1 rear"]), ("lmirror", ["door 1 front"]),
+                ("rmirror", ["door -1 front"]), ("bonnet", ["hood"]), ("fbumper", ["fascia"]), ("rbumper", ["rear bumper"]), ("lfender", ["fender 1"]), ("rfender", ["fender -1"]),
+                ("boot", ["trunk"]), ("wing", ["trunk"])],
+        skip=("fsus", "rsus", "tierod")),
+    "camaro": dict(
+        title="FEM Chevrolet Camaro IROC-Z", src="camaro_iroc_z/camaroirocz",
+        drop=("lid0",),   # (a hatch from the roof's rear edge)
+        meshes=dict(BODY=["irocz_body"], HOOD=["irocz_hood"], FENDER=["irocz_lfend", "irocz_rfend"], FDOOR=["irocz_ldoor", "irocz_rdoor"], TRUNK=["irocz_hatch"],
+                    FBUMP=["irocz_nose"], RBUMP=["irocz_rbumper"]),
+        forset=[("ldoor", ["door 1 front"]), ("rdoor", ["door -1 front"]), ("hood", ["hood"]), ("nose", ["fascia"]), ("rbumper", ["rear bumper"]), ("rlights", ["rear bumper"]),
+                ("lfend", ["fender 1"]), ("rfend", ["fender -1"]), ("hatch", ["trunk"])],
+        skip=("axle", "rsus", "fsus", "hubs", "pipe")),
+    "citroen_zx": dict(
+        title="FEM Citroen ZX", src="citroen_zx/citroenzx-hatchback",
+        drop=("lid0",),
+        meshes=dict(BODY=["citroenzx-body"], HOOD=["citroenzx-hood"], FENDER=["citroenzx-fenders"], FDOOR=["citroenzx-front_doors"], RDOOR=["citroenzx-rear_doors"],
+                    DWIN=["citroenzx-fr_d_glass"], TRUNK=["citroenzx-trunk"], FBUMP=["citroenzx-fr_bumper"], RBUMP=["citroenzx-r_bumper"]),
+        forset=[("front_doors", ["door 1 front", "door -1 front"]), ("fr_d_glass", ["door 1 front", "door -1 front"]), ("fr_door_i", ["door 1 front", "door -1 front"]),
+                ("mirrors", ["door 1 front", "door -1 front"]), ("rear_doors", ["door 1 rear", "door -1 rear"]), ("r_d_glass", ["door 1 rear", "door -1 rear"]),
+                ("r_door_i", ["door 1 rear", "door -1 rear"]), ("hood", ["hood"]), ("fr_bumper", ["fascia"]), ("frontplate", ["fascia"]), ("r_bumper", ["rear bumper"]),
+                ("fenders", ["fender 1", "fender -1"]), ("signal", ["fender 1", "fender -1"]), ("trunk", ["trunk"]), ("rearplate", ["trunk"])],
+        skip=("suspension", "r_axle", "f_hub")),
+    "mazda_626": dict(
+        title="FEM Mazda 626", src="mazda_626_gf/mazda626sd18i-mt",
+        meshes=dict(BODY=["mazda626gf-sd-body"], HOOD=["mazda626gf-sd-hood"], FENDER=["mazda626gf-sd-fen"], FDOOR=["mazda626gf-sd-fr_d"], RDOOR=["mazda626gf-sd-r_d"],
+                    TRUNK=["mazda626gf-sd-trunk"], FBUMP=["mazda626gf-sd-fr_bump"], RBUMP=["mazda626gf-sd-r_bump"]),
+        forset=[("sd-fr_d", ["door 1 front", "door -1 front"]), ("sd-r_d", ["door 1 rear", "door -1 rear"]), ("hood", ["hood"]), ("fr_bump", ["fascia"]),
+                ("r_bump", ["rear bumper"]), ("sd-fen", ["fender 1", "fender -1"]), ("trunk", ["trunk"])],
+        skip=("axles",)),
+    "audi_a4": dict(
+        title="FEM Audi A4", src="audi_a4/Audi_a4",
+        meshes=dict(BODY=["a4chassis"], HOOD=["a4hood"], FENDER=["a4fpanels"], FDOOR=["a4fdoors"], RDOOR=["a4rdoors"], TRUNK=["a4trunk"], FBUMP=["a4bumper"],
+                    RBUMP=["a4rbumper"]),
+        forset=[("a4fdoors", ["door 1 front", "door -1 front"]), ("a4rdoors", ["door 1 rear", "door -1 rear"]), ("a4lmirror", ["door 1 front"]), ("a4rmirror", ["door -1 front"]),
+                ("a4hood", ["hood"]), ("a4rbumper", ["rear bumper"]), ("a4bumper", ["fascia"]), ("a4fpanels", ["fender 1", "fender -1"]), ("a4trunk", ["trunk"]),
+                ("trlights", ["trunk"])],
+        skip=("suspension",)),
     # a pickup (style): the cab the saloon's body to its rear door's post (post: the rear door's rear edge; cback: the
     # cab's back at the roof), a ladder frame under it (FRAME: the mod's chassis, rail_z its rails' line), the bed (BED) and
     # its tailgate (GATE)
@@ -107,7 +190,7 @@ assert NAME in CARS and len(sys.argv) > 2, "usage: make_part_car.py <%s> <the mo
 CFG = CARS[NAME]
 MESH_DIR = sys.argv[2]
 SRC = CFG["src"]
-SRC_FILE = os.path.join(ROOT, "assets", "vehicles", SRC + ".truck")
+SRC_FILE = next((f for f in (os.path.join(ROOT, "assets", "vehicles", SRC + e) for e in (".truck", ".car")) if os.path.exists(f)), os.path.join(ROOT, "assets", "vehicles", SRC + ".truck"))
 OUT = os.environ.get("SC_OUT") or os.path.join(ROOT, "assets", "vehicles", "shell_car", "fem_%s.truck" % NAME)
 
 # ------------------------------------------------------------------------------------------------ the mod as exported
@@ -217,8 +300,11 @@ def measure():
     ident = lambda V: V
     body, door = Mesh(["BODY"], ident), Mesh(["FDOOR"], ident)
     L = dict(nose=float(Mesh(["FBUMP"], ident).lo[0]), tail=float(Mesh(["RBUMP"], ident).hi[0]), axf=AXF_T, axr=AXR_T)
-    L["belt"] = CFG.get("belt") or float(Mesh(["DWIN"], ident).lo[1]) + 0.02
     lo, hi = door.side(1)
+    if CFG.get("belt") or "DWIN" in CFG["meshes"]:
+        L["belt"] = CFG.get("belt") or float(Mesh(["DWIN"], ident).lo[1]) + 0.02
+    else:   # (no door glass of its own: the belt line where the E36's is between the door's foot and the roof)
+        L["belt"] = float(lo[1]) + 0.59 * (float(body.hi[1]) - float(lo[1]))
     ymid = 0.5 * (lo[1] + L["belt"])
     xs = [x for x in np.arange(lo[0] - 0.02, hi[0] + 0.02, 0.005) if door.first((x, ymid, 3.0), (0, 0, -1)) is not None]
     L["door0"], L["door1"] = float(xs[0]), float(xs[-1])
@@ -350,12 +436,21 @@ def scan_round(mesh, cx, ys, n, back, amax=90):
         d = lambda a: (back * math.cos(math.radians(a)), 0.0, math.sin(math.radians(a)))
         hit = lambda a: (lambda h: float(h[-1]) if len(h) else None)(mesh.hits((cx, y, 0.0), d(a)))
         span = [a for a in range(-amax, amax + 1) if hit(a) is not None]
+        if not span:   # (nothing of it at this height - an opening across it: the nearest row's outline, below)
+            rows.append(None)
+            continue
         row = []
         for j in range(n):
             a = lerp(float(span[0]), float(span[-1]), j / (n - 1))
             a, t = next((a + e, hit(a + e)) for e in [0] + [q * g for g in range(1, 181) for q in (1, -1)] if hit(a + e) is not None)   # (a hole: the nearest hit)
             row.append((cx + d(a)[0] * t, y, d(a)[2] * t))
         rows.append(row)
+    have = [i for i, r in enumerate(rows) if r is not None]
+    assert have, "scan_round: nothing of the mesh at any height"
+    for i, y in enumerate(ys):
+        if rows[i] is None:
+            k = min(have, key=lambda q: abs(q - i))
+            rows[i] = [(p[0], y, p[2]) for p in rows[k]]
     return rows
 
 

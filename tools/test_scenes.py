@@ -446,7 +446,11 @@ if os.path.exists(os.path.join(ROOT, "assets", "vehicles", "bmw_e36", "E36_CHASS
 # the FEM cars under the mods' meshes (tools/make_part_car.py; each when its mod is there): it loads with its meshes,
 # stands still with nothing yielded, gets to 50 km/h within 8 s on the lane, and into the wall at 80 km/h it crumples,
 # some of its parts' mounts let go, and it is stable
-FEM_CARS = {"viper": "dodge_viper", "trophy_truck": "trophy_truck_v2", "audi_quattro": "audi_quattro", "ford_f250": "ford_f250_2014", "mercedes_clk": "mercedes_clk"}
+FEM_CARS = {"viper": "dodge_viper", "trophy_truck": "trophy_truck_v2", "audi_quattro": "audi_quattro", "ford_f250": "ford_f250_2014", "mercedes_clk": "mercedes_clk",
+            "audi_80": "audi_80", "bmw_e39": "bmw_e39_m5", "seat_ibiza": "seat_ibiza", "toyota_ae86": "toyota_ae86",
+            "subaru_impreza": "subaru_impreza", "camaro": "camaro_iroc_z", "citroen_zx": "citroen_zx", "mazda_626": "mazda_626_gf", "audi_a4": "audi_a4"}
+if os.environ.get("FEM_ONLY"):   # (some of the cars: FEM_ONLY="camaro audi_a4")
+    FEM_CARS = {k: v for k, v in FEM_CARS.items() if k in os.environ["FEM_ONLY"].split()}
 for car, folder in FEM_CARS.items():
     if not os.path.isdir(os.path.join(ROOT, "assets", "vehicles", folder)):
         continue
