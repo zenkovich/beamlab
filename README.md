@@ -93,8 +93,12 @@ refined sheet, and a ball through a sheet in the world (cracks, the ball passes,
 runs bitwise identical), and the FEM frame elements (see Physics). `./build/test_physics only <section>` runs one
 section (kernel, momentum, topology, reorder, repeat, shapes, shape_impacts, patterns, laser, stability, world, frame).
 `./build/test_physics bench` adds the kernel timing and the cache model, `kernel [s]` loops the kernel alone (for
-sampling profilers), `team` measures the cost of a parallel phase. `python3 tools/test_scenes.py [--quick]` runs the
-scenes through the application: the car through the three lead sheets (each cracks, pieces fall off, area kept), the
+sampling profilers), `team` measures the cost of a parallel phase. `python3 tools/test_scenes.py [--full] [-j N]` runs the
+scenes through the application, by default the quick set in a few minutes (every FEM car stands, four of them drive and
+crash; the long and repeated runs - every car's drive and crash, the barrels' every drop, every scene's stability, the
+rally - with `--full`), N applications at a time (default 4, the performance cores shared: the physics' results do not
+depend on the number of threads), the longest runs first by the last run's times (`build/test_scenes_<set>.json`; with
+none, a `--dry` pass lists the runs): the car through the three lead sheets (each cracks, pieces fall off, area kept), the
 Materials Lab (glass shatters, rubber holds, the rest crack), cannonballs into the steel sheet, the Sheet Shapes (the car
 through the 6 x 4 m gate and the dome, cannonballs through each panel, a laser cut across the gate; area kept), no
 numerical warnings in any scene, and the autopilot's time on the Rally Stage.
@@ -127,6 +131,7 @@ the triangles it evaluated.
 | input | action |
 |---|---|
 | W / S, A / D | throttle / brake (hold S at a stop to reverse), steer |
+| M | mouse steering in the manner of Operation Flashpoint (also View menu): the mouse moves a cursor that is a heading in the world, a pixel of the mouse a pixel of the cursor; the vehicle steers towards it in proportion to the angle left (full lock 20 degrees off it, `View > full lock at`), so it turns to where the cursor points and the cursor comes back to the middle; the cursor is not held to the screen (off it, a dot at the edge towards it); backing up, the wheels turn the other way; A / D steer as ever and put the cursor ahead; RMB looks around; the mouse is taken while the mode is on (`App::gather_input`, `ui_mouse_steer`; `BL_MOUSESTEER=<degrees>` a scripted check) |
 | Space | handbrake |
 | 1 .. 0 | vehicle commands (cranes, doors, tippers) |
 | R / Shift+R | recover the vehicle on the spot / respawn at the scene start |
@@ -158,6 +163,11 @@ Everything is ImGui. The menu bar at the top of the screen holds:
   `vehicle.cpp`. Picking an item switches immediately, with no dialog. `BL_OPENMENU=vehiclemenu:FEM cars` (or
   `scenemenu:Rally`) holds a menu open for a screenshot.
 - **Reset**, **Pause / Step** and the simulation speed.
+- the **Performance** widget (F2): its graph is the main thread's frame by zone, the physics' part of it the heaviest
+  island's wall time by phase (`Isl: element forces`, `body contacts`, `static contacts, nodes`, `tyres, plates on
+  ground`, `FEM assemble`, `FEM factor, solve`, `integrate`, `merge, topology`: `prof::add_part`, summed over the
+  substeps); the bar under it and Physics details are CPU time summed over the threads by kind of work (Beams, Sheets,
+  Collisions, FEM, Integrate, Cracks; the static collisions by nodes, tyres and plates), not wall time.
 - the **View**, **Physics** and **Scene** menus:
   - **View**: camera, debug views (beams coloured by stress, nodes and frames, collision geometry, wheels, awake/asleep bodies), lighting.
   - **Physics**: gravity, wind, tyre grip, traction assist, steering response (steering speed, return to centre,
@@ -1339,6 +1349,38 @@ term that pulls it back onto the line. A stuck car reverses for a moment. With t
 Travanca 3:31, Fernet Branca 8:31.
 
 ## Performance
+
+**The frame in real time** (`App::frame`, `App::run`). Fixed stepping (the tests, `--screenshot`, `--bench`) runs as
+before, everything in line; in real time:
+
+- **the physics on a thread of its own**: the frame reads the world first (input, the scene's logic, the UI, the visuals'
+  skinning, the draw lists, the debug drawing), then the world's step of the frame starts on the physics thread
+  (`App::PhysicsThread`, the JobSystem's caller with a thread index past the workers') while the main thread submits
+  the frame to GL, draws the UI and waits for the display; the frame waits for the step at its end, then the vehicles'
+  frame and the camera. A frame is its serial part plus the longer of the physics and the drawing, not their sum. The
+  physics' zones reach the performance graph through `prof::add_part` / `flush_parts`. The model editor and
+  `BL_ASYNC=0` step in line.
+- **the frame rate held** (Physics menu, *Hold the frame rate*, target 60): a frame's physics gets what of the target's
+  frame the serial part leaves it (`WorldSettings::frame_budget_ms`): a frame steps at most the substeps its recent
+  cost per substep fits in (at least a quarter of its time), the rest dropped - the simulation slows for an impact's
+  frames instead of the frame rate, the performance widget's *Sim speed* shows by how much. `BL_HOLDFPS=0`: off.
+- **frames at the target's length** on a display above it (ProMotion's 120 Hz): the frame waits before its swap until
+  the target's frame has nearly passed (`BL_FPSCAP=0`: off; a swap interval of 2 is not kept on macOS) - each frame's
+  fixed work for the world and the drawing done half as often.
+- the vehicles' meshes skinned over the threads, one vehicle after another (`VehicleVisual::update`: the large meshes in
+  chunks, the small ones beside each other): two crashed FEM cars 2.4 -> 0.85 ms a frame.
+
+Measured live (`BL_LIVE=1`: stepped as the app is, a window of the screen's size, vsync) on the crash scenes: see the
+report of 2026-10-04. In the physics: the candidate pairs' reach is the two sides' relative travel and a plane's bound
+(`near_pairs`, also the plates' mid points against the other bodies' triangles: two cars' crushed fronts kept 20-30
+thousand pairs tested every substep, now a third of it), two wrecks at rest pressed together no longer keep their sheets'
+short steps (`SoftBody::plates_touched`: another body's touch counts while one of the two moves; `BL_PLATES_BODYTOUCH=1`
+as before), pairs are not inherited after a crack when the next substep makes them again, and a body of plates lying still as a
+whole, untouched by anything moving, steps its frame every other substep while the frame rate is held
+(`WorldSettings::frame_every_quiet`: a wreck at rest 8.1 -> 6.2 ms; `BL_FEMQUIET=1` off, `=2` also in fixed stepping). Diagnostics:
+`BL_CRASH=<a>,<b>[,<km/h a>,<km/h b>[,<layout>[,<slow motion>]]]` sets up Vehicle vs Vehicle, `BL_PAIRS_OLD=1` the
+absolute speeds' reach, `BL_PAIRSDBG=1` the pair lists' sizes, the profiling CSV's `hs_*` columns the heaviest island's
+integration and `budget_ms`, `budget_cut`.
 
 Apple M4 Max, 12 threads, Release build, 1600x900. Times are per 60 Hz frame (33 physics substeps per frame).
 
