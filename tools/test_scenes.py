@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Scenario checks through the application (headless): what the physics has to keep doing.
 
-    python3 tools/test_scenes.py [--quick]
+    python3 tools/test_scenes.py [--full] [-j N]
+
+By default the quick set (a few minutes): the long and the repeated runs - every FEM car's drive and crash, the
+barrels' every drop, every scene's stability, the rally - only with --full. The application runs N at a time (default 4,
+each with the performance cores' share of threads: the physics' results do not depend on the threads); the runs' list
+and times of the last run of a set (build/test_scenes_<set>.json) start the longest first. -j 1: one at a time, all
+threads.
 
 sheet_run: the car drives through all three lead sheets, each cracks, pieces fall off, nothing is lost (area);
 materials: glass shatters, rubber holds, the metals punch through, the ball lays each material's fracture pattern;
@@ -21,23 +27,155 @@ through; shell car: stands, steers, accelerates, drives round and over the rough
 parts and its rear toe, through the crash tests stable, the axe cuts it in two and goes through (the Frame Car's too);
 rally: the autopilot finishes in the usual time; all scenes: no numerical instability.
 """
-import os, re, subprocess, sys, csv, tempfile
+import concurrent.futures, json, os, re, subprocess, sys, csv, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, "build", "beamlab")
 TMP = tempfile.mkdtemp(prefix="bl_scenes_")
-quick = "--quick" in sys.argv
+FULL = "--full" in sys.argv
+quick = not FULL
+JOBS = int(sys.argv[sys.argv.index("-j") + 1]) if "-j" in sys.argv else 4
+DRY = "--dry" in sys.argv   # (the runs' list alone: every run answers nothing at once - the plan of a first run)
 results = []
+T0 = time.time()
 
 
-def run(args, env=None, timeout=900):
+def _cores():
+    try:
+        return int(subprocess.run(["sysctl", "-n", "hw.perflevel0.physicalcpu"], capture_output=True, text=True).stdout)
+    except ValueError:
+        return os.cpu_count() or 4
+
+
+THREADS = max(2, _cores() // JOBS) if JOBS > 1 else 0
+PLAN = os.path.join(ROOT, "build", "test_scenes_%s.json" % ("full" if FULL else "quick"))
+_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, JOBS))
+_pending = {}   # (the plan's runs started ahead: key -> [futures])
+_record = []    # (this run's runs in order, with their times: the next run's plan)
+
+
+def _key(args, env):
+    return json.dumps([[a.replace(TMP, "{TMP}") for a in args], sorted((env or {}).items())])
+
+
+import threading
+_gate = threading.Condition()
+_state = {"running": 0, "excl": False}   # (an exclusive run - one timing the physics - alone, with every thread)
+
+
+def _exec(args, env, timeout, exclusive=False):
     e = dict(os.environ)
     e.update(env or {})
-    p = subprocess.run([EXE] + args, env=e, capture_output=True, text=True, timeout=timeout)
-    return p.stdout + p.stderr
+    extra = ["--threads", str(THREADS)] if THREADS and not exclusive else []
+    with _gate:
+        if exclusive:
+            _state["excl"] = True
+            _gate.wait_for(lambda: _state["running"] == 0)
+        else:
+            _gate.wait_for(lambda: not _state["excl"])
+        _state["running"] += 1
+    try:
+        return _exec_now(args, e, extra, timeout)
+    finally:
+        with _gate:
+            _state["running"] -= 1
+            if exclusive:
+                _state["excl"] = False
+            _gate.notify_all()
+
+
+def _exec_now(args, e, extra, timeout):
+    t = time.time()
+    try:
+        p = subprocess.run([EXE] + args + extra, env=e, capture_output=True, text=True, timeout=timeout)
+        out = p.stdout + p.stderr
+    except subprocess.TimeoutExpired:
+        out = "TIMEOUT"
+    return out, time.time() - t
+
+
+if DRY and "_DRY_INNER" not in globals():
+    # (the dry pass: the script's statements one by one, each loop's body each time, whatever fails on the empty
+    # answers skipped - the runs are what is wanted)
+    import ast
+    tree = ast.parse(open(os.path.abspath(__file__)).read())
+    start = next(i for i, n in enumerate(tree.body) if isinstance(n, ast.FunctionDef) and n.name == "_plan")
+    def guard(stmts):
+        out = []
+        for n in stmts:
+            if isinstance(n, (ast.For, ast.While)):
+                n.body = [ast.Try(body=guard(n.body), handlers=[ast.ExceptHandler(type=ast.Name("Exception", ast.Load()), name=None, body=[ast.Continue()])], orelse=[], finalbody=[])]
+                out.append(ast.Try(body=[n], handlers=[ast.ExceptHandler(type=ast.Name("Exception", ast.Load()), name=None, body=[ast.Pass()])], orelse=[], finalbody=[]))
+            elif isinstance(n, ast.If):
+                n.body, n.orelse = guard(n.body), guard(n.orelse)
+                out.append(ast.Try(body=[n], handlers=[ast.ExceptHandler(type=ast.Name("Exception", ast.Load()), name=None, body=[ast.Pass()])], orelse=[], finalbody=[]))
+            elif isinstance(n, (ast.FunctionDef, ast.Import, ast.ImportFrom)):
+                out.append(n)
+            else:
+                out.append(ast.Try(body=[n], handlers=[ast.ExceptHandler(type=ast.Name("Exception", ast.Load()), name=None, body=[ast.Pass()])], orelse=[], finalbody=[]))
+        return out
+    body = [n for n in tree.body[start:] if not (isinstance(n, ast.Expr) and isinstance(getattr(n, "value", None), ast.Call) and getattr(n.value.func, "id", "") == "_finish")]
+    body = [n for n in body if not (isinstance(n, ast.Expr) and getattr(getattr(n.value, "func", None), "attr", "") == "exit")]
+    mod = ast.fix_missing_locations(ast.Module(body=guard(body), type_ignores=[]))
+    g = dict(globals())
+    g["_DRY_INNER"] = True
+    try:
+        exec(compile(mod, __file__, "exec"), g)
+    except SystemExit:
+        pass
+    os.makedirs(os.path.dirname(PLAN), exist_ok=True)
+    json.dump(_record, open(PLAN, "w"), indent=0)
+    print("dry: %d runs" % len(_record))
+    sys.exit(0)
+
+
+def _plan():
+    if os.path.exists(PLAN):
+        return json.load(open(PLAN))
+    # (none yet: the list from a dry pass, its frames for times)
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), "--dry"] + (["--full"] if FULL else []), capture_output=True, text=True)
+    return json.load(open(PLAN)) if os.path.exists(PLAN) else []
+
+
+if JOBS > 1 and not DRY:   # (the last run's runs, the longest first)
+    for entry in sorted(_plan(), key=lambda x: -x["secs"]):
+        args = [a.replace("{TMP}", TMP) for a in entry["args"]]
+        if not entry.get("exclusive"):
+            _pending.setdefault(_key(args, entry["env"]), []).append(_pool.submit(_exec, args, entry["env"], 900))
+
+
+def run(args, env=None, timeout=900, exclusive=False):
+    """exclusive: the run's physics timed - alone, with every thread (the others wait)"""
+    k = _key(args, env)
+    if DRY:
+        _record.append({"args": json.loads(k)[0], "env": dict(env or {}), "secs": float(args[args.index("--frames") + 1]) / 60.0 if "--frames" in args else 1.0})
+        return ""
+    q = _pending.get(k)
+    if exclusive:
+        out, secs = _exec(args, env, timeout, True)
+    else:
+        f = q.pop(0) if q else _pool.submit(_exec, args, env, timeout)
+        out, secs = f.result()
+    _record.append({"args": json.loads(k)[0], "env": dict(env or {}), "secs": round(secs, 2), "exclusive": exclusive})
+    return out
+
+
+def _finish():
+    for q in _pending.values():   # (runs of the plan no longer asked for)
+        for f in q:
+            f.cancel()
+    _pool.shutdown(wait=True, cancel_futures=True)
+    os.makedirs(os.path.dirname(PLAN), exist_ok=True)
+    json.dump(_record, open(PLAN, "w"), indent=0)
+    top = sorted(_record, key=lambda x: -x["secs"])[:8]
+    print("\n%s set: %d runs, %.0f s of runs, %.0f s wall (%d at a time); the longest: %s" % (
+        "full" if FULL else "quick", len(_record), sum(x["secs"] for x in _record), time.time() - T0, JOBS,
+        ", ".join("%s %.0f s" % (" ".join(a for a in x["args"][:4] if not a.startswith("--size")), x["secs"]) for x in top)))
 
 
 def check(name, ok, detail):
+    if DRY:
+        return
     results.append((name, ok, detail))
     print(("PASS " if ok else "FAIL ") + name + ": " + detail, flush=True)
 
@@ -451,6 +589,7 @@ FEM_CARS = {"viper": "dodge_viper", "trophy_truck": "trophy_truck_v2", "audi_qua
             "subaru_impreza": "subaru_impreza", "camaro": "camaro_iroc_z", "citroen_zx": "citroen_zx", "mazda_626": "mazda_626_gf", "audi_a4": "audi_a4"}
 if os.environ.get("FEM_ONLY"):   # (some of the cars: FEM_ONLY="camaro audi_a4")
     FEM_CARS = {k: v for k, v in FEM_CARS.items() if k in os.environ["FEM_ONLY"].split()}
+FEM_QUICK = ("viper", "ford_f250", "trophy_truck", "seat_ibiza")
 for car, folder in FEM_CARS.items():
     if not os.path.isdir(os.path.join(ROOT, "assets", "vehicles", folder)):
         continue
@@ -460,6 +599,8 @@ for car, folder in FEM_CARS.items():
     missing = len(re.findall(r"mesh not found|mesh load failed", out))
     check("fem %s: loads, stands, nothing yields" % car, bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[3] == 0 and missing == 0 and abs(sp.get(3.0, (9,))[0]) < 1.0 and unstable(out) == 0,
           "%s, %d meshes missing, %.1f km/h at 3 s" % (shell_text(sl), missing, sp.get(3.0, (9,))[0]))
+    if quick and car not in FEM_QUICK:   # (the quick set: every car stands, a saloon, a pickup, a tube truck and a hatchback drive and crash)
+        continue
     out = run(["--scene", "test_site", "--vehicle", vid, "--spawn", "-320,171,90", "--size", "640x360", "--frames", "500", "--hidden", "--novsync", "--drive", "1.0,0",
                "--screenshot", os.path.join(TMP, "fem1.png")])
     sl, sp = shell_line(out), speeds_at(out)
@@ -470,6 +611,15 @@ for car, folder in FEM_CARS.items():
     sl, sp = shell_line(out), speeds_at(out)
     last = sp[max(sp)] if sp else (99,)
     check("fem %s: into the wall at 80 km/h, crumples, sheds parts, stable" % car, bool(sl) and sl[0] == 0 and sl[3] > 20 and sl[4] > 0 and abs(last[0]) < 15 and unstable(out) == 0,
+          "%s, %.1f km/h at the end" % (shell_text(sl), last[0]))
+# a wreck lying still steps its frame every other substep in real time (WorldSettings::frame_every_quiet, App): after the
+# pole it stays at rest, no solve failing, nothing unstable
+if os.path.isdir(os.path.join(ROOT, "assets", "vehicles", "mercedes_clk")):
+    out = run(["--scene", "test_site", "--vehicle", "shell_car/fem_mercedes_clk", "--size", "640x360", "--frames", "900", "--hidden", "--novsync", "--drive", "0,0",
+               "--action", "Crash test/POLE 25 cm at 50", "--screenshot", os.path.join(TMP, "fq.png")], env={"BL_FEMQUIET": "2"})
+    sl, sp = shell_line(out), speeds_at(out)
+    last = sp[max(sp)] if sp else (99,)
+    check("fem quiet: a wreck at rest, its frame at 1 kHz, stays at rest", bool(sl) and sl[0] == 0 and abs(last[0]) < 1.0 and unstable(out) == 0,
           "%s, %.1f km/h at the end" % (shell_text(sl), last[0]))
 out = run(["--scene", "shell_car", "--size", "640x360", "--frames", "300", "--hidden", "--novsync", "--drive", "0,0", "--screenshot", os.path.join(TMP, "sc0.png")])
 sl = shell_line(out)
@@ -630,7 +780,7 @@ for act, fem in ([("Drop it on its side from 2 m", 0), ("Drop it on the rim (45 
 for fem in ((0, 1) if not quick else (0,)):
     csvp = os.path.join(TMP, "stress.csv")
     out = run(["--scene", "stress_barrels", "--size", "640x360", "--frames", "600", "--hidden", "--novsync", "--screenshot", os.path.join(TMP, "sb.png")],
-              dict({"BL_PROFCSV": csvp, "BL_SHELLDBG": "595"}, **({"BL_BARREL_FEM": "1"} if fem else {})))
+              dict({"BL_PROFCSV": csvp, "BL_SHELLDBG": "595"}, **({"BL_BARREL_FEM": "1"} if fem else {})), exclusive=True)   # (its physics timed)
     phys = sorted(float(r["physics_ms"]) for r in list(csv.DictReader(open(csvp)))[10:])
     sheets, _ = shell_blocks(out)
     loose = sum(p for _, p in sheets.values())
@@ -703,6 +853,7 @@ if not quick:
     t = int(m.group(1)) * 60 + float(m.group(2)) if m else 0
     check("rally: autopilot finishes as before", 93 < t < 100, f"stage time {t:.2f} s (was 96.2)")
 
+_finish()
 fails = [r for r in results if not r[1]]
 print(f"\n{len(results) - len(fails)} passed, {len(fails)} failed")
 sys.exit(1 if fails else 0)
