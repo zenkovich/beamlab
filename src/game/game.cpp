@@ -224,6 +224,13 @@ vec3 Game::camera_focus() const {
 }
 
 void Game::update(float dt, const VehicleInput& in, const CameraInput& cam_in) {
+    update_pre(dt, in);
+    if (step_due()) step_world(dt);
+    else frame_physics_ms = 0;
+    update_post(dt, cam_in);
+}
+
+void Game::update_pre(float dt, const VehicleInput& in) {
     Vehicle* pv = player_vehicle();
     {
         PROFILE_ZONE("Game logic");
@@ -232,20 +239,26 @@ void Game::update(float dt, const VehicleInput& in, const CameraInput& cam_in) {
         if (scene_update) scene_update(*this, dt);
     }
     world.settings.wind_focus = m_last_cam.pos;
-    if (!paused || step_once) {
-        float fdt = paused ? world.settings.dt * 20 / std::max(0.01f, world.settings.time_scale) : dt;
-        uint64_t t0 = prof::now();
-        world.step_frame(fdt);
-        frame_physics_ms = (float)prof::ticks_to_ms(prof::now() - t0);
-        step_once = false;
-    } else {
-        frame_physics_ms = 0;
-    }
+}
+
+void Game::step_world(float dt) {
+    float fdt = paused ? world.settings.dt * 20 / std::max(0.01f, world.settings.time_scale) : dt;
+    uint64_t t0 = prof::now();
+    world.step_frame(fdt);
+    frame_physics_ms = (float)prof::ticks_to_ms(prof::now() - t0);
+    m_stepped = true;
+}
+
+void Game::update_post(float dt, const CameraInput& cam_in) {
+    Vehicle* pv = player_vehicle();
+    const bool stepped = m_stepped;
+    m_stepped = false;
+    if (stepped) step_once = false;
     {
         PROFILE_ZONE("Vehicles frame");
         // vehicles get the simulated time of this frame (slow motion / pause aware)
         float sim_dt = world.stats().substeps * world.settings.dt;
-        for (auto& v : vehicles) v->update_frame(paused && !step_once ? 0.0f : sim_dt);
+        for (auto& v : vehicles) v->update_frame(paused ? 0.0f : sim_dt);
         if (grass) grass->update(vehicles, sim_dt, [this](float x, float z) { return ground_height(x, z); });
     }
     // camera
@@ -289,6 +302,7 @@ void Game::render(Renderer& r, int w, int h, const Camera* cam_override, bool vi
         m_instances.flush(r);
     }
     draw_debug(r);
+    if (after_collect) after_collect();
 }
 
 void Game::draw_debug(Renderer& r) {

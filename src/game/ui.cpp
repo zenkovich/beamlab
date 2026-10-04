@@ -508,6 +508,15 @@ void App::ui_main_menu() {
     }
     if (ImGui::BeginMenu("Physics")) {
         auto& s = m_game.world.settings;
+        ImGui::SeparatorText("Frame rate");
+        ImGui::Checkbox("Hold the frame rate", &m_hold_fps);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("In real time the physics gets what of the frame the rest leaves it: in heavy moments (an impact)\n"
+                              "the simulation slows down for a moment instead of the frame rate dropping (Sim speed in the\n"
+                              "performance widget). Off: the simulation keeps real time and the frames get longer.");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+        ImGui::SliderFloat("fps##target", &m_target_fps, 30.0f, 120.0f, "%.0f");
         ImGui::SeparatorText("World");
         float g = -s.gravity.y;
         if (ImGui::SliderFloat("Gravity", &g, 0.0f, 30.0f, "%.2f m/s2")) s.gravity.y = -g;

@@ -55,9 +55,13 @@ bool App::init(const AppOptions& opt) {
     glfwSwapInterval(opt.no_vsync || opt.bench_frames > 0 || opt.hidden ? 0 : 1);
     log_info("OpenGL %s | %s", (const char*)glGetString(GL_VERSION), (const char*)glGetString(GL_RENDERER));
 
-    int workers = opt.threads > 0 ? opt.threads - 1 : JobSystem::performance_cores() - 1;
+    // (in real time the physics thread is one more beside the workers and the main thread's drawing: a worker fewer -
+    // measured the faster; the fixed stepping of the tests steps on the main thread with all of them)
+    const bool live_run = !((opt.bench_frames > 0 || !opt.screenshot.empty() || !opt.shots.empty()) && !opt.realtime && !getenv("BL_LIVE"));
+    int workers = opt.threads > 0 ? opt.threads - 1 : JobSystem::performance_cores() - 1 - (live_run ? 1 : 0);
     JobSystem::get().init(std::max(0, workers));
     log_info("job system: %d threads", JobSystem::get().num_threads());
+    m_phys.start(JobSystem::get().num_threads());
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -474,6 +478,7 @@ void App::input_script() {
 void App::frame(float dt) {
     PROFILE_ZONE("Frame");
     uint64_t t_frame = prof::now();
+    m_t_frame = t_frame;
     {
         PROFILE_ZONE("Events"); // (the window system's event loop and the UI frame start)
         glfwPollEvents();
@@ -1111,7 +1116,26 @@ void App::frame(float dt) {
             printf("destroy: cursor %d (%.2f %.2f %.2f) total %d\n", (int)m_game.cursor_valid, m_game.cursor_point.x, m_game.cursor_point.y,
                    m_game.cursor_point.z, m_game.destroyed_total);
     }
-    m_game.update(dt, vin, cin);
+    static const bool async_env = !(getenv("BL_ASYNC") && atoi(getenv("BL_ASYNC")) == 0);
+    m_async_frame = async_env && !m_fixed && !m_editor.active();
+    m_kicked = false;
+    m_step_due = false;
+    if (m_async_frame) {
+        m_game.update_pre(dt, vin);
+        m_step_due = m_game.step_due();
+        if (m_step_due) // (the step once the frame has read the world: Game::render)
+            m_game.after_collect = [this, dt] {
+                m_game.after_collect = nullptr;
+                if (m_editor.active()) return; // (opened this frame: its views read the world one after another - in line, below)
+                m_kicked = true;
+                m_serial_ms = prof::ticks_to_ms(prof::now() - m_t_frame);
+                m_phys.run([this, dt] { m_game.step_world(dt); });
+            };
+        else
+            m_game.frame_physics_ms = 0;
+    } else {
+        m_game.update(dt, vin, cin);
+    }
     if (m_frame_index == 3 && !m_opt.camera.empty()) apply_camera_preset(m_opt.camera);
     if (m_frame_index == 3 && m_opt.editor) m_editor.open();
     if (m_frame_index == 6 && m_opt.editor_test) m_editor.test_drive();
@@ -1180,11 +1204,79 @@ void App::frame(float dt) {
         if (m_renderer.screenshot(m_opt.screenshot, m_fb_w, m_fb_h)) log_info("screenshot saved: %s", m_opt.screenshot.c_str());
         glfwSetWindowShouldClose(m_win, 1);
     }
+    if (m_frame_cap_s > 0 && m_last_present > 0) {
+        // (no zone of its own: the physics runs meanwhile - its parts are in the graph, the rest is the frame's own idle)
+        // (up to a refresh before the target's frame: the swap waits for the one after - the frame the target's long)
+        static const double early = getenv("BL_CAPEARLY") ? atof(getenv("BL_CAPEARLY")) * 1e-3 : 0.002;
+        const double until = m_last_present + m_frame_cap_s - early;
+        for (double t = glfwGetTime(); t < until; t = glfwGetTime()) {
+            if (until - t > 0.0007) std::this_thread::sleep_for(std::chrono::microseconds((int)((until - t - 0.0005) * 1e6)));
+        }
+    }
     {
         PROFILE_ZONE("Swap");
         glfwSwapBuffers(m_win);
     }
+    m_last_present = glfwGetTime();
+    if (m_async_frame) {
+        m_game.after_collect = nullptr;
+        if (m_kicked) {
+            PROFILE_ZONE("Physics wait");
+            m_phys.wait();
+        }
+        if (!m_kicked && m_step_due) m_game.step_world(dt); // (not kicked: the editor opened this frame)
+        const uint64_t t_post = prof::now();
+        prof::flush_parts("Physics", m_kicked ? m_game.frame_physics_ms : 0.0);
+        m_game.update_post(dt, cin);
+        m_serial_ms += prof::ticks_to_ms(prof::now() - t_post);
+        if (!m_kicked) m_serial_ms = prof::ticks_to_ms(prof::now() - t_frame);
+    }
     m_frame_index++;
+}
+
+void App::PhysicsThread::start(int index) {
+    th = std::thread([this, index] {
+        JobSystem::set_thread_index(index); // (past the workers': not the main thread's 0)
+        prof::register_thread(index);
+#if defined(__APPLE__)
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+        std::unique_lock<std::mutex> lk(m);
+        for (;;) {
+            cv.wait(lk, [&] { return quit || (busy && job); });
+            if (quit) return;
+            std::function<void()> f = std::move(job);
+            job = nullptr;
+            lk.unlock();
+            f();
+            lk.lock();
+            busy = false;
+            cv.notify_all();
+        }
+    });
+}
+
+void App::PhysicsThread::run(std::function<void()> f) {
+    std::lock_guard<std::mutex> lk(m);
+    job = std::move(f);
+    busy = true;
+    cv.notify_all();
+}
+
+void App::PhysicsThread::wait() {
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [&] { return !busy; });
+}
+
+void App::PhysicsThread::stop() {
+    if (!th.joinable()) return;
+    wait();
+    {
+        std::lock_guard<std::mutex> lk(m);
+        quit = true;
+        cv.notify_all();
+    }
+    th.join();
 }
 
 int App::run(const AppOptions& opt) {
@@ -1201,6 +1293,7 @@ int App::run(const AppOptions& opt) {
         static const bool live = getenv("BL_LIVE") != nullptr; // (diagnostics: scripted runs stepped like the interactive app)
         const bool fixed = (bench || !opt.screenshot.empty() || !opt.shots.empty()) && !opt.realtime && !live;
         if (fixed) dt = 1.0f / 60.0f; // deterministic stepping
+        m_fixed = fixed;
         dt = std::min(dt, 0.1f);
         m_frame_ms = dt * 1000.0;
         m_fps = m_fps * 0.9f + 0.1f * (dt > 0 ? 1.0f / dt : 0);
@@ -1209,6 +1302,34 @@ int App::run(const AppOptions& opt) {
         static const float max_step = getenv("BL_MAXSTEP") ? (float)atof(getenv("BL_MAXSTEP")) : 0.034f;
         if (!fixed) dt = std::min(dt, max_step);
         if (!fixed && !opt.realtime) dt = pace(dt);
+        {
+            // (the physics' budget: the target frame less what the rest of the frame took, a tenth spare; 0 off - fixed
+            // stepping, BL_HOLDFPS=0)
+            static const char* hold_env = getenv("BL_HOLDFPS");
+            const bool hold = m_hold_fps && !fixed && !(hold_env && atoi(hold_env) == 0);
+            // (the frame's part the physics does not run beside: on its thread the serial part, in line the rest of the
+            // frame's CPU)
+            const double other = m_async_frame ? m_serial_ms : std::max(0.0, m_cpu_ms - m_game.frame_physics_ms);
+            m_other_ms = m_other_ms <= 0 ? other : (other > m_other_ms ? other : m_other_ms * 0.9 + other * 0.1);
+            m_game.world.settings.frame_budget_ms = hold ? (float)std::max(4.0, 0.9 * 1000.0 / m_target_fps - m_other_ms) : 0.0f;
+            m_game.world.settings.overload_share = m_async_frame ? 0.9f : 0.5f;
+            static const char* quiet_env = getenv("BL_FEMQUIET"); // (diagnostics: 1 off; set, also in fixed stepping)
+            m_game.world.settings.frame_every_quiet = quiet_env ? std::max(1, atoi(quiet_env)) : hold ? 2 : 1;
+        }
+        {
+            // (the display's refresh above the target - 120 Hz: the frames held to the target's, every other refresh -
+            // each frame's work for the world and the drawing done half as often, the physics' share of a frame twice; a
+            // swap interval of 2 is not kept on macOS: the frame waits before its swap - App::frame - the physics running)
+            const bool vsync = !(opt.no_vsync || opt.bench_frames > 0 || opt.hidden);
+            static int refresh = 0; // (asked once, and only when it matters: with the display asleep there is no monitor)
+            if (vsync && refresh == 0) {
+                GLFWmonitor* mon = glfwGetPrimaryMonitor();
+                const GLFWvidmode* vm = mon ? glfwGetVideoMode(mon) : nullptr;
+                refresh = vm && vm->refreshRate > 0 ? vm->refreshRate : 60;
+            }
+            static const bool cap_env = !(getenv("BL_FPSCAP") && atoi(getenv("BL_FPSCAP")) == 0);
+            m_frame_cap_s = vsync && cap_env && m_hold_fps && refresh > 1.5f * m_target_fps ? 1.0 / m_target_fps : 0.0;
+        }
         static const bool prof_env = getenv("BL_PROFCSV") != nullptr;
         m_game.world.settings.element_stats = m_show_perf || prof_env || !m_rec_path.empty(); // (counting costs a pass)
         frame(dt);
@@ -1315,7 +1436,7 @@ void App::write_prof_csv(float dt) {
         for (const char* z : zone_names) fprintf(m_prof_csv, ",%s", z);
         fprintf(m_prof_csv, ",bodies,bodies_awake,pieces,pieces_awake,pieces_rigid,nodes,nodes_awake,beams,beams_awake,beams_broken,shells,shells_awake,"
                             "shells_L0,shells_L1,shells_L2,shells_L3,shells_L4,shells_x1,shells_x2,shells_x4,hinges,hinges_awake,edges_border,"
-                            "edges_crack,edges_cut,tris,tris_awake,impacts,node_steps,shell_evals,hinge_evals,beam_evals,contact_pairs,gpu_ms,fb_w,fb_h");
+                            "edges_crack,edges_cut,tris,tris_awake,impacts,node_steps,shell_evals,hinge_evals,beam_evals,contact_pairs,gpu_ms,fb_w,fb_h,budget_ms,budget_cut");
         fprintf(m_prof_csv, "\n");
     }
     const auto& st = m_game.world.stats();
@@ -1339,7 +1460,7 @@ void App::write_prof_csv(float dt) {
             e.shells_level[0], e.shells_level[1], e.shells_level[2], e.shells_level[3], e.shells_level[4], e.shells_rate[0], e.shells_rate[1],
             e.shells_rate[2], e.hinges, e.hinges_awake, e.edges_border, e.edges_crack, e.edges_cut, e.tris, e.tris_awake, e.impacts, e.node_steps,
             e.shell_evals, e.hinge_evals, e.beam_evals, st.contact_pairs);
-    fprintf(m_prof_csv, ",%.3f,%d,%d\n", m_renderer.gpu_ms(), m_fb_w, m_fb_h);
+    fprintf(m_prof_csv, ",%.3f,%d,%d,%.2f,%d\n", m_renderer.gpu_ms(), m_fb_w, m_fb_h, m_game.world.settings.frame_budget_ms, st.budget_cut_substeps);
 }
 
 // One sample of the Elements graphs per frame (while the performance widget is open and not frozen).
@@ -1382,6 +1503,7 @@ void App::record_elements() {
 }
 
 void App::shutdown() {
+    m_phys.stop();
     if (m_prof_csv) fclose(m_prof_csv);
     m_prof_csv = nullptr;
     m_game.clear_vehicles();

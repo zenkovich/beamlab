@@ -7,7 +7,11 @@
 
 #include "PerfmonWidget.h"
 
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
 
 struct GLFWwindow;
 struct ImFont;
@@ -104,6 +108,35 @@ private:
     float m_fps = 60;
     double m_frame_ms = 0, m_cpu_ms = 0, m_render_ms = 0, m_ui_ms = 0;
     double m_prev_mx = 0, m_prev_my = 0;
+    // The physics on a thread of its own in real time (App::frame): the world's step of a frame runs while the frame is
+    // drawn - the GL submission, the UI's drawing, the wait for the display - after the frame has read the world (its
+    // visuals, draw lists, UI); the frame waits for it at its end. Fixed stepping (the tests, screenshots) and the model
+    // editor step in line as before; BL_ASYNC=0 too.
+    struct PhysicsThread {
+        std::thread th;
+        std::mutex m;
+        std::condition_variable cv;
+        std::function<void()> job;
+        bool busy = false, quit = false;
+        void start(int index);
+        void run(std::function<void()> f);
+        void wait();
+        void stop();
+    };
+    PhysicsThread m_phys;
+    bool m_fixed = false;           // (this frame steps a fixed time: in line)
+    bool m_async_frame = false;     // (this frame's step on the physics thread)
+    bool m_kicked = false;
+    bool m_step_due = false;
+    double m_serial_ms = 0;         // (the frame's part the physics does not run beside: before the kick, after the wait)
+    uint64_t m_t_frame = 0;
+    double m_frame_cap_s = 0;       // (the frame held to the target's length: the display's refresh above it)
+    double m_last_present = 0;
+    // Holding the frame rate (Physics menu): in real time the physics gets what of the frame the rest leaves it
+    // (WorldSettings::frame_budget_ms), the simulation slowing for the heavy moments instead of the frames
+    bool m_hold_fps = true;
+    float m_target_fps = 60.0f;
+    double m_other_ms = 0;          // (the frame's CPU besides the physics, smoothed)
     // Steering by the mouse as in Operation Flashpoint (M): the cursor is a heading in the world, the vehicle steers to
     // it; as it turns the cursor comes back to the screen's middle (gather_input, ui_mouse_steer).
     bool m_mouse_steer = false;    // (the mode: View menu, M)

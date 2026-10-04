@@ -104,6 +104,15 @@ public:
     bool init();
     void load_scene(int index);
     void update(float dt, const VehicleInput& in, const CameraInput& cam_in);
+    // (the same in three: the input and the scene's logic; the world's step - on the physics thread, App - when not paused;
+    // after it, the vehicles' frame and the camera)
+    void update_pre(float dt, const VehicleInput& in);
+    bool step_due() const { return !paused || step_once; }
+    void step_world(float dt);
+    void update_post(float dt, const CameraInput& cam_in);
+    // (called once Game::render has read the world - the visuals, the draw lists, the debug drawing: the physics thread
+    // may step it while the frame is drawn)
+    std::function<void()> after_collect;
     // cam: another camera than the controller's (the model editor's views); visuals: skin the vehicles and objects
     // (off for the second and later views of one frame)
     void render(Renderer& r, int w, int h, const Camera* cam = nullptr, bool visuals = true);
@@ -165,6 +174,7 @@ public:
     vec3 spawn_override_pos;
     float spawn_override_yaw = 0;
     float frame_physics_ms = 0;
+    bool m_stepped = false; // (the world stepped since the last update_post)
 
     // mouse grab
     bool grab_active = false;
