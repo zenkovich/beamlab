@@ -1,5 +1,6 @@
 #include "NanoProfiler.h"
 #include <chrono>
+#include <cstring>
 
 namespace Perfmon
 {
@@ -18,6 +19,16 @@ namespace Perfmon
 
         samples[_top].endTime = GetTime();
         _top = samples[_top].parent;  // Return to parent sample
+    }
+
+    void NanoProfiler::AddSample(const char* parentName, const char* name, double durationMs)
+    {
+        auto& samples = GetSamplesInternal();
+        int parent = _top;
+        for (int i = static_cast<int>(samples.size()) - 1; i >= 0; i--)
+            if (std::strcmp(samples[i].name, parentName) == 0) { parent = i; break; }
+        const double t = GetTime();
+        samples.emplace_back(Sample{ name, parent, t - durationMs, t });
     }
 
     void NanoProfiler::Clear()

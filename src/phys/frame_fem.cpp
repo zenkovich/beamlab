@@ -543,6 +543,16 @@ void FemFrame::mount_forces(SoftBody& b) {
 // ------------------------------------------------------------------------------------------------ the sparse pattern
 void FemFrame::analyse() {
     PROFILE_ACCUM("Frame analyse");
+    static prof::Zone* const az[7] = {prof::zone("An graph"), prof::zone("An order"), prof::zone("An columns"), prof::zone("An blocks"), prof::zone("An gather"),
+                                      prof::zone("An plan"), prof::zone("An arrays")};
+    uint64_t an_t = prof::now();
+    int an_k = 0;
+    auto an_lap = [&]() {
+        const uint64_t t = prof::now();
+        prof::ZoneSlot& zs = az[an_k++]->slot[prof::t_zone_slot];
+        zs.ticks.store(zs.ticks.load(std::memory_order_relaxed) + (t - an_t), std::memory_order_relaxed);
+        an_t = t;
+    };
     const int n = (int)node.size();
     // the components: frame nodes joined by members (a part on mounts is one of its own)
     std::vector<int> up(n);
@@ -606,6 +616,7 @@ void FemFrame::analyse() {
         adj_ptr.swap(ptr2);
     }
     if (prof::g_trace) prof::trace_mark("analyse", 1);
+    an_lap();
     std::vector<std::vector<int>> comp_nodes(nc);
     for (int i = 0; i < n; i++) comp_nodes[comp_of[i]].push_back(i);
     perm_.assign(n, 0);
@@ -673,6 +684,7 @@ void FemFrame::analyse() {
         comp_range_[c].second = k;
     }
     if (prof::g_trace) prof::trace_mark("analyse", 2);
+    an_lap();
     col_ptr_.assign(n + 1, 0);
     row_.resize(cols_buf.size());
     size_t nupd = 0;
@@ -713,6 +725,7 @@ void FemFrame::analyse() {
         upd_ptr_[kk + 1] = (int)upd_.size();
     }
     if (prof::g_trace) prof::trace_mark("analyse", 3);
+    an_lap();
     elem_block_.assign(elems.size(), -1);
     elem_swap_.assign(elems.size(), 0);
     comp_elems_.assign(nc, {});
@@ -773,10 +786,13 @@ void FemFrame::analyse() {
         }
     }
     if (prof::g_trace) prof::trace_mark("analyse", 4);
+    an_lap();
     gather_lists();
     if (prof::g_trace) prof::trace_mark("analyse", 5);
+    an_lap();
     par_plan();
     if (prof::g_trace) prof::trace_mark("analyse", 6);
+    an_lap();
     // (diagnostics, BL_FACTORDUMP=<file>: the largest component's pattern as JSON, once: the nodes in the elimination
     // order, the members, triangles and springs between them, and the factor's blocks per column)
     static bool dumped = false;
@@ -840,6 +856,7 @@ void FemFrame::analyse() {
     rhs_.assign((size_t)n * 6, 0.0);
     dinv_.assign((size_t)n * 6, 0.0);
     diagA_.resize(diag_.size()), offA_.resize(off_.size()), rhsA_.resize(rhs_.size()); // (copies of the assembly: no zeroing)
+    an_lap();
 }
 
 // The assembly's lists (see Gather): the members' blocks, then the triangles', each in its order
@@ -3218,6 +3235,7 @@ bool FemFrame::process_events(SoftBody& b) {
     // substep (each is the solver's pattern again: the rest queue again while they yield)
     std::vector<uint8_t> refined; // (the triangles bisected now, the halves that kept the index and the new ones)
     {
+        PROFILE_ACCUM("Events refine");
         int budget = steps_ - refine_step_ >= (uint32_t)kRefineEvery ? kRefinePerStep : 0;
         const size_t nt = tris.size();
         std::vector<uint8_t> lv;
@@ -3261,6 +3279,7 @@ bool FemFrame::process_events(SoftBody& b) {
     ev.swap(events_);
     static const bool tdbg = getenv("BL_FRAMEDBG") != nullptr;
     for (const Event& x : ev) {
+        PROFILE_ACCUM("Events each");
         switch (x.kind) {
         case 5: break; // (above)
         case 6: // a triangle that could not tear along an edge, far past it: its corners copied for it alone - if no edge
@@ -3314,6 +3333,7 @@ bool FemFrame::process_events(SoftBody& b) {
     // a mount whose seat tore (a member torn off one of its nodes) lets go (the members at each frame node counted once:
     // members_at for every mount's node was a millisecond a crash's substep)
     static const bool dbg = getenv("BL_FRAMEDBG") != nullptr;
+    prof::AccumScope seats_scope(prof::zone("Events seats"));
     std::vector<int> at(node.size(), 0);
     for (const FrameElement& e : elems)
         if (!e.broken) {
@@ -3365,6 +3385,7 @@ bool FemFrame::process_events(SoftBody& b) {
     }
     // the fragments the tears cut off loose at once (their frame's step no longer theirs)
     if (tris_torn != torn0 && loose_mass_ > 0 && !b.rigid) {
+        PROFILE_ACCUM("Events debris");
         std::vector<std::unique_ptr<SoftBody>> none;
         detach_debris(b, none, loose_mass_, true);
     }

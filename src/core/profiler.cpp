@@ -2,6 +2,8 @@
 #include "core/jobs.h"
 
 #include "NanoProfiler.h"
+#include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <cstdio>
@@ -110,6 +112,31 @@ Scope::~Scope() {
         td->depth--;
     }
     if (m_nano) Perfmon::NanoProfiler::EndSample();
+}
+
+namespace {
+std::mutex g_parts_mx;
+std::vector<std::pair<const char*, double>> g_parts;
+} // namespace
+
+void add_part(const char* parent, const char* name, double ms) {
+    static const bool dbg = getenv("BL_PARTSDBG") != nullptr; // (diagnostics: what reaches the graph)
+    const bool main_thread = JobSystem::thread_index() == 0 && !JobSystem::in_job();
+    if (dbg) fprintf(stderr, "part %s %.3f ms%s\n", name, ms, main_thread ? "" : " (kept for the main thread)");
+    if (!(ms > 0)) return;
+    if (main_thread) {
+        Perfmon::NanoProfiler::AddSample(parent, name, ms);
+    } else {
+        std::lock_guard<std::mutex> lk(g_parts_mx);
+        g_parts.push_back({name, ms});
+    }
+}
+
+void flush_parts(const char* root, double root_ms) {
+    std::lock_guard<std::mutex> lk(g_parts_mx);
+    if (root_ms > 0) Perfmon::NanoProfiler::AddSample("", root, root_ms);
+    for (const auto& [name, ms] : g_parts) Perfmon::NanoProfiler::AddSample(root, name, ms);
+    g_parts.clear();
 }
 
 void end_frame() {

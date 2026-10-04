@@ -1302,7 +1302,7 @@ void App::write_prof_csv(float dt) {
                                        "Sheet pattern", "Sheet pattern codes", "Sheet settle", "Sheet split point", "Sheet coarsen", "Sheet fx", "Sheet budget", "Sheet sync",
                                        "Render", "Shadows", "Main pass", "UI", "ImGui render", "Draw submit", "Swap", "Input", "Events",
                                        "Frame elements", "Frame solve", "Frame assemble", "Frame factor", "Sheet membrane", "Sheet spheres",
-                                       "Volumes", "Near pairs", "Frame held", "Frame sync", "Sheet events", "FEM assemble", "FEM factor", "FEM finish", "FEM repass", "Volume mids", "Volume find", "Volume push", "Frame events", "Short step first", "Short steps later"};
+                                       "Volumes", "Near pairs", "Frame held", "Frame sync", "Sheet events", "FEM assemble", "FEM factor", "FEM finish", "FEM repass", "Volume mids", "Volume find", "Volume push", "Frame events", "Short step first", "Short steps later", "Static nodes", "Static tyres", "Static plates", "Frame analyse", "Events refine", "Events each", "Events seats", "Events debris", "Frame tear tri", "Frame tear", "Frame split", "An graph", "An order", "An columns", "An blocks", "An gather", "An plan", "An arrays"};
     if (!path) return;
     if (!m_prof_csv) {
         m_prof_csv = fopen(path, "w");
@@ -1310,7 +1310,8 @@ void App::write_prof_csv(float dt) {
         fprintf(m_prof_csv, "frame,t,dt_ms,substeps,physics_ms,cpu_ms,islands,islands_cpu_ms,heavy_ms,heavy_bodies,heavy_nodes,heavy_beams,"
                             "heavy_shells,heavy_sub,heavy_wide,heavy_body,active_bodies,active_nodes,awake_shells,shell_steps,beam_steps,"
                             "refines,cracks,pieces_created,narrow_tests,contacts,pair_rebuilds,fast_refreshes,team_wait_ms,team_stalls,speed_kmh,veh_z,"
-                            "hp_forces,hp_gather,hp_collide,hp_integrate,hp_serial,hp_topology,hp_rebuild,hp_refresh,hp_contacts,raw_dt_ms");
+                            "hp_forces,hp_gather,hp_collide,hp_integrate,hp_serial,hp_topology,hp_rebuild,hp_refresh,hp_contacts,"
+                            "hs_static,hs_ground,hs_fem_begin,hs_fem_solve,raw_dt_ms");
         for (const char* z : zone_names) fprintf(m_prof_csv, ",%s", z);
         fprintf(m_prof_csv, ",bodies,bodies_awake,pieces,pieces_awake,pieces_rigid,nodes,nodes_awake,beams,beams_awake,beams_broken,shells,shells_awake,"
                             "shells_L0,shells_L1,shells_L2,shells_L3,shells_L4,shells_x1,shells_x2,shells_x4,hinges,hinges_awake,edges_border,"
@@ -1326,6 +1327,7 @@ void App::write_prof_csv(float dt) {
             st.beam_steps, st.shell_refines, st.shell_cracks, st.pieces_created, st.narrow_tests, st.contacts, st.pair_rebuilds,
             st.fast_refreshes, st.team_wait_ms, st.team_stalls, v ? v->speed_kmh() : 0.0f, v ? v->position().z : 0.0f);
     for (double x : st.heavy_phase_ms) fprintf(m_prof_csv, ",%.4f", x);
+    for (double x : st.heavy_sub_ms) fprintf(m_prof_csv, ",%.4f", x);
     fprintf(m_prof_csv, ",%.3f", m_frame_ms);
     for (const char* z : zone_names) {
         const prof::Zone* zz = prof::find_zone(z);

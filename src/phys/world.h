@@ -82,6 +82,8 @@ struct WorldStats {
     double heavy_island_ms = 0;         // the slowest island: the frame's critical path (one island runs on one thread)
     int heavy_island_bodies = 0, heavy_island_nodes = 0, heavy_island_beams = 0, heavy_island_shells = 0;
     int heavy_island_sub = 1;           // short steps per substep of its finest sheet
+    double heavy_sub_ms[4] = {};        // its integration's parts (wall): static contacts of the nodes, tyres and plates on the
+                                        // ground, the FEM steps begun (assembly), the FEM steps (factor, solve)
     double heavy_phase_ms[9] = {};      // its phases (wall): forces, gather, collisions, integration, serial, topology;
                                         // collisions split: rebuilds, fast pair refreshes, narrow phase + response
     bool heavy_island_wide = false;

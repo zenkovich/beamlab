@@ -178,6 +178,8 @@ struct World::Island {
     bool fast_dense = false;                 // the fast bodies' pairs need the short schedule
     // profiling of the last frame
     double ms = 0;                           // wall time of simulate_island
+    double sub_ms[4] = {};                   // of the integration (wall): the nodes on the static world and their step; the tyres and
+                                             // the plates on it; the frames' steps begun; the frames' steps
     double ph_ms[9] = {};                    // its phases (wall): forces, gather, collisions, integration, serial merges, topology,
                                              // and of the collisions: rebuilds, fast pair refreshes, narrow phase + response
     int max_sub = 1;                         // most short steps per substep of a body
@@ -450,6 +452,18 @@ void World::step_substeps(int n) {
         if (heavy) {
             st.heavy_island_ms = heavy->ms;
             for (int k = 0; k < 9; k++) st.heavy_phase_ms[k] = heavy->ph_ms[k];
+            for (int k = 0; k < 4; k++) st.heavy_sub_ms[k] = heavy->sub_ms[k];
+            // (the performance widget's graph: the heaviest island's wall time by what its stepping thread waited
+            // on - the islands run in jobs, the graph is the main thread's, which waits for the longest of them)
+            const Island& isl = *heavy;
+            prof::add_part("Islands", "Isl: element forces", isl.ph_ms[0] + isl.ph_ms[1]);
+            prof::add_part("Islands", "Isl: body contacts", isl.ph_ms[2]);
+            prof::add_part("Islands", "Isl: static contacts, nodes", isl.sub_ms[0]);
+            prof::add_part("Islands", "Isl: tyres, plates on ground", isl.sub_ms[1]);
+            prof::add_part("Islands", "Isl: FEM assemble", isl.sub_ms[2]);
+            prof::add_part("Islands", "Isl: FEM factor, solve", isl.sub_ms[3]);
+            prof::add_part("Islands", "Isl: integrate", std::max(0.0, isl.ph_ms[3] - isl.sub_ms[0] - isl.sub_ms[1] - isl.sub_ms[2] - isl.sub_ms[3]));
+            prof::add_part("Islands", "Isl: merge, topology", isl.ph_ms[4] + isl.ph_ms[5]);
             st.heavy_island_bodies = (int)heavy->bodies.size();
             st.heavy_island_sub = heavy->max_sub;
             st.heavy_island_wide = heavy->teamed;
@@ -3192,6 +3206,13 @@ void World::simulate_island(Island& isl, int substeps) {
     };
     bool rebuild_now = false;
     for (double& x : isl.ph_ms) x = 0;
+    for (double& x : isl.sub_ms) x = 0;
+    uint64_t tsub = prof::now();
+    auto sub_lap = [&](int k) { // (k < 0: the clock set)
+        const uint64_t t = prof::now();
+        if (k >= 0) isl.sub_ms[k] += prof::ticks_to_ms(t - tsub);
+        tsub = t;
+    };
     uint64_t tph = prof::now();
     auto lap = [&](int k) {
         const uint64_t t = prof::now();
@@ -3384,12 +3405,14 @@ void World::simulate_island(Island& isl, int substeps) {
                 for (uint32_t c = 0; (size_t)c * kMidChunk < b.fem.tris.size(); c++) isl.smid_tasks.push_back({k, c});
             }
             if (isl.smid.size() < isl.smid_tasks.size()) isl.smid.resize(isl.smid_tasks.size());
+            sub_lap(-1);
             {
                 PROFILE_ACCUM("Integration");
                 const int nwork = (int)isl.work.size();
                 team.run(nwork + (int)isl.smid_tasks.size(), [&](int i) {
                     if (i >= nwork) {
                         PROFILE_ACCUM("Static collisions");
+                        PROFILE_ACCUM("Static plates");
                         const auto [k, c] = isl.smid_tasks[i - nwork];
                         static_mids_find(*isl.bodies[k], (size_t)c * kMidChunk, (size_t)(c + 1) * kMidChunk, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], isl.smid[i - nwork]);
                         return;
@@ -3417,10 +3440,19 @@ void World::simulate_island(Island& isl, int substeps) {
                     out.contacts = 0;
                     {
                         PROFILE_ACCUM("Static collisions");
-                        collide_static(b, w.a, w.b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt, out.contacts);
+                        {
+                            PROFILE_ACCUM("Static nodes");
+                            collide_static(b, w.a, w.b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt, out.contacts);
+                        }
                         if (!isl.fem_chunked[k]) {
-                            if (w.a == 0 && !b.wheels.empty() && !b.rigid) ring_tyres(b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt);
-                            if (w.a == 0 && w.b == b.nodes.size() && !b.fem.tris.empty()) collide_static_mids(b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt, out.contacts);
+                            if (w.a == 0 && !b.wheels.empty() && !b.rigid) {
+                                PROFILE_ACCUM("Static tyres");
+                                ring_tyres(b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt);
+                            }
+                            if (w.a == 0 && w.b == b.nodes.size() && !b.fem.tris.empty()) {
+                                PROFILE_ACCUM("Static plates");
+                                collide_static_mids(b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt, out.contacts);
+                            }
                         }
                     }
                     PROFILE_ACCUM("Integrate");
@@ -3453,6 +3485,7 @@ void World::simulate_island(Island& isl, int substeps) {
                         b.integrate_nodes(w.a, w.b, bdt, out.mn, out.mx, out.max_v2);
                     }
                 });
+                sub_lap(0);
                 // the chunked frames' bodies: their ring tyres and plates' mid points against the static world, then the
                 // frame's step (on the body's first chunk; the others integrate after it: 4)
                 {
@@ -3466,7 +3499,11 @@ void World::simulate_island(Island& isl, int substeps) {
                         const float bdt = dt / (float)isl.subs[k];
                         {
                             PROFILE_ACCUM("Static collisions");
-                            if (!b.wheels.empty() && !b.rigid) ring_tyres(b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt);
+                            if (!b.wheels.empty() && !b.rigid) {
+                                PROFILE_ACCUM("Static tyres");
+                                ring_tyres(b, isl.box_ids[k], isl.cyl_ids[k], isl.terrain_max[k], bdt);
+                            }
+                            PROFILE_ACCUM("Static plates");
                             if (const int t0 = isl.smid_first[k]; t0 >= 0)
                                 for (int q = t0; q < (int)isl.smid_tasks.size() && isl.smid_tasks[q].first == k; q++) static_mids_apply(b, isl.smid[q], bdt, isl.parts[i0].contacts);
                         }
@@ -3478,6 +3515,7 @@ void World::simulate_island(Island& isl, int substeps) {
                         for (int i = i0; i < (int)isl.work.size() && (int)isl.work[i].body == k; i++) isl.fem_defer[i] = i == i0 ? first : 4;
                     });
                 }
+                sub_lap(1);
                 // the frames' implicit steps: each frame's components (parts held by mounts, solved apart) beside each
                 // other and the other frames'; then those bodies' integration
                 {
@@ -3504,6 +3542,7 @@ void World::simulate_island(Island& isl, int substeps) {
                 }
                 for (int k = 0; k < nb; k++) // (begun beside the contacts and not stepping now: never - see above)
                     if (isl.fem_pre[k] == 1) fprintf(stderr, "frame of body %d begun beside the contacts, not stepped\n", k);
+                sub_lap(2);
                 if (std::find_if(isl.fem_defer.begin(), isl.fem_defer.end(), [](char c) { return c != 0; }) != isl.fem_defer.end()) {
                     // the large components (FemFrame::par_component) in the team's stages: their assembly in chunks
                     // of columns, the rest of it, the factor's subtrees, the updates above those, then the rest of the
@@ -3680,6 +3719,7 @@ void World::simulate_island(Island& isl, int substeps) {
                     });
                 }
             }
+            sub_lap(3);
             lap(3);
             // 4b) the sheets' sphere contacts (between them, and each deformed one with itself), after the integration
             isl.sph.clear();

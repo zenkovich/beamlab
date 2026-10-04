@@ -31,6 +31,10 @@ namespace Perfmon
         // Stop timing current sample
         static void EndSample();
 
+        // (BeamLab) A child of the frame's last sample named parentName (the current one if there is none) of a known
+        // duration (ms): time measured elsewhere, summed over many short intervals, shown as a part of its parent
+        static void AddSample(const char* parentName, const char* name, double durationMs);
+
         // Move current samples to buffer and clear current list
         static void Clear();
 

@@ -57,6 +57,12 @@ struct ThreadTimeline {
 Zone* zone(const char* name);
 void register_thread(int index);
 void end_frame();
+// A part of the main thread's zone `parent` of this frame, of a duration measured elsewhere (the performance widget's graph shows a
+// zone's own time, less its parts': an island's phases, each summed over the substeps). Other threads, jobs: nothing.
+void add_part(const char* parent, const char* name, double ms);
+// (the parts recorded on another thread - the physics thread - kept until the main thread adds them: root a part of the
+// main thread's open zone, the kept ones parts of root)
+void flush_parts(const char* root, double root_ms);
 void set_timeline_enabled(bool e);
 bool timeline_enabled();
 

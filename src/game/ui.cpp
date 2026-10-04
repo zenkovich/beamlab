@@ -1006,9 +1006,11 @@ void App::ui_perf() {
             {"Collisions", zms("Broadphase") + zms("Fast pair refresh") + zms("Narrow phase") + zms("Contacts") + zms("Static collisions") +
                                zms("Pair inheritance"),
              IM_COL32(200, 120, 230, 255)},
+            {"FEM", zms("Frame elements") + zms("Frame solve") + zms("Frame held") + zms("FEM finish") + zms("Volumes"), IM_COL32(110, 215, 150, 255)},
             {"Integrate", zms("Integrate"), IM_COL32(90, 170, 250, 255)},
             {"Cracks", zms("Sheet topology"), IM_COL32(240, 90, 80, 255)},
         };
+        const int ncats = (int)(sizeof cats / sizeof cats[0]);
         double total = 0;
         for (const Cat& c : cats) total += c.ms;
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1021,12 +1023,13 @@ void App::ui_perf() {
             x += w;
         }
         ImGui::Dummy(ImVec2(W, H + 2));
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < ncats; i++) {
             ImGui::ColorButton(cats[i].name, ImGui::ColorConvertU32ToFloat4(cats[i].col), ImGuiColorEditFlags_NoTooltip, ImVec2(8, 8));
             ImGui::SameLine();
             ImGui::TextDisabled("%s", cats[i].name);
-            if (i != 4) ImGui::SameLine();
+            if (i != ncats - 1) ImGui::SameLine();
         }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("CPU time summed over the threads (not the wall time above): what the work is, not what the frame waits for.\nThe graph at the top shows the island's wall time by phase (Isl: ...).");
         if (ImGui::CollapsingHeader("Physics details")) {
             ImGui::TextDisabled("CPU ms per frame, all threads, smoothed");
             if (ImGui::BeginTable("physzones", 3, ImGuiTableFlags_SizingFixedFit)) {
@@ -1050,7 +1053,15 @@ void App::ui_perf() {
                 row("Broadphase", zms("Broadphase"), format("%d rebuilds", st.pair_rebuilds));
                 row("  fast pairs", zms("Fast pairs"), format("%d refreshes", st.fast_refreshes));
                 row("  inherited", zms("Pair inheritance"), "after cracks");
-                row("Static colls", zms("Static collisions"), "");
+                row("Static colls", zms("Static collisions"), "against the terrain, boxes, cylinders");
+                row("  nodes", zms("Static nodes"), "");
+                row("  tyres", zms("Static tyres"), "the ring tyres' patches");
+                row("  plates", zms("Static plates"), "the FEM triangles' mid points");
+                row("FEM elements", zms("Frame elements"), "members' and triangles' forces");
+                row("FEM solve", zms("Frame solve"), format("assemble %.2f, factor %.2f", zms("Frame assemble"), zms("Frame factor")));
+                row("  held steps", zms("Frame held"), "between the implicit steps");
+                row("  finish", zms("FEM finish"), format("repass %.2f", zms("FEM repass")));
+                row("Volumes", zms("Volumes"), "collision volumes against plates and nodes");
                 row("Integrate", zms("Integrate"), "");
                 row("Sheet refine", zms("Sheet refine"), format("%d splits", st.shell_refines));
                 row("Sheet cracks", zms("Sheet cracks"), format("%d cracks", st.shell_cracks));
