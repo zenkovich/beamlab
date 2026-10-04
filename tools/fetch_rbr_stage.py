@@ -7,6 +7,10 @@ Stages (all by RALLY Guru, https://rallyguru-tracks.blogspot.com/):
     undva         Undva (Estonia, narrow fast gravel through forest and juniper bushes)
     travanca      Travanca do Monte (Portugal, gravel through pine and eucalyptus hills)
     fernet_branca Fernet Branca 2015 (Argentina, gravel through the Cordoba hills)
+    haguenau      Haguenau 2012 (tarmac, 5.7 km)
+    zarasai       Zaraso Salos Trekas (a super special on an island, 2 laps, 2 km)
+    undva_reverse Undva the other way (Estonia, gravel, 10 km)
+    junior_wheels_2 Junior Wheels II (a technical training stage of many road types, 5.6 km)
 Author's terms (install guide and blog): free for non-commercial use; all models and textures may be used for
 non-commercial purposes (vegetation textures reduced to 1024x1024); the stages themselves must not be modified or
 redistributed as modified RBR stages; keep the author's credits. The converter therefore runs locally, reduces the
@@ -102,6 +106,52 @@ STAGES = {
             "Author's terms: free for non-commercial use. All models and textures may be used for non-commercial\n"
             "purposes (vegetation textures reduced to 1024x1024 pixels). No modification of the stage itself is\n"
             "allowed without the author's permission; keep the author's credits.\n\n"
+            "Converted locally for BeamLab by tools/fetch_rbr_stage.py (vegetation textures reduced to 1024 px).\n"
+            "Personal, non-commercial use only. Do not redistribute.\n"),
+    ),
+    "haguenau": dict(
+        title="Haguenau 2012 (RBR)",
+        archive="haguenau.7z",
+        url=GDRIVE.format("0BwUDAvN91_GyQktGanA0SUJLT0E"),
+        credits=(
+            "Haguenau 2012 v1.0.2 - Richard Burns Rally community stage (tarmac, 5.7 km)\n"
+            "Made by RALLY Guru (https://rallyguru-tracks.blogspot.com/).\n\n"
+            "Author's terms (as published with the stage): free for non commercial usage.\n\n"
+            "Converted locally for BeamLab by tools/fetch_rbr_stage.py (vegetation textures reduced to 1024 px).\n"
+            "Personal, non-commercial use only. Do not redistribute.\n"),
+    ),
+    "zarasai": dict(
+        title="Zaraso Salos Trekas (RBR)",
+        archive="zarasai.7z",
+        url=GDRIVE.format("0BwUDAvN91_GyVDNxS2RkaFF5YTQ"),
+        credits=(
+            "Zaraso Salos Trekas v1.0, 2 laps - Richard Burns Rally community super special (2.0 km)\n"
+            "Made by RALLY Guru (https://rallyguru-tracks.blogspot.com/).\n\n"
+            "Author's terms (as published with the stage): free for noncommercial use in all RBR plugins; free for noncommercial use all textures\n"
+            "and models or parts from this stage; no modification of the stage is allowed.\n\n"
+            "Converted locally for BeamLab by tools/fetch_rbr_stage.py (vegetation textures reduced to 1024 px).\n"
+            "Personal, non-commercial use only. Do not redistribute.\n"),
+    ),
+    "undva_reverse": dict(
+        title="Undva Reverse (RBR)",
+        archive="undva_reverse.7z",
+        url=GDRIVE.format("0BwUDAvN91_GyTFllSVJHV09aQUU"),
+        credits=(
+            "Undva reverse v1.0 - Richard Burns Rally community stage (Estonia, gravel, 10 km)\n"
+            "Made by RALLY Guru (https://rallyguru-tracks.blogspot.com/). Pace notes by Neo.\n\n"
+            "Author's terms (as published with the stage): free in all plugins; textures and models for non-commercial use only; no modification\n"
+            "is allowed.\n\n"
+            "Converted locally for BeamLab by tools/fetch_rbr_stage.py (vegetation textures reduced to 1024 px).\n"
+            "Personal, non-commercial use only. Do not redistribute.\n"),
+    ),
+    "junior_wheels_2": dict(
+        title="Junior Wheels II (RBR)",
+        archive="junior_wheels_2.7z",
+        url=GDRIVE.format("0BwUDAvN91_GycklkRGhNSmtVS0U"),
+        credits=(
+            "Junior Wheels II v1.0 - Richard Burns Rally community stage (a technical training stage, 5.6 km)\n"
+            "Made by RALLY Guru (https://rallyguru-tracks.blogspot.com/).\n\n"
+            "Author's terms (as published with the stage): free, for all plugins; any parts of the project may be used; no modification is allowed.\n\n"
             "Converted locally for BeamLab by tools/fetch_rbr_stage.py (vegetation textures reduced to 1024 px).\n"
             "Personal, non-commercial use only. Do not redistribute.\n"),
     ),
