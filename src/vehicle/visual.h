@@ -48,9 +48,33 @@ private:
         vec3 n;  // normal coords
         float lx = 0, ly = 0; // (its two edges' lengths as built: Flex::stretch)
     };
+    // A vertex skinned to the frames of FEM nodes (Flex::skin): its place and its normal carried by each of the kSkinK
+    // nodes of its forset nearest it - the node's position and its orientation (FemFrame::q) turning the vertex's offset
+    // from it as built (its place as built: m_vert_rest, the node's: m_node_rest) - blended by weights that fall smoothly to nothing at the next nearest node's distance (an
+    // embedded deformation: the mesh bends as a smooth surface between the nodes; on a locator's three nodes each vertex
+    // lay in one triangle's plane, and the mesh folded in facets along the triangles' edges)
+    static constexpr int kSkinK = 8;   // (the nodes that carry a vertex: with four the folds still showed as ridges)
+    struct Skin {
+        uint32_t n[kSkinK];
+        float w[kSkinK];
+        vec3 nrm;
+    };
     struct Flex {
         uint32_t first, count;
         std::vector<Locator> loc;
+        std::vector<Skin> skin;   // (not empty: the vertices skinned to node frames instead of the locators)
+        // (a skinned mesh's normals follow its surface as it bends between the nodes: its triangles (vertices from
+        // `first`), each vertex's group - the vertices at its place with its normal: a seam's two sides shade as one -
+        // and the group's normal off the triangles as built; each frame the normal off the triangles now against that one
+        // carried by the nodes turns the vertex's own normal. Carried by the nodes alone the light showed every node's
+        // patch as a stripe)
+        std::vector<uint32_t> tri, group;
+        std::vector<uint32_t> gptr, gtri;   // (per group's first vertex: the triangles at the group, for a gather in parallel)
+        std::vector<vec3> face0;
+        // (its nodes and their places as built: while they stand to each other as built - a part not bent, the whole car
+        // before its first crash - the mesh moves as one rigid piece with the first of them, a vertex a matrix's product)
+        std::vector<uint32_t> fnode;
+        std::vector<vec3> frest;
         // (above 1: a locator's edges taken no longer than this times their length as built, no shorter than 1 over it -
         // a mesh over FEM parts that tear: a vertex whose node went off with a shard stays by its other nodes, the mesh
         // was pulled out in spikes after it. 0: as RoR, the edges as they are)
@@ -157,6 +181,10 @@ private:
     // (and one stretched to three times its size as built and 0.25 m: a panel hanging on by a corner)
     std::vector<uint32_t> m_vert_node, m_draw_indices;
     std::vector<vec3> m_vert_rest;
+    std::vector<vec3> m_skin_carried, m_skin_now;   // (update's scratch: a skinned mesh's normals off its triangles)
+    std::vector<mat3> m_node_rot, m_node_R;         // (the FEM nodes' orientations: per frame node, per body node)
+    std::vector<vec3> m_node_rest, m_node_t;        // (the body's nodes as built; each one's offset now: p - R rest)
+    std::vector<uint8_t> m_node_has;                // (a body node in the frame now)
     uint64_t m_tear_key = ~0ull;
     int m_tear_again = 0;
     bool m_idx_dirty = false;

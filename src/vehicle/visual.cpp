@@ -4,6 +4,8 @@
 #include "core/util.h"
 
 #include <algorithm>
+#include <cctype>
+#include <atomic>
 #include <cmath>
 
 namespace bl {
@@ -101,6 +103,27 @@ MaterialPtr VehicleVisual::material(const std::string& name, bool double_sided) 
         m->emissive = md->emissive * 0.6f;
         m->unlit = !md->lighting;
         m->cast_shadow = !m->blend;
+        // what it is of, by its name and its texture's: glass (blended), polished metal, the body's paint - each its own
+        // shading (Material::surface); the interior, the tyres, the underbody and the rest as they were
+        std::string low = name + " " + md->diffuse_tex.substr(md->diffuse_tex.find_last_of('/') + 1);   // (not its folders: "shell_car")
+        for (char& ch : low) ch = (char)std::tolower((unsigned char)ch);
+        auto has = [&](std::initializer_list<const char*> keys) {
+            for (const char* k : keys)
+                if (low.find(k) != std::string::npos) return true;
+            return false;
+        };
+        if (!m->unlit) {
+            bool lamp = has({"lens", "headlight", "frontlight", "taillight", "_tail", "lights", "fogs", "indicator", "projector", "flight", "rlight"}) && !has({"switch", "dash"});
+            bool opaque = !m->blend && m->alpha_ref <= 0;
+            if (lamp) m->surface = Material::Lens;
+            else if (m->blend && (glass || has({"glass", "window", "wind"}))) m->surface = Material::Glass;
+            else if (opaque && has({"chrome", "mirror", "ornament", "exhaust"})) m->surface = Material::Chrome;
+            else if (opaque && (md->reflective || has({"body", "paint", "skin", "shell", "coupe", "-ext", "fender", "hood", "bumper", "lightweight"})) &&
+                     !has({"interior", "seat", "dash", "carpet", "under", "unibody", "chassis", "frame", "engine", "tire", "tyre", "wheel", "dial", "gauge", "badge", "driveline", "steer",
+                           "panel", "rubber", "fabric", "plastic"}))
+                m->surface = Material::Paint;
+        }
+        if (getenv("BL_MATDBG")) fprintf(stderr, "mat %s tex %s: surface %d blend %d aref %.2f refl %d\n", name.c_str(), md->diffuse_tex.c_str(), (int)m->surface, (int)m->blend, m->alpha_ref, (int)md->reflective);
     }
     m_mats[key] = m;
     return m;
@@ -247,8 +270,87 @@ void VehicleVisual::build(const ror::Document& d, const SoftBody& b, std::vector
                 fclose(fo);
             }
         }
+        // a body of FEM parts under its meshes: each vertex skinned to the frames of the FEM nodes of its forset
+        // nearest it (Skin; BL_FLEX_LOCATORS=1: RoR's locators as before)
+        static const bool locators_only = getenv("BL_FLEX_LOCATORS") != nullptr;
+        std::vector<uint32_t> framed;
+        if (fx.stretch > 1 && !rigid && !locators_only)
+            for (uint32_t n : forset)
+                if (b.fem.slot(n) >= 0) framed.push_back(n);
+        if (framed.size() > (size_t)kSkinK) {
+            fx.skin.resize(total);
+            JobSystem::get().parallel_for((int)total, 256, [&](int b0, int b1, int) {
+                for (int i = b0; i < b1; i++) {
+                    // the nearest kSkinK carry it, the next one's distance is where a weight ends
+                    uint32_t bn[kSkinK + 1];
+                    float bd[kSkinK + 1];
+                    for (int k = 0; k <= kSkinK; k++) bn[k] = 0, bd[k] = 1e30f;
+                    for (uint32_t n : framed) {
+                        const float dd = length2(nd[n].p - wp[i]);
+                        if (dd >= bd[kSkinK]) continue;
+                        int k = kSkinK;
+                        for (; k > 0 && bd[k - 1] > dd; k--) bd[k] = bd[k - 1], bn[k] = bn[k - 1];
+                        bd[k] = dd, bn[k] = n;
+                    }
+                    Skin sk;
+                    const float dmax = std::max(std::sqrt(bd[kSkinK]), 1e-4f);
+                    float sum = 0;
+                    for (int k = 0; k < kSkinK; k++) {
+                        const float t = 1.0f - std::sqrt(bd[k]) / dmax;
+                        sk.n[k] = bn[k];
+                        sk.w[k] = t * t;
+                        sum += sk.w[k];
+                    }
+                    if (sum < 1e-6f) sk.w[0] = 1.0f, sum = 1.0f; // (all five as far: on the nearest)
+                    for (int k = 0; k < kSkinK; k++) sk.w[k] /= sum;
+                    sk.nrm = wn[i];
+                    fx.skin[i] = sk;
+                    Locator L;
+                    L.ref = L.nx = L.ny = bn[0];
+                    fx.loc[i] = L;
+                }
+            });
+            if (m_node_rest.empty())
+                for (int n = 0; n < N; n++) m_node_rest.push_back(nd[n].p);
+            fx.fnode = framed;
+            for (uint32_t n : framed) fx.frest.push_back(nd[n].p);
+            // (its triangles, the vertices' groups and the groups' normals off the triangles as built)
+            size_t base = 0;
+            for (const auto& sm : om->submeshes) {
+                for (uint32_t i : sm.indices) fx.tri.push_back((uint32_t)(base + i));
+                base += sm.vertices.size();
+            }
+            fx.tri.resize(fx.tri.size() / 3 * 3);
+            fx.group.resize(total);
+            std::unordered_map<uint64_t, uint32_t> seen;
+            auto qz = [](float v, float s) { return (uint64_t)((int64_t)std::lround(v * s) & 0x3ffff); };
+            for (size_t i = 0; i < total; i++) {
+                const uint64_t key = qz(wp[i].x, 2000.0f) | (qz(wp[i].y, 2000.0f) << 18) | (qz(wp[i].z, 2000.0f) << 36) |
+                                     (qz(wn[i].x, 3.0f) & 7) << 54 | (qz(wn[i].y, 3.0f) & 7) << 57 | (qz(wn[i].z, 3.0f) & 7) << 60;
+                fx.group[i] = seen.emplace(key, (uint32_t)i).first->second;
+            }
+            fx.face0.assign(total, vec3(0));
+            for (size_t t = 0; t + 2 < fx.tri.size(); t += 3) {
+                const uint32_t a = fx.tri[t], bb = fx.tri[t + 1], c = fx.tri[t + 2];
+                if (a >= total || bb >= total || c >= total) continue;
+                const vec3 n = cross(wp[bb] - wp[a], wp[c] - wp[a]);
+                fx.face0[fx.group[a]] += n, fx.face0[fx.group[bb]] += n, fx.face0[fx.group[c]] += n;
+            }
+            for (size_t i = 0; i < total; i++) fx.face0[i] = normalize_or(fx.face0[fx.group[i]], vec3(0));
+            fx.gptr.assign(total + 1, 0);
+            for (size_t t = 0; t < fx.tri.size(); t++)
+                if (fx.tri[t] < total) fx.gptr[fx.group[fx.tri[t]] + 1]++;
+            for (size_t i = 0; i < total; i++) fx.gptr[i + 1] += fx.gptr[i];
+            fx.gtri.resize(fx.gptr[total]);
+            {
+                std::vector<uint32_t> at(fx.gptr.begin(), fx.gptr.end() - 1);
+                for (size_t t = 0; t < fx.tri.size(); t++)
+                    if (fx.tri[t] < total) fx.gtri[at[fx.group[fx.tri[t]]]++] = (uint32_t)(t / 3);
+            }
+        }
         // bind each vertex to (ref, nx, ny) nodes (RoR FlexBody locator search)
         const float cos_lim = 0.70710678f;
+        if (fx.skin.empty())
         JobSystem::get().parallel_for((int)total, 256, [&](int b0, int b1, int) {
             for (int i = b0; i < b1; i++) {
                 Locator L;
@@ -650,8 +752,154 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
         for (uint32_t i = 0; i < m_cab_count; i++) V[m_cab_first + i].normal = normalize_or(V[m_cab_first + i].normal, vec3(0, 1, 0));
     }
     // flexbodies
+    // (the FEM nodes' frames now: their orientations as matrices, per frame node)
+    bool any_skin = false;
+    for (const Flex& f : m_flex) any_skin |= !f.skin.empty();
+    // (something of the body torn off or let go: the skinned vertices weigh their nodes' words again)
+    const bool torn = b.fem.tris_torn + b.fem.mounts_broken + b.fem.broken + b.fem.loose_count > 0;
+    const std::vector<uint32_t>* part_now = torn && any_skin ? &const_cast<SoftBody&>(b).part_labels() : nullptr;
+    if (any_skin) {
+        m_node_rot.resize(b.fem.q.size());
+        for (size_t i = 0; i < b.fem.q.size(); i++) m_node_rot[i] = to_mat3(b.fem.q[i]);
+        const size_t nr = m_node_rest.size();
+        m_node_R.resize(nr), m_node_t.resize(nr);
+        m_node_has.assign(nr, 0);
+        for (size_t sl = 0; sl < b.fem.node.size() && sl < m_node_rot.size(); sl++) {
+            const uint32_t n = b.fem.node[sl];
+            if (n >= nr || n >= b.nodes.size()) continue;
+            m_node_R[n] = m_node_rot[sl];
+            m_node_t[n] = nd[n].p - m_node_rot[sl] * m_node_rest[n];
+            m_node_has[n] = 1;
+        }
+    }
     for (const Flex& f : m_flex) {
         Vertex* out = V + f.first;
+        if (!f.skin.empty()) {
+            const Skin* S = f.skin.data();
+            const vec3* F0 = f.face0.data();
+            // (as built still? its nodes turned alike and standing to the first as they did, within 6 mm and 0.012 rad: a
+            // standing car's body gives 1 mm and 0.008 rad under its own weight)
+            bool as_built = !f.fnode.empty() && m_vert_rest.size() >= (size_t)f.first + f.count;
+            mat3 R0;
+            vec3 o0(0);
+            if (as_built) {
+                const int s0 = b.fem.slot(f.fnode[0]);
+                as_built = s0 >= 0 && (size_t)s0 < m_node_rot.size();
+                if (as_built) R0 = m_node_rot[s0], o0 = nd[f.fnode[0]].p;
+                for (size_t k = 1; k < f.fnode.size() && as_built; k++) {
+                    const int sl = b.fem.slot(f.fnode[k]);
+                    if (sl < 0 || (size_t)sl >= m_node_rot.size()) {
+                        as_built = false;
+                        break;
+                    }
+                    const mat3& R = m_node_rot[sl];
+                    float dr = 0;
+                    for (int c = 0; c < 3; c++) dr = std::max(dr, maxc(vabs(R.c[c] - R0.c[c])));
+                    as_built = dr < 0.012f && length2(nd[f.fnode[k]].p - (o0 + R0 * (f.frest[k] - f.frest[0]))) < 0.006f * 0.006f;
+                }
+            }
+            static const bool sdbg = getenv("BL_SKINDBG") != nullptr; // (diagnostics: the meshes skinned the long way)
+            if (sdbg && !as_built) fprintf(stderr, "skin: %u vertices on %zu nodes the long way\n", f.count, f.fnode.size());
+            if (as_built) {
+                const vec3* rest = m_vert_rest.data() + f.first;
+                const vec3 r0 = f.frest[0];
+                for (uint32_t i = 0; i < f.count; i++) out[i].pos = o0 + R0 * (rest[i] - r0), out[i].normal = R0 * S[i].nrm;
+                continue;
+            }
+            m_skin_carried.resize(f.count);
+            std::atomic<bool> bent{false};
+            vec3* carried = m_skin_carried.data();
+            // (a node's word on where a vertex is: R (rest - the node's place as built) + its place now = R rest + t; so
+            // the blend of the nodes' words is one matrix and one offset for the vertex, summed over its nodes. Once
+            // something of the body has torn or let go, each word is weighed again by how far it is from the nearest
+            // node's - one whose part went its own way counts for less, past 30 cm for nothing: no spikes)
+            // (... only a mesh whose own nodes are no longer of one part: the body's and the parts still whole the short way)
+            bool ftorn = false;
+            if (part_now)
+                for (uint32_t n : f.fnode)
+                    if (n >= part_now->size() || (*part_now)[n] != (*part_now)[f.fnode[0] < part_now->size() ? f.fnode[0] : 0]) {
+                        ftorn = true;
+                        break;
+                    }
+            const vec3* vrest = m_vert_rest.data() + f.first;
+            const mat3* NR = m_node_R.data();
+            const vec3* NT = m_node_t.data();
+            const uint8_t* NH = m_node_has.data();
+            const size_t nn_ = m_node_has.size();
+            auto skin_range = [&](int i0, int i1, int) {
+                for (int i = i0; i < i1; i++) {
+                    const Skin& sk = S[i];
+                    const vec3 rest = vrest[i];
+                    vec3 m0(0), m1(0), m2(0), t(0);
+                    float sum = 0;
+                    if (!ftorn) {
+                        for (int k = 0; k < kSkinK; k++) {
+                            const uint32_t n = sk.n[k];
+                            const float wk = sk.w[k];
+                            if (n >= nn_ || !NH[n]) continue;
+                            const mat3& R = NR[n];
+                            m0 += R.c[0] * wk, m1 += R.c[1] * wk, m2 += R.c[2] * wk, t += NT[n] * wk, sum += wk;
+                        }
+                    } else {
+                        vec3 c0(0);
+                        bool first = true;
+                        for (int k = 0; k < kSkinK; k++) {
+                            const uint32_t n = sk.n[k];
+                            if (n >= nn_ || !NH[n] || !(sk.w[k] > 0)) continue;
+                            const mat3& R = NR[n];
+                            const vec3 c = R * rest + NT[n];
+                            if (first) c0 = c, first = false;
+                            const float wk = sk.w[k] * clampf((0.30f - length(c - c0)) / 0.22f, 0.0f, 1.0f);
+                            m0 += R.c[0] * wk, m1 += R.c[1] * wk, m2 += R.c[2] * wk, t += NT[n] * wk, sum += wk;
+                        }
+                    }
+                    if (sum < 1e-6f) { // (none of its nodes in the frame: as it was drawn last)
+                        carried[i] = vec3(0);
+                        continue;
+                    }
+                    const float inv = 1.0f / sum;
+                    const mat3 M(m0 * inv, m1 * inv, m2 * inv);
+                    // (bent here? nodes turned differently blend to less than a turn)
+                    if (length2(M.c[0]) < 0.9990f && !bent.load(std::memory_order_relaxed)) bent.store(true, std::memory_order_relaxed);
+                    out[i].pos = M * rest + t * inv;
+                    out[i].normal = normalize_or(M * sk.nrm, vec3(0, 1, 0));
+                    carried[i] = normalize_or(M * F0[i], vec3(0));
+                }
+            };
+            // (a small mesh in this thread: a job's start costs more than its few thousand vertices)
+            if (f.count < 6000) skin_range(0, (int)f.count, 0);
+            else JobSystem::get().parallel_for((int)f.count, 2048, skin_range);
+            if (!bent.load()) continue; // (nowhere bent between its nodes: the carried normals are the surface's)
+            // the normals off the triangles now, per group; the turn from the carried one to it turns the vertex's normal
+            // (nothing where the mesh has not bent between its nodes: the two are the same)
+            std::vector<vec3>& now = m_skin_now;
+            now.resize(f.count);
+            const uint32_t* G = f.group.data();
+            auto gather = [&](int i0, int i1, int) {
+                for (int i = i0; i < i1; i++) {
+                    if (G[i] != (uint32_t)i) continue;
+                    vec3 n(0);
+                    for (uint32_t q = f.gptr[i]; q < f.gptr[i + 1]; q++) {
+                        const uint32_t* t = &f.tri[(size_t)f.gtri[q] * 3];
+                        if (t[0] >= f.count || t[1] >= f.count || t[2] >= f.count) continue;
+                        n += cross(out[t[1]].pos - out[t[0]].pos, out[t[2]].pos - out[t[0]].pos);
+                    }
+                    now[i] = normalize_or(n, vec3(0));
+                }
+            };
+            auto turn = [&](int i0, int i1, int) {
+                for (int i = i0; i < i1; i++) {
+                    const vec3 a = carried[i], bn = now[G[i]];
+                    const float cs = dot(a, bn);
+                    if (length2(a) < 0.5f || length2(bn) < 0.5f || cs > 0.9995f || cs < -0.9f) continue;
+                    const vec3 v = cross(a, bn), n = out[i].normal;
+                    out[i].normal = normalize_or(n * cs + cross(v, n) + v * (dot(v, n) / (1.0f + cs)), n);
+                }
+            };
+            if (f.count < 6000) gather(0, (int)f.count, 0), turn(0, (int)f.count, 0);
+            else JobSystem::get().parallel_for((int)f.count, 2048, gather), JobSystem::get().parallel_for((int)f.count, 2048, turn);
+            continue;
+        }
         const Locator* L = f.loc.data();
         for (uint32_t i = 0; i < f.count; i++) {
             const Locator& l = L[i];
