@@ -32,11 +32,22 @@ struct WorldSettings {
     // rigid body (FemFrame::detach_debris)
     float frame_debris_mass = 40.0f;
     int max_substeps_per_frame = 100;   // slow-motion instead of spiral of death
+    // A frame's physics budget (ms, 0: none): a frame steps at most the substeps its last frames' cost per substep fits
+    // in it (but at least a quarter of its time), the rest dropped - the simulation slows for the heavy moments (an
+    // impact's frames) instead of the frame rate (the app sets it while it runs in real time: App::run)
+    float frame_budget_ms = 0;
+    // (the spiral guard's threshold: the physics' share of an average frame past which a frame steps no more than an
+    // average one - half in line with the frame's other work, more when the physics runs beside it: App)
+    float overload_share = 0.5f;
     // the rates: the beams, shocks, wheels and contact forces every substep (2 kHz); the frames' implicit step
     // (FemFrame: members and triangles) every frame_every substeps (1: 2 kHz; between, the frame answers the substep's
     // forces through its factorization: FemFrame::held_begin), in every frame alike; collision detection (the candidate
     // pairs and the pairs within reach, see rebuild_pairs / near_pairs) at most collision_hz times a second
     int frame_every = kFrameEvery;
+    // (a body of plates at rest - still as a whole, nothing moving has touched it, nothing of it torn, for
+    // SoftBody::kPlatesQuiet: a wreck lying still - its frame's step every this many substeps; App sets 2 while it holds the frame rate in real time,
+    // the fixed stepping of the tests keeps 1)
+    int frame_every_quiet = 1;
     float collision_hz = 120.0f;
     bool inter_body_collisions = true;
     bool sleeping = true;
@@ -75,6 +86,8 @@ struct WorldStats {
     int contact_pairs = 0;      // candidate pairs (last rebuild, summed)
     int contacts = 0;           // actual contacts in last substep (summed)
     double step_ms = 0;
+    double cost_per_substep_ms = 0;     // (the frames' step over their substeps, smoothed: the budget's estimate)
+    int budget_cut_substeps = 0;        // (the last frame's substeps dropped by the frame budget)
     double sim_time = 0;
     float realtime_factor = 1;
     // profiling detail, per frame (the performance widget, BL_PROFCSV)

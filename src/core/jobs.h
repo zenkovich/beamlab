@@ -27,6 +27,8 @@ public:
     int num_threads() const { return (int)m_workers.size() + 1; }
     // 0 for the main thread, 1..N for workers.
     static int thread_index();
+    // (a thread of the app's own that calls parallel_for - the physics thread: App - takes an index past the workers')
+    static void set_thread_index(int index);
     // True while executing inside a parallel_for chunk.
     static bool in_job();
 

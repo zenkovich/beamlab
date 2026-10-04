@@ -274,6 +274,15 @@ void scene_vehicle_crash(Game& g) {
             g.crash.vehicle_b = pick[1];
         }
     }
+    // (diagnostics, BL_CRASH=<vehicle a>,<vehicle b>[,<km/h a>,<km/h b>[,<layout>[,<slow motion 0/1>]]]: the pair and
+    // the run without the menu - profiling a crash at full speed)
+    if (const char* e = getenv("BL_CRASH")) {
+        const std::vector<std::string> f = split_any(e, ",");
+        if (f.size() >= 2) g.crash.vehicle_a = f[0], g.crash.vehicle_b = f[1];
+        if (f.size() >= 4) g.crash.speed_a = (float)atof(f[2].c_str()), g.crash.speed_b = (float)atof(f[3].c_str());
+        if (f.size() >= 5) g.crash.layout = atoi(f[4].c_str());
+        if (f.size() >= 6) g.crash.slow_motion = atoi(f[5].c_str()) != 0;
+    }
     g.set_spawn(vec3(0, 0, -40), 0);
     g.no_player_vehicle = true;
     g.scene_hint = "Two vehicles collide at the marked point. Choose the vehicles, speeds and crash layout in the Scene menu, F5 restarts.";

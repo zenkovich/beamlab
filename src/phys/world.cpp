@@ -320,7 +320,7 @@ void World::step_frame(float frame_dt) {
     m_avg_frame = m_avg_frame <= 0 ? std::clamp(want, 1.0 / 240.0, 1.0 / 15.0) : m_avg_frame * 0.95 + 0.05 * std::clamp(want, 1.0 / 240.0, 1.0 / 15.0);
     m_accum += want;
     int n = (int)(m_accum / settings.dt);
-    const bool overloaded = m_stats.step_ms > 0.5 * m_avg_frame * 1000.0;
+    const bool overloaded = m_stats.step_ms > settings.overload_share * m_avg_frame * 1000.0;
     const int maxn = overloaded ? std::min(settings.max_substeps_per_frame, (int)std::ceil(m_avg_frame / settings.dt) + 1)
                                 : settings.max_substeps_per_frame;
     if (n > maxn) {
@@ -329,6 +329,15 @@ void World::step_frame(float frame_dt) {
         m_stats.dropped_substeps++;
     } else {
         m_accum -= n * (double)settings.dt;
+    }
+    m_stats.budget_cut_substeps = 0;
+    if (settings.frame_budget_ms > 0 && m_stats.cost_per_substep_ms > 0 && n > 4) {
+        const int fit = std::max(n / 4, (int)(settings.frame_budget_ms / m_stats.cost_per_substep_ms));
+        if (n > fit) {
+            m_stats.budget_cut_substeps = n - fit;
+            n = fit;
+            m_accum = 0;
+        }
     }
     if (n > 0) step_substeps(n);
     else m_stats.substeps = 0;
@@ -569,6 +578,10 @@ void World::step_substeps(int n) {
     m_time += frame_time;
     m_stats.sim_time = m_time;
     m_stats.step_ms = prof::ticks_to_ms(prof::now() - t0);
+    if (n > 0) { // (rising at once - an impact - falling slowly)
+        const double c = m_stats.step_ms / n;
+        m_stats.cost_per_substep_ms = c > m_stats.cost_per_substep_ms ? c : m_stats.cost_per_substep_ms * 0.8 + c * 0.2;
+    }
 }
 
 void World::count_elements() {
@@ -1335,7 +1348,7 @@ int World::collide_volumes(Island& isl, float dt, bool bodies, int stage) {
             case 4: {
                 const Node& x = B.nodes[h.i];
                 B.force[h.i] += contact(h.p, h.n, h.pen, x.mass, x.v, B.force[h.i], h.moves);
-                if (h.kind != 0) B.body_contacts++;
+                if (h.kind != 0) B.body_contacts++, B.moving_touch(A);
                 break;
             }
             case 1:
@@ -1350,7 +1363,7 @@ int World::collide_volumes(Island& isl, float dt, bool bodies, int stage) {
                     if (h.i < B.mid_touch.size()) B.mid_touch[h.i] |= 4;
                 }
                 B.mid_contacts++;
-                if (h.kind == 3) B.body_contacts++;
+                if (h.kind == 3) B.body_contacts++, B.moving_touch(A);
                 else if (std::fabs(dot(v - V.vel_at(h.p), h.n)) > SoftBody::kPlatesClosing) B.plates_hits++;
                 break;
             }
@@ -2273,6 +2286,8 @@ void World::rebuild_pairs(Island& isl) {
     }
     if (prof::g_trace) prof::trace_mark("bp", 14);
     isl.pair_count = (int)(isl.nt.size() + isl.nc.size() + isl.ct.size() + isl.mt.size());
+    if (static const bool pd = getenv("BL_PAIRSDBG") != nullptr; pd && isl.pair_count > 2000)
+        fprintf(stderr, "pairs (rebuild): nt %zu (fast from %zu) nc %zu ct %zu mt %zu, margin %.3f interval %d\n", isl.nt.size(), isl.nt_fast, isl.nc.size(), isl.ct.size(), isl.mt.size(), isl.margin, isl.rebuild_interval);
     if (bp_t0 > 0) {
         double ms = (time_seconds() - bp_t0) * 1000.0;
         if (ms > 0.1) {
@@ -2512,6 +2527,7 @@ void World::near_pairs(Island& isl) {
     const size_t n = isl.nt.size();
     if (n == 0) return;
     const float T = (float)std::max(isl.rebuild_interval, 1) * isl.dt;
+    static const bool old_reach = getenv("BL_PAIRS_OLD") != nullptr; // (diagnostics: the absolute speeds' reach, no plane bound)
     isl.near_keep.assign(n, 1);
     constexpr size_t kChunk = 512;
     const int nch = (int)((n + kChunk - 1) / kChunk);
@@ -2530,9 +2546,41 @@ void World::near_pairs(Island& isl) {
             const Node &a = bt.nodes[t.a], &b = bt.nodes[t.b], &c3 = bt.nodes[t.c];
             vec3 bary;
             const vec3 q = closest_on_triangle(x.p, a.p, b.p, c3.p, bary);
-            const float vt = std::sqrt(std::max(length2(a.v), std::max(length2(b.v), length2(c3.v))));
-            const float reach = bn.collision_radius + (t.two_sided ? 0.0f : bt.hull_depth) + 1.25f * (length(x.v) + vt) * T + 0.02f;
-            isl.near_keep[i] = length2(x.p - q) < reach * reach;
+            const float r0 = bn.collision_radius + (t.two_sided ? 0.0f : bt.hull_depth);
+            if (old_reach) {
+                const float vt = std::sqrt(std::max(length2(a.v), std::max(length2(b.v), length2(c3.v))));
+                const float reach = r0 + 1.25f * (length(x.v) + vt) * T + 0.02f;
+                isl.near_keep[i] = length2(x.p - q) < reach * reach;
+                continue;
+            }
+            // (the travel of the two sides relative to each other: a point of the triangle moves with a mix of its
+            // corners' velocities, the node's distance from it changes at most by the largest of the node's speeds
+            // relative to a corner - the crushed fronts of two cars moving together are near nothing new)
+            const vec3 da = x.v - a.v, db = x.v - b.v, dc = x.v - c3.v;
+            const float vrel = std::sqrt(std::max(length2(da), std::max(length2(db), length2(dc))));
+            const float reach = r0 + 1.25f * vrel * T + 0.02f;
+            if (length2(x.p - q) >= reach * reach) {
+                isl.near_keep[i] = 0;
+                continue;
+            }
+            // (and across its plane: the node's height over it, at a fixed normal, closes at most as fast as the node and
+            // a corner approach along it - the bound holds however the triangle turns, for the moved triangle's every
+            // point is the same mix of its moved corners; a hull's triangle only from in front)
+            const vec3 nn = cross(b.p - a.p, c3.p - a.p);
+            const float nl = length(nn);
+            if (nl > 1e-12f) {
+                const vec3 n0 = nn / nl;
+                const float s0 = dot(n0, x.p - a.p);
+                if (t.two_sided || s0 > bn.collision_radius) {
+                    const float sg = s0 >= 0 ? 1.0f : -1.0f;
+                    const float close = std::max(0.0f, std::max(-sg * dot(n0, da), std::max(-sg * dot(n0, db), -sg * dot(n0, dc))));
+                    if (std::fabs(s0) - 1.25f * close * T - 0.02f >= bn.collision_radius) {
+                        isl.near_keep[i] = 0;
+                        continue;
+                    }
+                }
+            }
+            isl.near_keep[i] = 1;
         }
     };
     if (isl.team) isl.team->run(nch, pass);
@@ -2546,6 +2594,58 @@ void World::near_pairs(Island& isl) {
     }
     isl.nt_fast = fast == std::string::npos ? w : fast;
     isl.nt.resize(w);
+    // the plates' mid points against the other bodies' triangles (Island::MT) alike: the reach of their relative travel,
+    // the plane's bound (two cars' crushed fronts: 20-30 thousand of these were tested every substep)
+    const size_t nm = isl.mt.size();
+    if (old_reach || nm == 0) return;
+    isl.near_keep.assign(nm, 1);
+    const int mch = (int)((nm + kChunk - 1) / kChunk);
+    auto mpass = [&](int c) {
+        constexpr float kW = 1.0f / 3.0f;
+        const size_t i0 = (size_t)c * kChunk, i1 = std::min(nm, i0 + kChunk);
+        for (size_t i = i0; i < i1; i++) {
+            const Island::MT& pr = isl.mt[i];
+            const SoftBody& bm = *isl.bodies[pr.bm];
+            const SoftBody& bt = *isl.bodies[pr.bt];
+            if (pr.tri >= bt.tris.size() || pr.mid >= bm.fem.tris.size()) continue; // (as it was: mid_detect's to judge)
+            const Triangle& t = bt.tris[pr.tri];
+            uint32_t n3[3];
+            if (t.torn || !tri_mid(bm, pr.mid, n3, NF_CONTACTER)) continue;
+            const vec3 p = tri_mid_p(bm, n3);
+            vec3 vm(0);
+            for (int j = 0; j < 3; j++) vm += bm.nodes[n3[j]].v * kW;
+            const Node &a = bt.nodes[t.a], &b = bt.nodes[t.b], &c3 = bt.nodes[t.c];
+            const float r = bt.faces_only && !t.two_sided ? bt.face_skin : bm.collision_radius;
+            const vec3 da = vm - a.v, db = vm - b.v, dc = vm - c3.v;
+            const float vrel = std::sqrt(std::max(length2(da), std::max(length2(db), length2(dc))));
+            const float reach = r + 1.25f * vrel * T + 0.02f;
+            vec3 bary;
+            const vec3 q = closest_on_triangle(p, a.p, b.p, c3.p, bary);
+            if (length2(p - q) >= reach * reach) {
+                isl.near_keep[i] = 0;
+                continue;
+            }
+            const vec3 nn = cross(b.p - a.p, c3.p - a.p);
+            const float nl = length(nn);
+            if (nl > 1e-12f) {
+                const vec3 n0 = nn / nl;
+                const float s0 = dot(n0, p - a.p);
+                if (t.two_sided || s0 > r) {
+                    const float sg = s0 >= 0 ? 1.0f : -1.0f;
+                    const float close = std::max(0.0f, std::max(-sg * dot(n0, da), std::max(-sg * dot(n0, db), -sg * dot(n0, dc))));
+                    if (std::fabs(s0) - 1.25f * close * T - 0.02f >= r) isl.near_keep[i] = 0;
+                }
+            }
+        }
+    };
+    if (isl.team) isl.team->run(mch, mpass);
+    else
+        for (int c = 0; c < mch; c++) mpass(c);
+    size_t wm = 0;
+    for (size_t i = 0; i < nm; i++)
+        if (isl.near_keep[i]) isl.mt[wm++] = isl.mt[i];
+    isl.mt.resize(wm);
+    isl.pair_count = (int)(isl.nt.size() + isl.nc.size() + isl.ct.size() + isl.mt.size());
 }
 
 void World::refresh_fast_pairs(Island& isl) {
@@ -2684,6 +2784,8 @@ void World::inherit_pairs(Island& isl, int k) {
         isl.mt.resize(w);
     }
     isl.pair_count = (int)(isl.nt.size() + isl.nc.size() + isl.ct.size() + isl.mt.size());
+    if (static const bool pd = getenv("BL_PAIRSDBG") != nullptr; pd && isl.pair_count > 2000)
+        fprintf(stderr, "pairs (near): nt %zu nc %zu ct %zu mt %zu\n", isl.nt.size(), isl.nc.size(), isl.ct.size(), isl.mt.size());
 }
 
 // Contacts of the candidate pairs: the narrow phase (closest points of the current positions: independent per pair,
@@ -3089,7 +3191,6 @@ void World::collide_mid_pairs(Island& isl, bool detected) {
                                     SB[0] ? SB : nullptr)) {
                 contacts++, bm.touch(bt), bt.touch(bm);
                 bm.mid_contacts++;
-                bm.plates_hits++;
                 if (bm.mid_touch.size() != bm.fem.tris.size()) bm.mid_touch.assign(bm.fem.tris.size(), 0);
                 bm.mid_touch[pr.mid] |= 2;
                 if (bm.fem.patterned()) { // (a fast blow on the plate: its fracture pattern)
@@ -3129,7 +3230,7 @@ void World::simulate_island(Island& isl, int substeps) {
         b->sphere_touches = 0;
         b->body_contacts = 0;
         b->mid_contacts = 0;
-        b->plates_hits = b->plates_static = 0;
+        b->plates_hits = b->plates_static = b->plates_moving_touch = 0;
         if (!b->fem.tris.empty()) b->mid_touch.assign(b->fem.tris.size(), 0);
         b->touched.clear();
         if (b->energy_guard && !b->rigid) b->motion_energy(settings.gravity, b->guard_ke, b->guard_pe);
@@ -3235,7 +3336,10 @@ void World::simulate_island(Island& isl, int substeps) {
                 b.wake();
             }
             isl.subs[k] = b.sleeping ? 0 : 1 << b.dt_shift();
-            if (!b.fem.empty() && b.fem_left <= 0) b.fem_period = fe; // (its frame's step now: over this many substeps)
+            if (!b.fem.empty() && b.fem_left <= 0) // (its frame's step now: over this many substeps)
+                b.fem_period = settings.frame_every_quiet > fe && b.sheet_on_plates && b.plates_quiet > SoftBody::kPlatesQuiet && b.plates_rms < SoftBody::kPlatesMoving
+                                   ? settings.frame_every_quiet // (at rest as a whole: not a car driving - its frame at 1 kHz dented)
+                                   : fe;
             maxsub = std::max(maxsub, isl.subs[k]);
             isl.node_steps += (long long)b.nodes.size() * isl.subs[k];
             isl.beam_steps += (long long)b.beams.size() * isl.subs[k];
@@ -3844,7 +3948,7 @@ void World::simulate_island(Island& isl, int substeps) {
             b.topo_changed = false;
             if (isl.needs_pairs && !rebuild_now) {
                 if (b.topo_log.overflow || b.self_collision || settings.pair_search_on_topology) rebuild_now = true;
-                else inherit_pairs(isl, k);
+                else if (s + 1 < isl.next_rebuild && s + 1 < substeps) inherit_pairs(isl, k); // (else the next substep, or frame, makes them again)
             }
             b.topo_log.clear();
         }
@@ -3878,7 +3982,7 @@ void World::simulate_island(Island& isl, int substeps) {
             const int topo = b->fem.tris_torn + b->fem.tris_refined + b->fem.splits + b->fem.broken + b->fem.mounts_broken;
             static const bool dbg = getenv("BL_PLATESDBG") != nullptr;
             if (static int tick = 0; dbg && (tick++ % 15) == 0)
-                fprintf(stderr, "plates: %s static %d+%d body %d hits %d sphere %d topo %d rms %.2f quiet %.2f\n", b->name.c_str(), b->static_contacts, b->plates_static, b->body_contacts, b->plates_hits, b->sphere_touches, topo != b->plates_topo, b->plates_rms, b->plates_quiet);
+                fprintf(stderr, "plates: %s [torn %d refined %d splits %d broken %d mounts %d] static %d+%d body %d (moving %d) hits %d sphere %d topo %d rms %.2f quiet %.2f\n", b->name.c_str(), b->fem.tris_torn, b->fem.tris_refined, b->fem.splits, b->fem.broken, b->fem.mounts_broken, b->static_contacts, b->plates_static, b->body_contacts, b->plates_moving_touch, b->plates_hits, b->sphere_touches, topo != b->plates_topo, b->plates_rms, b->plates_quiet);
             vec3 mv(0); // (the body's speed as a whole: its wheels may spin, its engine shake)
             float mm = 0;
             for (const Node& x : b->nodes)

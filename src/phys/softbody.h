@@ -784,6 +784,7 @@ public:
     std::vector<const SoftBody*> touched; // (those bodies)
     void touch(const SoftBody& o) {
         body_contacts++;
+        moving_touch(o);
         if (std::find(touched.begin(), touched.end(), &o) == touched.end()) touched.push_back(&o);
     }
     // A passive body left to itself cannot gain energy: with energy_guard, a frame in which it met no other body (nor in
@@ -843,14 +844,25 @@ public:
     }
     bool sheet_on_plates = false;
     float plates_quiet = 0;             // seconds since it was last touched or its frame's topology changed
-    // (what counts as a touch: another body's, a ball's; a volume of its own closing on a plate (not lying on it: the
-    // engine's lies on its mounts' plates as it drives); the static world's while the body moves as a whole - a wreck
-    // lying on the road carries its own weight only)
-    int plates_hits = 0;                // (this frame's: other bodies' triangles, its own volumes closing)
+    // (what counts as a touch: a ball's; another body's while either of the two moves as a whole - two wrecks at rest
+    // pressed together carry their weight only: they kept the short steps for good, a tenth of their frame; a volume of
+    // its own closing on a plate (not lying on it: the engine's lies on its mounts' plates as it drives); the static
+    // world's while the body moves as a whole - a wreck lying on the road carries its own weight only)
+    int plates_hits = 0;                // (this frame's: its own volumes closing on its plates)
+    int plates_moving_touch = 0;        // (this frame's: other bodies' touches while one of the two moved)
     int plates_static = 0;              // (this frame's: the plates' mid points on the static world)
     float plates_rms = 1e9f;            // (the body's speed as a whole at the last frame's end)
     static constexpr float kPlatesMoving = 0.5f, kPlatesClosing = 1.0f;
-    bool plates_touched() const { return body_contacts + sphere_touches + plates_hits > 0 || (static_contacts + plates_static > 0 && plates_rms > kPlatesMoving); }
+    // (how fast it moves as a whole, for the touch: a body of plates its mean velocity, any other its fastest node)
+    float bulk_speed() const { return sheet_on_plates ? plates_rms : max_speed; }
+    static inline const bool g_plates_body_touch = getenv("BL_PLATES_BODYTOUCH") != nullptr; // (diagnostics: any other body's touch counts, as before)
+    bool plates_touched() const {
+        return sphere_touches + plates_hits + (g_plates_body_touch ? body_contacts : plates_moving_touch) > 0 ||
+               (static_contacts + plates_static > 0 && plates_rms > kPlatesMoving);
+    }
+    void moving_touch(const SoftBody& o) {
+        if (o.bulk_speed() > kPlatesMoving || bulk_speed() > kPlatesMoving) plates_moving_touch++;
+    }
     int plates_topo = 0;                // (the frame's tears, bisections and splits at the last frame's end)
     // A sheet whose hinges must be stiffer than the substep lets them (thin metal that holds its shape: a drum): its
     // short steps are at least 2^this per substep and every triangle is evaluated at least that often (0..2)

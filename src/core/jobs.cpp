@@ -32,6 +32,7 @@ JobSystem& JobSystem::get() {
 }
 
 int JobSystem::thread_index() { return t_thread_index; }
+void JobSystem::set_thread_index(int index) { t_thread_index = index; }
 
 int JobSystem::performance_cores() {
 #if defined(__APPLE__)
@@ -112,7 +113,8 @@ void JobSystem::worker_main(int index) {
                 // the core away from it (and from the rest of the system): the OS then preempts somebody in a chunk.
                 const uint64_t now = prof::now();
                 if (!idle_since) idle_since = now;
-                if (prof::ticks_to_ms(now - idle_since) < 0.1) {
+                static const double park_ms = getenv("BL_PARK_MS") ? atof(getenv("BL_PARK_MS")) : 0.1; // (diagnostics)
+                if (prof::ticks_to_ms(now - idle_since) < park_ms) {
                     for (int k = 0; k < 16; k++) BL_CPU_RELAX();
                     continue;
                 }
