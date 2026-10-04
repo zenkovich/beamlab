@@ -772,7 +772,9 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
             m_node_has[n] = 1;
         }
     }
-    for (const Flex& f : m_flex) {
+    // (a mesh at a time: the large ones here, each in chunks over the threads; the small ones beside each other, one a
+    // chunk - one car's dozens of small meshes took 2 ms in one thread; scratch of each thread's own)
+    auto one_flex = [&](const Flex& f, std::vector<vec3>& m_skin_carried_, std::vector<vec3>& m_skin_now_) {
         Vertex* out = V + f.first;
         if (!f.skin.empty()) {
             const Skin* S = f.skin.data();
@@ -804,11 +806,11 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
                 const vec3* rest = m_vert_rest.data() + f.first;
                 const vec3 r0 = f.frest[0];
                 for (uint32_t i = 0; i < f.count; i++) out[i].pos = o0 + R0 * (rest[i] - r0), out[i].normal = R0 * S[i].nrm;
-                continue;
+                return;
             }
-            m_skin_carried.resize(f.count);
+            m_skin_carried_.resize(f.count);
             std::atomic<bool> bent{false};
-            vec3* carried = m_skin_carried.data();
+            vec3* carried = m_skin_carried_.data();
             // (a node's word on where a vertex is: R (rest - the node's place as built) + its place now = R rest + t; so
             // the blend of the nodes' words is one matrix and one offset for the vertex, summed over its nodes. Once
             // something of the body has torn or let go, each word is weighed again by how far it is from the nearest
@@ -869,10 +871,10 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
             // (a small mesh in this thread: a job's start costs more than its few thousand vertices)
             if (f.count < 6000) skin_range(0, (int)f.count, 0);
             else JobSystem::get().parallel_for((int)f.count, 2048, skin_range);
-            if (!bent.load()) continue; // (nowhere bent between its nodes: the carried normals are the surface's)
+            if (!bent.load()) return; // (nowhere bent between its nodes: the carried normals are the surface's)
             // the normals off the triangles now, per group; the turn from the carried one to it turns the vertex's normal
             // (nothing where the mesh has not bent between its nodes: the two are the same)
-            std::vector<vec3>& now = m_skin_now;
+            std::vector<vec3>& now = m_skin_now_;
             now.resize(f.count);
             const uint32_t* G = f.group.data();
             auto gather = [&](int i0, int i1, int) {
@@ -898,7 +900,7 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
             };
             if (f.count < 6000) gather(0, (int)f.count, 0), turn(0, (int)f.count, 0);
             else JobSystem::get().parallel_for((int)f.count, 2048, gather), JobSystem::get().parallel_for((int)f.count, 2048, turn);
-            continue;
+            return;
         }
         const Locator* L = f.loc.data();
         for (uint32_t i = 0; i < f.count; i++) {
@@ -916,7 +918,19 @@ void VehicleVisual::update(const SoftBody& b, float dir_state) {
             out[i].pos = o + X * l.c.x + Y * l.c.y + Z * l.c.z;
             out[i].normal = normalize_or(X * l.n.x + Y * l.n.y + Z * l.n.z, vec3(0, 1, 0));
         }
+        };
+    static thread_local std::vector<vec3> tl_carried, tl_now;
+    std::vector<uint32_t> small;
+    for (uint32_t fi = 0; fi < (uint32_t)m_flex.size(); fi++) {
+        if (m_flex[fi].count >= 6000 && !JobSystem::in_job()) one_flex(m_flex[fi], tl_carried, tl_now);
+        else small.push_back(fi);
     }
+    if (small.size() > 1 && !JobSystem::in_job())
+        JobSystem::get().parallel_for((int)small.size(), 1, [&](int b0, int b1, int) {
+            for (int k = b0; k < b1; k++) one_flex(m_flex[small[k]], tl_carried, tl_now);
+        });
+    else
+        for (uint32_t fi : small) one_flex(m_flex[fi], tl_carried, tl_now);
     // rigid parts
     for (Rigid& r : m_rigid) {
         Placement pl;

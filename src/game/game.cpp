@@ -264,13 +264,12 @@ void Game::render(Renderer& r, int w, int h, const Camera* cam_override, bool vi
         for (auto& o : objects)
             if (o->needs_visual_update()) objs.push_back(o.get());
         // CPU skinning for vehicles and objects in parallel, GL uploads afterwards on this thread
+        // (a vehicle's own meshes over the threads - VehicleVisual::update - one vehicle after another; a vehicle in a
+        // chunk of a batch had them all in one thread: 2.4 ms for two crashed cars)
         std::vector<uint8_t> need((size_t)objs.size(), 0);
-        const int nv = (int)vehicles.size();
-        JobSystem::get().parallel_for(nv + (int)objs.size(), 1, [&](int b0, int b1, int) {
-            for (int i = b0; i < b1; i++) {
-                if (i < nv) vehicles[i]->update_visuals();
-                else need[i - nv] = objs[i - nv]->prepare_visuals() ? 1 : 0;
-            }
+        for (auto& v : vehicles) v->update_visuals();
+        JobSystem::get().parallel_for((int)objs.size(), 1, [&](int b0, int b1, int) {
+            for (int i = b0; i < b1; i++) need[i] = objs[i]->prepare_visuals() ? 1 : 0;
         });
         for (size_t i = 0; i < objs.size(); i++)
             if (need[i]) objs[i]->upload_visuals();
