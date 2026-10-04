@@ -19,11 +19,13 @@ struct VehicleEntry {
     std::string title;    // name from the definition
     std::string type;     // truck / car / trailer / load
     std::string group;    // folder display name
+    std::string kind;     // the menu's section (vehicle_kinds): from SOURCE.txt's "kind: " line, else by the folder
     bool drivable = true; // has an engine (false: trailers, caravans, loads)
     std::string text;     // a definition in memory (the model editor's previews): `file` then only names its folder
     bool split_parts = false; // the visual part by part (the model editor: VehicleVisual::split_parts)
 };
 const std::vector<VehicleEntry>& vehicle_registry();
+const std::vector<std::string>& vehicle_kinds(); // the sections, in the menu's order
 void refresh_vehicle_registry(); // rescans assets/vehicles (the model editor saves new files there); entries move
 const VehicleEntry* find_vehicle(const std::string& id);
 

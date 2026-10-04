@@ -470,6 +470,10 @@ public:
     // rigid motions of the whole body
     void rotate(const quat& r);
     void set_orientation(const quat& r);  // every node (a respawn: rest orientations are the identity)
+    // A body put somewhere as a whole (a spawn): its frame nodes at rel[node] + (tx, ty, tz), summed in double - the
+    // floats' rounding far from the origin (0.5 mm at 5 km) would be strain enough to yield every plate - and the body's
+    // float positions set from them.
+    void place_exact(SoftBody& b, const std::vector<vec3>& rel, double tx, double ty, double tz);
     void stop();                          // angular velocities to zero
     // Destroy tool: members passing within r of p are torn there (at a joint, off it; else split and torn at that
     // point). Returns the tears.

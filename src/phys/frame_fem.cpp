@@ -3817,6 +3817,15 @@ void FemFrame::set_orientation(const quat& r) {
     for (size_t i = 0; i < q.size(); i++) q[i] = r, w[i] = vec3(0);
 }
 
+void FemFrame::place_exact(SoftBody& b, const std::vector<vec3>& rel, double tx, double ty, double tz) {
+    if (xd.size() != node.size() * 3 || rel.size() != b.nodes.size()) return;
+    for (size_t i = 0; i < node.size(); i++) {
+        const uint32_t n = node[i];
+        xd[i * 3] = (double)rel[n].x + tx, xd[i * 3 + 1] = (double)rel[n].y + ty, xd[i * 3 + 2] = (double)rel[n].z + tz;
+        b.nodes[n].p = vec3((float)xd[i * 3], (float)xd[i * 3 + 1], (float)xd[i * 3 + 2]);
+    }
+}
+
 void FemFrame::stop() {
     for (vec3& x : w) x = vec3(0);
 }

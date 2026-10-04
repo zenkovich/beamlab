@@ -16,6 +16,27 @@ namespace bl {
 using namespace phys;
 
 // ------------------------------------------------------------------ registry
+const std::vector<std::string>& vehicle_kinds() {
+    static const std::vector<std::string> k = {"FEM cars", "Cars", "SUVs, vans, pickups", "Off-road", "Trucks", "Buses", "Editor models", "Trailers and loads", "Other"};
+    return k;
+}
+
+// The section of a folder that does not say its own (a "kind: <section>" line in its SOURCE.txt, written by
+// tools/fetch_vehicles.py): the vehicles made here are FEM cars.
+static std::string folder_kind(const std::string& folder) {
+    static const std::pair<const char*, const char*> table[] = {
+        {"frame_car", "FEM cars"}, {"buggy", "FEM cars"}, {"shell_car", "FEM cars"}, {"sheet_car", "FEM cars"}, {"yaris_biw", "FEM cars"},
+        {"audi_80", "Cars"}, {"audi_quattro", "Cars"}, {"bmw_e36", "Cars"}, {"bmw_e39_m5", "Cars"}, {"dodge_viper", "Cars"}, {"mercedes_clk", "Cars"},
+        {"seat_ibiza", "Cars"}, {"toyota_ae86", "Cars"}, {"ford_f250_2014", "SUVs, vans, pickups"}, {"ford_f_1999", "SUVs, vans, pickups"},
+        {"mercedes_vito", "SUVs, vans, pickups"}, {"mercedes_w460", "SUVs, vans, pickups"}, {"mitsubishi_pajero", "SUVs, vans, pickups"},
+        {"trophy_truck_v2", "Off-road"}, {"autocar_xpeditor", "Trucks"}, {"freightliner_fla", "Trucks"}, {"kenworth_wrecker", "Trucks"},
+        {"kme_predator", "Trucks"}, {"lcf_trucks", "Trucks"}, {"tatra_815_6x6", "Trucks"}, {"thomas_hdx_bus", "Buses"}, {"man_caetano_enigma", "Buses"},
+        {"editor", "Editor models"}};
+    for (const auto& [f, k] : table)
+        if (folder == f) return k;
+    return "Other";
+}
+
 static std::vector<VehicleEntry> scan_vehicles() {
         std::vector<VehicleEntry> r;
         std::string root = asset_path("vehicles");
@@ -23,9 +44,15 @@ static std::vector<VehicleEntry> scan_vehicles() {
             std::string dir = path_join(root, folder);
             std::string group = folder;
             std::string src;
+            std::string kind = folder_kind(folder);
             if (read_text_file(path_join(dir, "SOURCE.txt"), src)) {
                 size_t e = src.find('\n');
                 group = trim(src.substr(0, e));
+                if (const size_t k = src.find("\nkind: "); k != std::string::npos) {
+                    const std::string named = trim(src.substr(k + 7, src.find('\n', k + 1) - (k + 7)));
+                    const auto& kinds = vehicle_kinds();
+                    if (std::find(kinds.begin(), kinds.end(), named) != kinds.end()) kind = named;
+                }
             }
             for (const auto& f : list_dir(dir, true, false)) {
                 std::string ext = path_ext_lower(f);
@@ -46,6 +73,7 @@ static std::vector<VehicleEntry> scan_vehicles() {
                         engine = (p == 0 || text[p - 1] == '\n') && (p + 6 >= text.size() || isspace((unsigned char)text[p + 6]));
                     e.drivable = engine;
                 }
+                e.kind = !e.drivable ? "Trailers and loads" : kind;
                 r.push_back(e);
             }
         }
@@ -233,8 +261,11 @@ void Vehicle::reset(vec3 pos, float yaw_deg) {
     for (auto& n : b.nodes) la.add(n.p);
     vec3 pivot = la.center();
     pivot.y = la.mn.y;
-    for (auto& n : b.nodes) {
-        n.p = R * (n.p - pivot) + pos;
+    std::vector<vec3> rel(b.nodes.size()); // (about the pivot: FemFrame::place_exact)
+    for (size_t i = 0; i < b.nodes.size(); i++) {
+        Node& n = b.nodes[i];
+        rel[i] = R * (n.p - pivot);
+        n.p = rel[i] + pos;
         n.v = vec3(0);
     }
     b.fem.set_orientation(from_mat3(R)); // (the frame nodes turn with the vehicle)
@@ -267,6 +298,7 @@ void Vehicle::reset(vec3 pos, float yaw_deg) {
     }
     if (lift > -1e8f)
         for (auto& n : b.nodes) n.p.y += lift + 0.03f;
+    if (!b.fem.empty()) b.fem.place_exact(b, rel, pos.x, (double)pos.y + (lift > -1e8f ? (double)lift + 0.03 : 0.0), pos.z);
     b.compute_aabb();
     b.seat_wheels(); // (the ring tyres' wheels with their hubs)
     b.max_speed = 0;
