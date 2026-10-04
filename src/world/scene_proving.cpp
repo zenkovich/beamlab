@@ -1,4 +1,4 @@
-// The Proving Ground (the start scene), a vehicle test site 1400 x 1000 m:
+// The Test Site (scene `test_site`), a vehicle test site 1400 x 1000 m:
 //   - a high-speed oval (two 700 m straights, turns of 200 m radius banked 14 degrees) round the test lanes;
 //   - twenty test lanes inside it, each its own road 630 m long with 480 m to get up to speed before its test: walls
 //     (full, 40% and 25% overlap), poles, posts that break, concrete barriers, blocks that slide, the two wedges, the
@@ -401,22 +401,14 @@ void drive_platen(const std::shared_ptr<Platen>& p, const std::shared_ptr<Platen
 
 } // namespace
 
-void scene_proving_ground(Game& g) {
+void scene_test_site(Game& g) {
     auto& A = SharedAssets::get();
-    const MaterialPtr m_road2 = pbr_material("road_two_lane", A.concrete), m_road4 = pbr_material("road_multi_lane", A.concrete), m_asphalt = pbr_material("asphalt", A.concrete),
+    const MaterialPtr m_road2 = pbr_material("road_two_lane", A.concrete), m_road4 = pbr_material("road_multi_lane", A.concrete), m_asphalt = pbr_material("asphalt_fine", A.concrete),
                       m_worn = pbr_material("asphalt_worn", A.concrete), m_cobbles = pbr_material("cobbles", A.stone), m_concrete = pbr_material("concrete", A.concrete),
                       m_concrete_dark = pbr_material("concrete_dark", A.concrete), m_paving = pbr_material("paving", A.concrete), m_rock = pbr_material("rock", A.stone),
                       m_plate = pbr_material("metal_plate", A.metal), m_metal = pbr_material("metal", A.metal);
-    // ---- the sky and the light: the panorama's sun
-    if (TexturePtr sky = TextureCache::get().load(asset_path("textures/sky.jpg"))) {
-        g.light.sky_panorama = sky;
-        std::string txt;
-        vec3 sun(0.54f, 0.77f, 0.35f);
-        if (read_text_file(asset_path("textures/sky_sun.txt"), txt)) sscanf(txt.c_str(), "%f %f %f", &sun.x, &sun.y, &sun.z);
-        g.light.sun_dir = normalize(sun);
-        g.light.sun_color = vec3(2.9f, 2.7f, 2.4f), g.light.sky_color = vec3(0.34f, 0.47f, 0.72f), g.light.fog_color = vec3(0.70f, 0.78f, 0.88f);
-        g.light.fog_density = 0.00045f;
-    }
+    // ---- the sky and the light: the panorama's sun (every scene's: Game::load_scene), a clearer air
+    if (g.light.sky_panorama) g.light.fog_density = 0.00045f;
 
     // ---- the ground: hills outside, level inside the oval
     g.create_terrain(1401, 1001, 1.0f, vec2(-700, -500));

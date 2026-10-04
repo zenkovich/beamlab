@@ -451,17 +451,17 @@ for car, folder in FEM_CARS.items():
     if not os.path.isdir(os.path.join(ROOT, "assets", "vehicles", folder)):
         continue
     vid = "shell_car/fem_" + car
-    out = run(["--scene", "proving", "--vehicle", vid, "--size", "640x360", "--frames", "240", "--hidden", "--novsync", "--drive", "0,0", "--screenshot", os.path.join(TMP, "fem0.png")])
+    out = run(["--scene", "test_site", "--vehicle", vid, "--size", "640x360", "--frames", "240", "--hidden", "--novsync", "--drive", "0,0", "--screenshot", os.path.join(TMP, "fem0.png")])
     sl, sp = shell_line(out), speeds_at(out)
     missing = len(re.findall(r"mesh not found|mesh load failed", out))
     check("fem %s: loads, stands, nothing yields" % car, bool(sl) and sl[0] == 0 and sl[2] == 0 and sl[3] == 0 and missing == 0 and abs(sp.get(3.0, (9,))[0]) < 1.0 and unstable(out) == 0,
           "%s, %d meshes missing, %.1f km/h at 3 s" % (shell_text(sl), missing, sp.get(3.0, (9,))[0]))
-    out = run(["--scene", "proving", "--vehicle", vid, "--spawn", "-320,171,90", "--size", "640x360", "--frames", "500", "--hidden", "--novsync", "--drive", "1.0,0",
+    out = run(["--scene", "test_site", "--vehicle", vid, "--spawn", "-320,171,90", "--size", "640x360", "--frames", "500", "--hidden", "--novsync", "--drive", "1.0,0",
                "--screenshot", os.path.join(TMP, "fem1.png")])
     sl, sp = shell_line(out), speeds_at(out)
     check("fem %s: accelerates, nothing yields" % car, bool(sl) and sl[0] == 0 and sl[2] == 0 and sp.get(8.0, (0,))[0] > 50 and unstable(out) == 0,
           "%.1f km/h at 8 s, %s" % (sp.get(8.0, (0,))[0], shell_text(sl)))
-    out = run(["--scene", "proving", "--vehicle", vid, "--size", "640x360", "--frames", "330", "--hidden", "--novsync", "--drive", "0,0", "--action", "Crash test/WALL at 80",
+    out = run(["--scene", "test_site", "--vehicle", vid, "--size", "640x360", "--frames", "330", "--hidden", "--novsync", "--drive", "0,0", "--action", "Crash test/WALL at 80",
                "--screenshot", os.path.join(TMP, "fem2.png")])
     sl, sp = shell_line(out), speeds_at(out)
     last = sp[max(sp)] if sp else (99,)
@@ -688,7 +688,7 @@ check("yaris: the wall crash crumples the body, stable", yb and int(yb[-1][1]) >
 
 # ---- all scenes: no numerical trouble
 if not quick:
-    for sc in ["proving", "forest", "canyon", "offroad", "crash", "vehicle_crash", "stress_vehicles", "stress_derby", "stress_crates",
+    for sc in ["proving", "test_site", "forest", "canyon", "offroad", "crash", "vehicle_crash", "stress_vehicles", "stress_derby", "stress_crates",
                "stress_forest", "stress_bridge", "tape_maze", "rally", "rbr_verkiai"]:
         out = run(["--scene", sc, "--size", "640x360", "--frames", "600", "--hidden", "--novsync", "--screenshot", os.path.join(TMP, "x.png")])
         check(f"{sc}: stable", unstable(out) == 0, f"{unstable(out)} warnings")

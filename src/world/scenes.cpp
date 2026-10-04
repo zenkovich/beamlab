@@ -14,7 +14,7 @@ namespace bl {
 using namespace phys;
 namespace te = terrain_edit;
 
-void scene_proving_ground(Game& g); // (scene_proving.cpp)
+void scene_test_site(Game& g); // (scene_proving.cpp)
 
 namespace {
 
@@ -88,6 +88,90 @@ void scatter_trees(Game& g, vec2 center, float radius, int count, uint32_t seed,
 }
 
 // ------------------------------------------------------------------------------------------- scenes
+void add_ramp(Game& g, vec3 foot, float yaw_deg, float length, float width, float height, MaterialPtr mat, uint8_t surf = SURF_CONCRETE) {
+    float ang = std::atan2(height, length);
+    float slope_len = std::sqrt(length * length + height * height);
+    float thick = 0.6f;
+    quat q = yaw_q(yaw_deg) * quat::axis_angle(vec3(1, 0, 0), -ang);
+    vec3 fwd = yaw_q(yaw_deg).rotate(vec3(0, 0, 1));
+    // box center: middle of the slope, pushed down by half thickness along the slope normal
+    vec3 up = q.rotate(vec3(0, 1, 0));
+    vec3 c = foot + fwd * (length * 0.5f) + vec3(0, height * 0.5f, 0) - up * (thick * 0.5f);
+    g.add_static_box(c, vec3(width * 0.5f, thick * 0.5f, slope_len * 0.5f), q, surf, mat);
+}
+
+std::vector<vec2> ellipse(vec2 c, vec2 r, int n, float phase = 0) {
+    std::vector<vec2> p;
+    for (int i = 0; i <= n; i++) {
+        float a = phase + 2 * kPi * i / n;
+        p.push_back(c + vec2(std::cos(a) * r.x, std::sin(a) * r.y));
+    }
+    return p;
+}
+
+// The start scene: a small handling course on painted terrain (the large test site with its roads, crash lanes and
+// machines is the Test Site: scene_proving.cpp)
+void scene_proving_ground(Game& g) {
+    auto& A = SharedAssets::get();
+    g.create_terrain(401, 401, 1.0f, vec2(-200, -200));
+    auto& hf = g.world.statics.terrain;
+    te::add_noise(hf, 6.0f, 90.0f, 4, 11);
+    te::flatten_rect(hf, vec2(0, 0), vec2(75, 55), 0, 0.0f, 25.0f, SURF_ASPHALT);
+    // hill climb (south-east): 20% and 40% grades
+    for (int z = 0; z < hf.nz(); z++)
+        for (int x = 0; x < hf.nx(); x++) {
+            float wx = hf.origin().x + x, wz = hf.origin().y + z;
+            if (wx > 90 && wx < 185 && wz > -48 && wz < 8) {
+                // hill climb: 20% then 40% grade, plateau on top, smooth side slopes
+                float t = clampf((wx - 95) / 80.0f, 0, 1);
+                float hgt = t < 0.5f ? t * 2 * 8.0f : 8.0f + (t - 0.5f) * 2 * 16.0f;
+                float side = std::max(0.0f, std::fabs(wz + 20.0f) - 7.0f); // 14 m wide road
+                float k = clampf(1.0f - side / 14.0f, 0, 1);
+                float endk = clampf((185 - wx) / 10.0f, 0, 1);
+                float target = hgt * smoothstepf(0, 1, k) * endk;
+                if (target > hf.h(x, z)) {
+                    hf.h(x, z) = target;
+                    hf.surf(x, z) = side < 0.5f ? SURF_DIRT : SURF_GRASS;
+                }
+            }
+            // twister / axle articulation bumps (north-east)
+            if (wx > 90 && wx < 150 && wz > 25 && wz < 37) {
+                float s = std::sin((wx - 90) * 0.35f) * (wz < 31 ? 1 : -1);
+                hf.h(x, z) = std::max(0.0f, s) * 0.8f;
+                hf.surf(x, z) = SURF_DIRT;
+            }
+        }
+    te::flatten_rect(hf, vec2(-120, 0), vec2(20, 20), 0, 0.2f, 6.0f, SURF_MUD);   // mud pit
+    te::flatten_rect(hf, vec2(-120, 50), vec2(20, 18), 0, 0.0f, 6.0f, SURF_ICE);  // ice skid pad
+    te::flatten_rect(hf, vec2(-120, -50), vec2(20, 18), 0, 0.0f, 6.0f, SURF_GRAVEL);
+    te::paint_road(hf, ellipse(vec2(0, 0), vec2(150, 110), 64), 6.0f, SURF_ASPHALT, 0.9f);
+    te::auto_surfaces(hf);
+    g.finish_terrain();
+
+    // slalom
+    add_cone_line(g, vec3(-55, 0, 20), vec3(35, 0, 20), 10);
+    add_cone_line(g, vec3(-55, 0, 40), vec3(-55, 0, 46), 2);
+    // ramps: small / medium / jump
+    add_ramp(g, vec3(-40, 0, -25), 90, 6, 5, 0.6f, A.concrete);
+    add_ramp(g, vec3(-10, 0, -25), 90, 8, 5, 1.4f, A.concrete);
+    add_ramp(g, vec3(25, 0, -25), 90, 10, 6, 2.6f, A.concrete);
+    add_ramp(g, vec3(67, 0, -25), -90, 16, 6, 2.6f, A.concrete); // landing
+    // speed bumps
+    for (int i = 0; i < 4; i++)
+        g.add_static_box(vec3(-30 + i * 9.0f, 0.0f, -45), vec3(0.35f, 0.12f, 4.0f), quat(), SURF_ASPHALT, A.yellow);
+    // washboard
+    for (int i = 0; i < 30; i++) g.add_static_box(vec3(10 + i * 0.7f, -0.02f, -45), vec3(0.12f, 0.08f, 3.5f), quat(), SURF_CONCRETE, A.concrete);
+    // stairs
+    for (int i = 0; i < 6; i++) g.add_static_box(vec3(50 + i * 1.2f, 0.12f + i * 0.18f, -45), vec3(0.6f + (5 - i) * 0.0f, 0.12f + i * 0.18f, 3.0f), quat(), SURF_CONCRETE, A.concrete);
+    g.add_static_box(vec3(60, 0.5f, -45), vec3(2.0f, 1.0f, 3.0f), quat(), SURF_CONCRETE, A.concrete);
+    // curbs around the pad
+    for (int i = -3; i <= 3; i++) g.add_static_box(vec3(i * 20.0f, 0.1f, 56), vec3(9.5f, 0.12f, 0.25f), quat(), SURF_CONCRETE, A.white);
+    // a few dynamic crates to push around
+    for (int i = 0; i < 6; i++) g.drop_primitive(0, vec3(-60 + i * 1.5f, 0.6f, -5));
+    g.set_spawn(vec3(-60, 0.0f, 30), 90);
+    g.scene_hint = "Slalom, ramps, bumps, washboard, stairs, hill climb (E), articulation twister (NE), mud/ice/gravel pads (W).";
+}
+
 void scene_forest(Game& g) {
     g.create_terrain(351, 351, 1.0f, vec2(-175, -175));
     auto& hf = g.world.statics.terrain;
@@ -2884,6 +2968,7 @@ void scene_stress_bridge(Game& g) {
 const std::vector<SceneInfo>& scene_registry() {
     static std::vector<SceneInfo> s = {
         {"proving", "Proving Ground", "Driving", "Vehicle handling test course", scene_proving_ground},
+        {"test_site", "Test Site", "Driving", "Vehicle test site: oval, crash lanes, press and vise, ride lanes, off-road park, circuit, city block", scene_test_site},
         {"forest", "Forest", "Driving", "Hills with trees and bushes", scene_forest},
         {"offroad", "Offroad Trail", "Driving", "Rocks, mud, sand, logs", scene_offroad},
         {"canyon", "Canyon Bridges", "Driving", "Breakable beam bridges over a chasm", scene_canyon},
