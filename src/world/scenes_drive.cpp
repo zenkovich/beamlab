@@ -75,8 +75,72 @@ void scene_proving_ground(Game& g) {
     for (int i = -3; i <= 3; i++) g.add_static_box(vec3(i * 20.0f, 0.1f, 56), vec3(9.5f, 0.12f, 0.25f), quat(), SURF_CONCRETE, A.white);
     // a few dynamic crates to push around
     for (int i = 0; i < 6; i++) g.drop_primitive(0, vec3(-60 + i * 1.5f, 0.6f, -5));
+    // crash obstacles at the pad's east end: a steel pole of 25 cm and a concrete slab stood as a wall (4 m wide, 2.4 m
+    // high, 0.4 m thick), each with a trigger pad 30 m before it - stop on the pad a second and the car is sent at the
+    // obstacle at the triggers' speed (Scene menu, 50 km/h at first); the speed it meets it at is shown under the hint
+    struct Obstacle {
+        const char* name;
+        vec3 at, pad;
+    };
+    static const Obstacle kObst[2] = {{"POLE 25 cm", vec3(66, 0, 2), vec3(36, 0, 2)}, {"WALL", vec3(66, 0, 12), vec3(36, 0, 12)}};
+    g.add_static_cylinder(kObst[0].at, 0.125f, 4.0f, SURF_METAL, A.metal);
+    g.add_static_box(kObst[1].at + vec3(0.2f, 1.2f, 0), vec3(0.2f, 1.2f, 2.0f), quat(), SURF_CONCRETE, A.concrete);
+    for (const Obstacle& o : kObst) {
+        // (the pad: a yellow frame painted on the asphalt, 6 x 3 m, an arrow's line down its middle)
+        const vec3 c = o.pad;
+        for (float sz : {-1.5f, 1.5f}) g.add_static_box(c + vec3(0, -0.045f, sz), vec3(3.0f, 0.05f, 0.08f), quat(), SURF_ASPHALT, A.yellow);
+        for (float sx : {-3.0f, 3.0f}) g.add_static_box(c + vec3(sx, -0.045f, 0), vec3(0.08f, 0.05f, 1.5f), quat(), SURF_ASPHALT, A.yellow);
+        g.add_static_box(c + vec3(1.0f, -0.045f, 0), vec3(1.6f, 0.05f, 0.06f), quat(), SURF_ASPHALT, A.white);
+        g.labels.push_back({c + vec3(0, 1.6f, 0), std::string("TRIGGER: ") + o.name});
+        g.labels.push_back({o.at + vec3(0, 3.0f, 0), o.name});
+    }
+    struct Trigger {
+        float kmh = 50.0f;
+        float still[2] = {0, 0};
+        bool fired[2] = {false, false}; // (sent: again once the car has left the pad)
+        int armed = -1;                 // (the obstacle the car was sent at: its speed there wanted)
+    };
+    auto trig = std::make_shared<Trigger>();
+    auto send = [trig](Game& gg, int k, float kmh) {
+        Vehicle* v = gg.player_vehicle();
+        if (!v) return;
+        v->reset(kObst[k].pad, 90);
+        v->launch(vec3(kmh / 3.6f, 0, 0));
+        trig->armed = k;
+        gg.scene_status = format("sent at the %s at %.0f km/h", kObst[k].name, kmh);
+    };
+    for (int k = 0; k < 2; k++)
+        for (float kmh : {30.0f, 50.0f, 80.0f, 120.0f})
+            g.scene_actions.push_back({format("Crash test/%s at %.0f km/h", kObst[k].name, kmh), [send, k, kmh](Game& gg) { send(gg, k, kmh); }});
+    for (float kmh : {30.0f, 50.0f, 80.0f, 120.0f})
+        g.scene_actions.push_back({format("Trigger speed/%.0f km/h", kmh), [trig, kmh](Game& gg) {
+                                       trig->kmh = kmh;
+                                       gg.scene_status = format("the triggers send the car at %.0f km/h", kmh);
+                                   }});
+    g.scene_update = [trig, send](Game& gg, float dt) {
+        Vehicle* v = gg.player_vehicle();
+        if (!v) return;
+        const vec3 p = v->position();
+        for (int k = 0; k < 2; k++) {
+            const vec3 c = kObst[k].pad;
+            const bool on = std::fabs(p.x - c.x) < 3.0f && std::fabs(p.z - c.z) < 1.5f;
+            if (!on) trig->fired[k] = false;
+            trig->still[k] = on && !trig->fired[k] && std::fabs(v->speed_kmh()) < 2.0f ? trig->still[k] + dt : 0.0f;
+            if (trig->still[k] > 1.0f) {
+                trig->still[k] = 0;
+                trig->fired[k] = true;
+                send(gg, k, trig->kmh);
+            }
+        }
+        // (the speed it meets the obstacle at: as the car's front - its nodes' - comes within half a metre of it, in its lane)
+        if (const int k = trig->armed; k >= 0 && v->body && v->body->aabb.mx.x > kObst[k].at.x - 0.5f) {
+            trig->armed = -1;
+            if (std::fabs(p.z - kObst[k].at.z) < 3.0f) gg.scene_status = format("%s: %.1f km/h at the impact", kObst[k].name, v->speed_kmh());
+        }
+    };
     g.set_spawn(vec3(-60, 0.0f, 30), 90);
-    g.scene_hint = "Slalom, ramps, bumps, washboard, stairs, hill climb (E), articulation twister (NE), mud/ice/gravel pads (W).";
+    g.scene_hint = "Slalom, ramps, bumps, washboard, stairs, hill climb (E), articulation twister (NE), mud/ice/gravel pads (W). "
+                   "Pole and wall at the pad's east end: stop on a TRIGGER pad and the car is sent at it (speed: Scene menu).";
 }
 
 void scene_forest(Game& g) {
