@@ -39,7 +39,7 @@ while IFS= read -r id; do
         --screenshot "$TMP/t.png" > /dev/null 2>&1 || echo "   warning: '$id' failed to run"
     n=$((n + 1))
 done < "$TMP/ids.txt"
-for sc in forest canyon offroad crash vehicle_crash lab stress_vehicles stress_derby stress_bridge; do
+for sc in forest canyon offroad crash vehicle_crash lab test_site stress_vehicles stress_derby stress_bridge; do
     BL_TRACE_FILES="$TRACE" "$BUILD/beamlab" --scene "$sc" --frames 4 --size 320x180 --hidden \
         --screenshot "$TMP/t.png" > /dev/null 2>&1 || echo "   warning: scene '$sc' failed to run"
 done
@@ -51,6 +51,11 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/assets"
 cp "$BUILD/beamlab" "$APP/Contents/MacOS/beamlab"
 strip -S "$APP/Contents/MacOS/beamlab"
 cp -R "$ROOT/assets/shaders" "$ROOT/assets/fonts" "$APP/Contents/Resources/assets/"
+# the open (CC0) textures, sky and models of tools/fetch_assets.py: the scenes' and the cars' look (the RBR stages are not
+# redistributable and stay out)
+for d in textures models; do
+    [ -d "$ROOT/assets/$d" ] && cp -R "$ROOT/assets/$d" "$APP/Contents/Resources/assets/"
+done
 python3 - "$ROOT/assets" "$APP/Contents/Resources/assets" "$TRACE" << 'EOF'
 import os, shutil, sys
 src, dst, trace = sys.argv[1:4]
